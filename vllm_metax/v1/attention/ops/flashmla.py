@@ -4,6 +4,7 @@
 # adapted from: https://github.com/deepseek-ai/FlashMLA/blob/main/flash_mla/flash_mla_interface.py
 
 from dataclasses import dataclass
+import inspect
 
 import torch
 
@@ -54,6 +55,8 @@ if _is_flashmla_available()[0]:
         flash_mla_sparse_fwd,
         get_mla_metadata,
     )
+    _flash_mla_with_kvcache_impl = flash_mla_with_kvcache
+    _flash_mla_sparse_fwd_impl = flash_mla_sparse_fwd
 else:
 
     class FlashMLASchedMeta:  # type: ignore[no-redef]
@@ -62,6 +65,20 @@ else:
     flash_mla_with_kvcache = _raise_flashmla_unavailable  # type: ignore[assignment]
     flash_mla_sparse_fwd = _raise_flashmla_unavailable  # type: ignore[assignment]
     get_mla_metadata = _raise_flashmla_unavailable  # type: ignore[assignment]
+    _flash_mla_with_kvcache_impl = _raise_flashmla_unavailable
+    _flash_mla_sparse_fwd_impl = _raise_flashmla_unavailable
+
+
+_FLASHMLA_SPARSE_FWD_PARAMS = (
+    set(inspect.signature(flash_mla_sparse_fwd).parameters)
+    if _is_flashmla_available()[0]
+    else set()
+)
+_FLASHMLA_WITH_KVCACHE_PARAMS = (
+    set(inspect.signature(_flash_mla_with_kvcache_impl).parameters)
+    if _is_flashmla_available()[0]
+    else set()
+)
 
 
 def get_mla_metadata_dense_fp8(
@@ -128,17 +145,14 @@ def flash_mla_sparse_fwd_wrapper(
     # # [s_q, h_kv, topk] -> [s_q, h_kv] -> [s_q, 1]
     # indices_all_valid_per_q = indices_valid.all(dim=2).all(dim=1, keepdim=True)
 
-    results = flash_mla.flash_mla_interface.flash_mla_sparse_fwd(
-        q,
-        kv,
-        indices,
-        sm_scale,
-        d_v,
-        None,  # indices_all_valid_per_q
-        attn_sink,
-        topk_length,
-        out,
-    )
+    # MetaX sparse FlashMLA prefill currently traps in
+    # ``sparse_attn_global_fwd_kernel`` on DeepSeek V4 workloads. Use the
+    # local torch reference path so converted checkpoints can still be
+    # brought up and validated end to end.
+    results = torch_flash_mla_sparse_prefill(q, kv, indices, sm_scale)
+    if out is not None:
+        out.copy_(results[0])
+        results = (out, results[1], results[2])
     # \------------------------- Metax Modification -------------------------/
     return results
 
@@ -197,28 +211,31 @@ def flash_mla_sparse_decode_wrapper(
     # # [s_q, h_kv, topk] -> [s_q, h_kv, 1]
     # indices_all_valid_per_q = indices_valid.all(dim=-1, keepdim=True)
 
-    return flash_mla_with_kvcache(
-        q=q,
-        k_cache=k_cache,
-        block_table=block_table,
-        cache_seqlens=cache_seqlens,
-        head_dim_v=head_dim_v,
-        tile_scheduler_metadata=tile_scheduler_metadata,
-        num_splits=num_splits,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        is_fp8_kvcache=is_fp8_kvcache,
-        indices=indices,
-        attn_sink=attn_sink,
-        extra_k_cache=extra_k_cache,
-        extra_indices_in_kvcache=extra_indices_in_kvcache,
-        topk_length=topk_length,
-        extra_topk_length=extra_topk_length,
-        descale_q=descale_q,
-        descale_k=descale_k,
-        indices_all_valid_per_q=None,  # unnecessary
-        out=out,
-    )
+    decode_kwargs = {
+        "q": q,
+        "k_cache": k_cache,
+        "block_table": block_table,
+        "cache_seqlens": cache_seqlens,
+        "head_dim_v": head_dim_v,
+        "tile_scheduler_metadata": tile_scheduler_metadata,
+        "causal": causal,
+        "is_fp8_kvcache": is_fp8_kvcache,
+        "indices": indices,
+        "descale_q": descale_q,
+        "descale_k": descale_k,
+    }
+    if "num_splits" in _FLASHMLA_WITH_KVCACHE_PARAMS:
+        decode_kwargs["num_splits"] = num_splits
+    if "softmax_scale" in _FLASHMLA_WITH_KVCACHE_PARAMS:
+        decode_kwargs["softmax_scale"] = softmax_scale
+    if "indices_all_valid_per_q" in _FLASHMLA_WITH_KVCACHE_PARAMS:
+        decode_kwargs["indices_all_valid_per_q"] = indices_all_valid_per_q
+
+    out_tensor, softmax_lse = _flash_mla_with_kvcache_impl(**decode_kwargs)
+    if out is not None:
+        out.copy_(out_tensor)
+        out_tensor = out
+    return out_tensor, softmax_lse
 
 
 #
@@ -266,3 +283,8 @@ def torch_flash_mla_sparse_prefill(
     result = attn_score @ kvs[:, :, :512]
 
     return (result.to(torch.bfloat16), max_logits, lse)
+
+
+# Export the compatibility wrapper under the public name used by callers.
+flash_mla_sparse_fwd = flash_mla_sparse_fwd_wrapper
+flash_mla_with_kvcache = flash_mla_sparse_decode_wrapper

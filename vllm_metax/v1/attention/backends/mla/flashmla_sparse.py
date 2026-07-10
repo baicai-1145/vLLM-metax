@@ -600,7 +600,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             decode_query_len = (query_start_loc_cpu[1] - query_start_loc_cpu[0]).item()
 
             # Use padded head count since that's what the kernel will see
-            scheduler_metadata, _ = get_mla_metadata()
+            scheduler_metadata, _ = get_mla_metadata(None)
 
             kernel_meta = FlashMLASparseMetadata.FP8KernelMetadata(
                 scheduler_metadata=scheduler_metadata,
@@ -644,7 +644,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
             decode_query_len = (query_start_loc_cpu[1] - query_start_loc_cpu[0]).item()
 
-            scheduler_metadata, _ = get_mla_metadata()
+            scheduler_metadata, _ = get_mla_metadata(None)
 
             kernel_meta = FlashMLASparseMetadata.BF16KernelMetadata(
                 scheduler_metadata=scheduler_metadata,

@@ -276,6 +276,65 @@ def mhc_post(
     return out
 
 
+def mhc_fused_post_pre(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    residual_cur = mhc_post_ref(x, residual, post_layer_mix, comb_res_mix)
+    post_mix, comb_mix, layer_input = mhc_pre(
+        residual_cur,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits,
+    )
+    return residual_cur, post_mix, comb_mix, layer_input
+
+
+def hc_head_ref(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+) -> torch.Tensor:
+    residual_flat = residual.flatten(-2).float()
+    residual_norm = residual_flat * torch.rsqrt(
+        residual_flat.square().mean(dim=-1, keepdim=True) + rms_eps
+    )
+    pre_mix = torch.nn.functional.linear(residual_norm, fn)
+    pre_mix = torch.sigmoid(pre_mix * hc_scale + hc_base) + hc_eps
+    return torch.sum(pre_mix.unsqueeze(-1) * residual.float(), dim=-2).bfloat16()
+
+
+def hc_head_fused_kernel(
+    hs_flat: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+) -> torch.Tensor:
+    return hc_head_ref(hs_flat, fn, hc_scale, hc_base, rms_eps, hc_eps)
+
+
 def _mhc_post_fake(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -283,6 +342,43 @@ def _mhc_post_fake(
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
     return torch.empty_like(residual)
+
+
+def _mhc_fused_post_pre_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    hc_mult = residual.shape[-2]
+    hidden_size = residual.shape[-1]
+    outer_shape = residual.shape[:-2]
+    residual_cur = torch.empty_like(residual)
+    post_mix = torch.empty(*outer_shape, hc_mult, 1, dtype=torch.float32, device=residual.device)
+    comb_mix = torch.empty(*outer_shape, hc_mult, hc_mult, dtype=torch.float32, device=residual.device)
+    layer_input = torch.empty(*outer_shape, hidden_size, dtype=torch.bfloat16, device=residual.device)
+    return residual_cur, post_mix, comb_mix, layer_input
+
+
+def _hc_head_fused_kernel_fake(
+    hs_flat: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+) -> torch.Tensor:
+    num_tokens, _, hidden_size = hs_flat.shape
+    return torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=hs_flat.device)
 
 
 direct_register_custom_op(

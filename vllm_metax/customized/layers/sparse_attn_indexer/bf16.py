@@ -33,6 +33,17 @@ logger = init_logger(__name__)
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
 
+def _fill_topk_indices_torch(logits: torch.Tensor, topk_indices: torch.Tensor) -> None:
+    k = min(topk_indices.shape[-1], logits.shape[-1])
+    topk_indices.fill_(-1)
+    if k == 0:
+        return
+    topk = torch.topk(logits, k=k, dim=-1).indices.to(torch.int32)
+    topk_indices_view = topk_indices.reshape(-1, topk_indices.shape[-1])
+    topk_view = topk.reshape(-1, k)
+    topk_indices_view[:, :k].copy_(topk_view)
+
+
 def _gather_workspace_shapes_bf16(
     total_seq_lens: int,
     head_dim: int,
@@ -178,16 +189,7 @@ def sparse_attn_indexer_bf16(
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
 
-            ops.top_k_per_row_prefill(
-                logits,
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-                topk_indices,
-                num_rows,
-                logits.stride(0),
-                logits.stride(1),
-                topk_tokens,
-            )
+            _fill_topk_indices_torch(logits, topk_indices)
 
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
@@ -226,30 +228,7 @@ def sparse_attn_indexer_bf16(
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
-        if current_platform.is_cuda() and topk_tokens in (512, 1024, 2048):
-            workspace_manager = current_workspace_manager()
-            (topk_workspace,) = workspace_manager.get_simultaneous(
-                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
-            )
-            torch.ops._C.persistent_topk(
-                logits,
-                seq_lens,
-                topk_indices,
-                topk_workspace,
-                topk_tokens,
-                attn_metadata_narrowed.max_seq_len,
-            )
-        else:
-            ops.top_k_per_row_decode(
-                logits,
-                next_n,
-                seq_lens,
-                topk_indices,
-                num_rows,
-                logits.stride(0),
-                logits.stride(1),
-                topk_tokens,
-            )
+        _fill_topk_indices_torch(logits, topk_indices)
 
         if decode_metadata.requires_padding:
             # if padded, we need to unpack

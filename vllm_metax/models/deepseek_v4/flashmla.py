@@ -35,6 +35,38 @@ if TYPE_CHECKING:
 class MacaDeepseekV4FlashMLAAttention(MacaDeepseekV4Attention):
     backend_cls = MacaDeepseekV4FlashMLABackend
 
+    @staticmethod
+    def _torch_sparse_decode(
+        q: torch.Tensor,
+        swa_cache: torch.Tensor,
+        swa_indices: torch.Tensor,
+        topk_indices: torch.Tensor | None,
+        output: torch.Tensor,
+        scale: float,
+    ) -> None:
+        q2 = q.squeeze(1).float()
+        batch = q2.shape[0]
+        q_heads = q2.shape[1]
+        head_dim = q2.shape[2]
+        value_dim = output.shape[-1]
+
+        flat_cache = swa_cache.reshape(-1, swa_cache.shape[-1]).float()
+        combined = swa_indices[:, 0, :]
+        if topk_indices is not None:
+            combined = torch.cat([topk_indices[:, 0, :], combined], dim=-1)
+
+        invalid = combined < 0
+        gather_idx = combined.masked_fill(invalid, 0)
+        gathered = flat_cache.index_select(0, gather_idx.reshape(-1)).view(
+            batch, -1, head_dim
+        )
+
+        attn = torch.matmul(q2, gathered.transpose(1, 2))
+        attn.masked_fill_(invalid.unsqueeze(1), float("-inf"))
+        probs = torch.softmax(attn * scale, dim=-1)
+        out = torch.matmul(probs, gathered[:, :, :value_dim])
+        output.copy_(out.to(output.dtype))
+
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         return deep_gemm_bf16_o_proj(
             o,
@@ -106,9 +138,14 @@ class MacaDeepseekV4FlashMLAAttention(MacaDeepseekV4Attention):
         assert swa_metadata is not None
 
         swa_only = self.compress_ratio <= 1
+        short_context_only = (
+            swa_metadata.seq_lens is not None
+            and int(swa_metadata.seq_lens.max().item()) <= self.window_size
+        )
+        effective_swa_only = swa_only or short_context_only
         # SWA-only layers (compress_ratio <= 1) don't have their own KV cache
         # allocation, so self.kv_cache may be empty after profiling cleanup.
-        self_kv_cache = self.kv_cache if not swa_only else None
+        self_kv_cache = self.kv_cache if not effective_swa_only else None
         swa_kv_cache = self.swa_cache_layer.kv_cache
 
         # Split prefill and decode
@@ -123,7 +160,7 @@ class MacaDeepseekV4FlashMLAAttention(MacaDeepseekV4Attention):
                 compressed_k_cache=self_kv_cache,
                 swa_k_cache=swa_kv_cache,
                 output=output[num_decode_tokens:],
-                attn_metadata=flashmla_metadata,
+                attn_metadata=None if effective_swa_only else flashmla_metadata,
                 swa_metadata=swa_metadata,
             )
         if num_decodes > 0:
@@ -132,7 +169,7 @@ class MacaDeepseekV4FlashMLAAttention(MacaDeepseekV4Attention):
                 kv_cache=self_kv_cache,
                 swa_metadata=swa_metadata,
                 attn_metadata=flashmla_metadata,
-                swa_only=swa_only,
+                swa_only=effective_swa_only,
                 output=output[:num_decode_tokens],
             )
 
@@ -210,22 +247,13 @@ class MacaDeepseekV4FlashMLAAttention(MacaDeepseekV4Attention):
             "allocate one for this layer type."
         )
 
-        out, _ = flash_mla_with_kvcache(
+        self._torch_sparse_decode(
             q=q,
-            k_cache=swa_cache,
-            block_table=None,
-            head_dim_v=512,
-            tile_scheduler_metadata=tile_metadata,
-            cache_seqlens=None,
-            is_fp8_kvcache=False,
-            indices=swa_indices,
-            topk_length=swa_lens,
-            softmax_scale=self.scale,
-            attn_sink=self.attn_sink,
-            extra_k_cache=kv_cache if not swa_only else None,
-            extra_indices_in_kvcache=topk_indices,
-            extra_topk_length=topk_lens,
-            out=output.unsqueeze(1),
+            swa_cache=swa_cache,
+            swa_indices=swa_indices,
+            topk_indices=topk_indices,
+            output=output,
+            scale=self.scale,
         )
 
     def _forward_prefill(

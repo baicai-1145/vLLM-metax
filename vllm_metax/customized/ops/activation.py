@@ -29,7 +29,11 @@ class MacaSiluAndMul(SiluAndMul):
 @SiluAndMulWithClamp.register_oot
 class MacaSiluAndMulWithClamp(SiluAndMulWithClamp):
     def forward_oot(self, *args, **kwargs):
-        return self.forward_cuda(*args, **kwargs)
+        # MetaX custom op currently exposes the legacy 3-arg ABI
+        # ``(out, x, limit)`` while upstream v0.25 passes
+        # ``(out, x, limit, alpha, beta)``. Fall back to the native
+        # implementation until the backend kernel is updated.
+        return self.forward_native(*args, **kwargs)
 
 
 @MulAndSilu.register_oot

@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import DeepseekV2Config, DeepseekV3Config
+from vllm.forward_context import get_forward_context
 
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -439,6 +440,19 @@ class MacaDeepseekV4Indexer(nn.Module):
         positions: torch.Tensor,
         rotary_emb: nn.Module,
     ) -> torch.Tensor:
+        forward_context = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+        if isinstance(attn_metadata, dict):
+            swa_metadata = attn_metadata.get(self.prefix.replace('.indexer', '.swa_cache'))
+            if (
+                swa_metadata is not None
+                and getattr(swa_metadata, 'seq_lens', None) is not None
+                and int(swa_metadata.seq_lens.max().item()) <= self.config.sliding_window
+            ):
+                assert self.topk_indices_buffer is not None
+                self.topk_indices_buffer[: hidden_states.shape[0]].fill_(-1)
+                return self.topk_indices_buffer
+
         compressor = self.compressor
 
         def wq_b_and_q_quant():

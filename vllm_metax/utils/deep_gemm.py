@@ -126,7 +126,17 @@ def bf16_mqa_logits(
     """
     _lazy_init()
     if _bf16_mqa_logits_impl is None:
-        return _missing()
+        qf = q.to(torch.float32)
+        kf = kv.to(torch.float32)
+        logits = torch.einsum("mhd,nd->mhn", qf, kf)
+        logits = (logits * weights.to(torch.float32).unsqueeze(-1)).sum(dim=1)
+        num_queries, num_keys = logits.shape
+        idx = torch.arange(num_keys, device=logits.device).unsqueeze(0)
+        start = cu_seqlen_ks.to(torch.int64).unsqueeze(1)
+        end = cu_seqlen_ke.to(torch.int64).unsqueeze(1)
+        valid = (idx >= start) & (idx < end)
+        logits.masked_fill_(~valid, float("-inf"))
+        return logits
     return _bf16_mqa_logits_impl(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
 
 
@@ -163,7 +173,35 @@ def bf16_paged_mqa_logits(
     """
     _lazy_init()
     if _bf16_paged_mqa_logits_impl is None:
-        return _missing()
+        batch_size, next_n, num_heads, head_dim = q_bf16.shape
+        logits = torch.full(
+            (batch_size * next_n, max_model_len),
+            float("-inf"),
+            dtype=torch.float32,
+            device=q_bf16.device,
+        )
+        flat_q = q_bf16.to(torch.float32).reshape(batch_size * next_n, num_heads, head_dim)
+        flat_w = weights.to(torch.float32).reshape(batch_size * next_n, num_heads)
+        for b in range(batch_size):
+            ctx_len = int(context_lens[b].item())
+            if ctx_len <= 0:
+                continue
+            block_table = block_tables[b]
+            block_size = kv_cache_bf16.shape[1]
+            blocks_needed = (ctx_len + block_size - 1) // block_size
+            block_ids = block_table[:blocks_needed].to(torch.int64)
+            gathered = kv_cache_bf16.index_select(0, block_ids).reshape(-1, kv_cache_bf16.shape[-1])[:ctx_len]
+            if gathered.dim() == 3:
+                gathered = gathered[:, 0, :]
+            gathered = gathered[..., :head_dim].to(torch.float32)
+            q_slice = flat_q[b * next_n : (b + 1) * next_n]
+            w_slice = flat_w[b * next_n : (b + 1) * next_n]
+            local_logits = torch.einsum("mhd,nd->mhn", q_slice, gathered)
+            local_logits = (local_logits * w_slice.unsqueeze(-1)).sum(dim=1)
+            row_start = b * next_n
+            row_end = row_start + next_n
+            logits[row_start:row_end, :ctx_len] = local_logits
+        return logits
     return _bf16_paged_mqa_logits_impl(
         q_bf16,
         kv_cache_bf16,
@@ -203,7 +241,17 @@ def int8_mqa_logits(
     """
     _lazy_init()
     if _int8_mqa_logits_impl is None:
-        return _missing()
+        qf = q.to(torch.float32)
+        kf = kv[0].to(torch.float32) if isinstance(kv, tuple) else kv.to(torch.float32)
+        logits = torch.einsum("mhd,nd->mhn", qf, kf)
+        logits = (logits * weights.to(torch.float32).unsqueeze(-1)).sum(dim=1)
+        num_queries, num_keys = logits.shape
+        idx = torch.arange(num_keys, device=logits.device).unsqueeze(0)
+        start = cu_seqlen_ks.to(torch.int64).unsqueeze(1)
+        end = cu_seqlen_ke.to(torch.int64).unsqueeze(1)
+        valid = (idx >= start) & (idx < end)
+        logits.masked_fill_(~valid, float("-inf"))
+        return logits
     return _int8_mqa_logits_impl(
         q,
         kv,
@@ -248,7 +296,35 @@ def int8_paged_mqa_logits(
     """
     _lazy_init()
     if _int8_paged_mqa_logits_impl is None:
-        return _missing()
+        batch_size, next_n, num_heads, head_dim = q_bf16.shape
+        logits = torch.full(
+            (batch_size * next_n, max_model_len),
+            float("-inf"),
+            dtype=torch.float32,
+            device=q_bf16.device,
+        )
+        flat_q = q_bf16.to(torch.float32).reshape(batch_size * next_n, num_heads, head_dim)
+        flat_w = weights.to(torch.float32).reshape(batch_size * next_n, num_heads)
+        for b in range(batch_size):
+            ctx_len = int(context_lens[b].item())
+            if ctx_len <= 0:
+                continue
+            block_table = block_tables[b]
+            block_size = kv_cache_bf16.shape[1]
+            blocks_needed = (ctx_len + block_size - 1) // block_size
+            block_ids = block_table[:blocks_needed].to(torch.int64)
+            gathered = kv_cache_bf16.index_select(0, block_ids).reshape(-1, kv_cache_bf16.shape[-1])[:ctx_len]
+            if gathered.dim() == 3:
+                gathered = gathered[:, 0, :]
+            gathered = gathered[..., :head_dim].to(torch.float32)
+            q_slice = flat_q[b * next_n : (b + 1) * next_n]
+            w_slice = flat_w[b * next_n : (b + 1) * next_n]
+            local_logits = torch.einsum("mhd,nd->mhn", q_slice, gathered)
+            local_logits = (local_logits * w_slice.unsqueeze(-1)).sum(dim=1)
+            row_start = b * next_n
+            row_end = row_start + next_n
+            logits[row_start:row_end, :ctx_len] = local_logits
+        return logits
     return _int8_paged_mqa_logits_impl(
         q_bf16,
         kv_cache_bf16,
@@ -264,7 +340,12 @@ def int8_paged_mqa_logits(
 def bf16_einsum(*args, **kwargs):
     _lazy_init()
     if _bf16_einsum is None:
-        return _missing(*args, **kwargs)
+        equation, lhs, rhs, out = args
+        result = torch.einsum(
+            equation, lhs.to(torch.bfloat16), rhs.to(torch.bfloat16)
+        )
+        out.copy_(result.to(out.dtype))
+        return out
     return _bf16_einsum(*args, **kwargs)
 
 
@@ -284,7 +365,13 @@ def tf32_hc_prenorm_gemm(
     """
     _lazy_init()
     if _tf32_hc_prenorm_gemm_impl is None:
-        return _missing()
+        x_f32 = x.to(torch.float32)
+        fn_f32 = fn.to(torch.float32)
+        gemm = x_f32 @ fn_f32.t()
+        out.copy_(gemm.view_as(out))
+        sq = x_f32.square().sum(dim=-1)
+        sqrsum.copy_(sq.expand_as(sqrsum))
+        return out
     return _tf32_hc_prenorm_gemm_impl(x, fn, out, sqrsum, num_split)
 
 

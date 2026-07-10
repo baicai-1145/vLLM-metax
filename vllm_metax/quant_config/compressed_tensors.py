@@ -11,7 +11,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors import (
 )
 
 from vllm.model_executor.layers.quantization import register_quantization_config
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
 
 @register_quantization_config("compressed-tensors")
@@ -22,7 +22,7 @@ class MacaCompressedTensorsConfig(vllm_ct.CompressedTensorsConfig):
         prefix: str,
     ) -> "QuantizeMethodBase | None":
         # Replace with Metax's MoE quantization methods
-        if isinstance(layer, FusedMoE):
+        if isinstance(layer, RoutedExperts):
             from vllm_metax.quant_config.compressed_tensors_moe.compressed_tensors_moe import (
                 CompressedTensorsMoEMethod,
             )
@@ -35,8 +35,8 @@ class MacaCompressedTensorsConfig(vllm_ct.CompressedTensorsConfig):
         except ValueError:
             # Note: w4a8 may trigger ValueError in the CompressedTensorsMoEMethod,
             # but we'd handle it in our custom method below.
-            # So we catch the exception and ensure it's a FusedMoE layer.
-            if not isinstance(layer, FusedMoE):
+            # So we catch the exception and ensure it's a RoutedExperts layer.
+            if not isinstance(layer, RoutedExperts):
                 raise
         except Exception:
             raise

@@ -373,7 +373,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             # returns a fresh empty FlashMLASchedMeta; using it keeps this
             # call site aligned with the rest of the vLLM FlashMLA backends
             # that already go through the same stub.
-            out[layer_type] = get_mla_metadata()[0]
+            out[layer_type] = get_mla_metadata(None)[0]
         return out
 
     def _build_deepseek_v4_metadata(

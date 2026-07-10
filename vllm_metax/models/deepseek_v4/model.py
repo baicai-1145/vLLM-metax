@@ -17,14 +17,17 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState
-from .ops.mhc.tilelang import (
-    hc_head_fused_kernel_tilelang,
-    mhc_post_tilelang,
-    mhc_pre_tilelang,
-    mhc_fused_post_pre_tilelang,
+from .ops.mhc.torch import (
+    hc_head_fused_kernel as hc_head_fused_kernel_torch,
+    mhc_fused_post_pre as mhc_fused_post_pre_torch,
+    mhc_post as mhc_post_torch,
+    mhc_pre as mhc_pre_torch,
 )
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.fused_moe.layer import (
+    fused_moe_make_expert_params_mapping,
+)
 from vllm.model_executor.layers.fused_moe.router.base_router import (
     eplb_map_to_physical_and_record,
 )
@@ -810,7 +813,7 @@ class DeepseekV4DecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = x
-            post_mix, res_mix, x = mhc_pre_tilelang(
+            post_mix, res_mix, x = mhc_pre_torch(
                 x,
                 self.hc_attn_fn,
                 self.hc_attn_scale,
@@ -822,7 +825,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_sinkhorn_iters,
             )
         else:
-            residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang(
+            residual, post_mix, res_mix, x = mhc_fused_post_pre_torch(
                 x,
                 residual,
                 post_mix,
@@ -839,7 +842,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         x = self.attn_norm(x)
         x = self.attn(positions, x, None)
 
-        residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang(
+        residual, post_mix, res_mix, x = mhc_fused_post_pre_torch(
             x,
             residual,
             post_mix,
@@ -853,7 +856,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_post_alpha,
             self.hc_sinkhorn_iters,
             n_splits=1,
-            tile_n=1,
         )
         x = self.ffn_norm(x)
         x = self.ffn(x, input_ids)
@@ -1015,7 +1017,7 @@ class DeepseekV4Model(nn.Module):
                 residual,
             )
         if layer is not None:
-            hidden_states = mhc_post_tilelang(
+            hidden_states = mhc_post_torch(
                 hidden_states, residual, post_mix, res_mix
             )
 
@@ -1026,7 +1028,7 @@ class DeepseekV4Model(nn.Module):
         num_tokens = hidden_states.shape[0]
         self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
-        hidden_states = hc_head_fused_kernel_tilelang(
+        hidden_states = hc_head_fused_kernel_torch(
             hidden_states,
             self.hc_head_fn,
             self.hc_head_scale,
@@ -1142,7 +1144,7 @@ class DeepseekV4Model(nn.Module):
             return make_deepseek_v4_expert_params_mapping(self.config.n_routed_experts)
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        return FusedMoE.make_expert_params_mapping(
+        return fused_moe_make_expert_params_mapping(
             self,
             ckpt_gate_proj_name="w1",
             ckpt_down_proj_name="w2",
