@@ -229,6 +229,7 @@ class MacaFlashAttentionBackend(AttentionBackend):
         use_mla: bool,
         has_sink: bool,
         use_sparse: bool,
+        use_mm_prefix: bool,
         device_capability: DeviceCapability,
     ) -> str | None:
         if has_sink and device_capability < DeviceCapability(9, 0):
@@ -915,6 +916,14 @@ class FlashAttentionImpl(AttentionImpl):
         self.supports_quant_query_input = flash_attn_supports_quant_query_input()
 
         vllm_config = get_current_vllm_config_or_none()
+        speculative_config = (
+            vllm_config.speculative_config if vllm_config is not None else None
+        )
+        self.spec_decode_max_query_len = (
+            speculative_config.num_speculative_tokens + 1
+            if speculative_config is not None
+            else 8
+        )
         dcp_a2a = (
             vllm_config is not None
             and vllm_config.parallel_config.decode_context_parallel_size > 1
@@ -968,7 +977,7 @@ class FlashAttentionImpl(AttentionImpl):
                 block_table=attn_metadata.decode_block_table[req_start:req_end],
                 cache_seqlens=attn_metadata.decode_seq_lens[req_start:req_end],
                 softmax_scale=self.scale,
-                causal=True,
+                causal=attn_metadata.causal,
                 window_size=list(self.sliding_window)
                 if self.sliding_window is not None
                 else None,
@@ -979,6 +988,67 @@ class FlashAttentionImpl(AttentionImpl):
             decode_output[token_start:token_end] = reshape_attn_output_for_spec_decode(
                 bucket_output_unreshape
             )
+
+    def _forward_decode_serial_q_len(
+        self,
+        decode_query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        sliding_window_size: list[int] | None,
+    ) -> None:
+        query_start_loc = (
+            attn_metadata.decode_query_start_loc
+            if attn_metadata.decode_query_start_loc is not None
+            else attn_metadata.query_start_loc
+        )
+        seq_lens = (
+            attn_metadata.decode_seq_lens
+            if attn_metadata.decode_seq_lens is not None
+            else attn_metadata.seq_lens
+        )
+        block_table = (
+            attn_metadata.decode_block_table
+            if attn_metadata.decode_block_table is not None
+            else attn_metadata.block_table
+        )
+        num_reqs = query_start_loc.shape[0] - 1
+
+        decode_output = output[: decode_query.shape[0]]
+        for req_idx in range(num_reqs):
+            req_start = int(query_start_loc[req_idx].item())
+            req_end = int(query_start_loc[req_idx + 1].item())
+            query_len = req_end - req_start
+            for query_offset in range(query_len):
+                token_idx = req_start + query_offset
+                cache_seqlens = (
+                    seq_lens[req_idx : req_idx + 1]
+                    - (query_len - query_offset - 1)
+                )
+                cu_seqlens_q = torch.tensor(
+                    [0, 1], dtype=torch.int32, device=decode_query.device
+                )
+                cu_seqlens_k = torch.cat(
+                    [cache_seqlens.new_zeros(1), cache_seqlens.to(torch.int32)]
+                )
+                output_row = flash_attn_varlen_func(
+                    q=decode_query[token_idx : token_idx + 1],
+                    k=key_cache,
+                    v=value_cache,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_q=1,
+                    max_seqlen_k=int(cache_seqlens.item()),
+                    softmax_scale=self.scale,
+                    causal=attn_metadata.causal,
+                    alibi_slopes=self.alibi_slopes,
+                    window_size=sliding_window_size,
+                    block_table=block_table[req_idx : req_idx + 1],
+                    softcap=self.logits_soft_cap,
+                    s_aux=self.sinks,
+                )
+                decode_output[token_idx : token_idx + 1] = output_row
 
     def forward(
         self,
@@ -1135,7 +1205,22 @@ class FlashAttentionImpl(AttentionImpl):
                     if attn_metadata.num_decodes > 0:
                         decode_query = query[:num_decode_tokens]
                         # Use flash_attn_with_kvcache for normal decoding.
-                        if attn_metadata.decode_bucket_req_bounds is not None:
+                        if (
+                            mx_envs.VLLM_METAX_SERIALIZE_SPEC_DECODE_ATTENTION
+                            and attn_metadata.num_prefills == 0
+                            and attn_metadata.max_query_len > 1
+                            and not isinstance(attn_metadata.causal, torch.Tensor)
+                            and bool(attn_metadata.causal)
+                        ):
+                            self._forward_decode_serial_q_len(
+                                decode_query,
+                                key_cache,
+                                value_cache,
+                                output,
+                                attn_metadata,
+                                sliding_window_size,
+                            )
+                        elif attn_metadata.decode_bucket_req_bounds is not None:
                             self._forward_decode_with_query_len_bucketing(
                                 decode_query,
                                 key_cache,
@@ -1154,7 +1239,7 @@ class FlashAttentionImpl(AttentionImpl):
                                 block_table=attn_metadata.decode_block_table,
                                 cache_seqlens=attn_metadata.decode_seq_lens,
                                 softmax_scale=self.scale,
-                                causal=True,
+                                causal=attn_metadata.causal,
                                 window_size=sliding_window_size,
                                 alibi_slopes=self.alibi_slopes,
                                 softcap=self.logits_soft_cap,
@@ -1176,21 +1261,39 @@ class FlashAttentionImpl(AttentionImpl):
                         value=0,
                     ).cumsum(dim=0, dtype=torch.int32)
 
-                    output[:num_actual_tokens] = flash_attn_varlen_func(
-                        q=query[:num_actual_tokens],
-                        k=key_cache,
-                        v=value_cache,
-                        cu_seqlens_q=cu_seqlens_q,
-                        max_seqlen_q=max_seqlen_q,
-                        cu_seqlens_k=cu_seqlens_k,
-                        max_seqlen_k=max_seqlen_k,
-                        softmax_scale=self.scale,
-                        causal=True,
-                        alibi_slopes=self.alibi_slopes,
-                        window_size=sliding_window_size,
-                        block_table=block_table,
-                        softcap=self.logits_soft_cap,
-                    )
+                    if (
+                        mx_envs.VLLM_METAX_SERIALIZE_SPEC_DECODE_ATTENTION
+                        and self.spec_decode_max_query_len > 1
+                        and attn_metadata.max_query_len > 1
+                        and attn_metadata.max_query_len
+                        <= self.spec_decode_max_query_len
+                        and not isinstance(attn_metadata.causal, torch.Tensor)
+                        and bool(attn_metadata.causal)
+                    ):
+                        self._forward_decode_serial_q_len(
+                            query[:num_actual_tokens],
+                            key_cache,
+                            value_cache,
+                            output,
+                            attn_metadata,
+                            sliding_window_size,
+                        )
+                    else:
+                        output[:num_actual_tokens] = flash_attn_varlen_func(
+                            q=query[:num_actual_tokens],
+                            k=key_cache,
+                            v=value_cache,
+                            cu_seqlens_q=cu_seqlens_q,
+                            max_seqlen_q=max_seqlen_q,
+                            cu_seqlens_k=cu_seqlens_k,
+                            max_seqlen_k=max_seqlen_k,
+                            softmax_scale=self.scale,
+                            causal=attn_metadata.causal,
+                            alibi_slopes=self.alibi_slopes,
+                            window_size=sliding_window_size,
+                            block_table=block_table,
+                            softcap=self.logits_soft_cap,
+                        )
                     return output
 
         # Cascade attention (rare case).

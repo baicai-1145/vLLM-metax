@@ -5,10 +5,12 @@
 #
 # Affected versions: v0.21.0
 # -----------------------------------------------
+from . import jit_kwargs
 from . import kda
 from . import lora
 from . import chunk_delta_h
 from . import rejection_sampler
+from . import rejection_sampler_v2
 from . import eagle
 from . import topk_topp_sampler
 from . import mrv2

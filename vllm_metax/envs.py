@@ -17,7 +17,11 @@ if TYPE_CHECKING:
     MACA_VLLM_ENABLE_MCTLASS_PYTHON_API: bool = True
     MACA_VLLM_ENABLE_MCTLASS_FUSED_MOE: bool = False
     USE_VLLM_TRITON_EXPERT: bool = False
-    VLLM_METAX_ENABLE_FA_SPLIT_FORWARD: bool = True
+    VLLM_METAX_ENABLE_FA_SPLIT_FORWARD: bool = False
+    VLLM_METAX_USE_NATIVE_ROPE: bool = True
+    VLLM_METAX_USE_NATIVE_RMS_NORM: bool = True
+    VLLM_METAX_SERIALIZE_SPEC_DECODE_ATTENTION: bool = True
+    VLLM_METAX_USE_FP32_LOGITS: bool | None
     VLLM_FUSED_MOE_CHUNK_SIZE: int = 16 * 1024
     VLLM_METAX_USE_FP8_SPARSE_ATTN_INDEXER: bool = False
     VLLM_METAX_USE_SGL_FUSED_MOE_GROUPED_TOPK: bool = False
@@ -68,11 +72,36 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_METAX_OPTIMIZED_DP_ALL2ALL": lambda: bool(
         int(os.environ.get("VLLM_METAX_OPTIMIZED_DP_ALL2ALL", "1"))
     ),
-    # if set, enable FA split forward into
-    # prefill and decode for better latency
-    # and memory usage during decoding
+    # if set, enable FA split forward into prefill and decode for better
+    # latency and memory usage during decoding. Disabled by default because
+    # the split decode path can diverge from HF/vLLM varlen attention.
     "VLLM_METAX_ENABLE_FA_SPLIT_FORWARD": lambda: bool(
-        int(os.environ.get("VLLM_METAX_ENABLE_FA_SPLIT_FORWARD", "1"))
+        int(os.environ.get("VLLM_METAX_ENABLE_FA_SPLIT_FORWARD", "0"))
+    ),
+    # Use vLLM's PyTorch-native RoPE path by default. The MetaX custom RoPE
+    # kernel can make cached decode diverge from full-prefix evaluation.
+    "VLLM_METAX_USE_NATIVE_ROPE": lambda: bool(
+        int(os.environ.get("VLLM_METAX_USE_NATIVE_ROPE", "1"))
+    ),
+    # Use vLLM's PyTorch-native RMSNorm path by default. The MetaX custom
+    # RMSNorm path can make cached decode diverge from full-prefix evaluation.
+    "VLLM_METAX_USE_NATIVE_RMS_NORM": lambda: bool(
+        int(os.environ.get("VLLM_METAX_USE_NATIVE_RMS_NORM", "1"))
+    ),
+    # MetaX FlashAttention can produce different argmaxes for multi-query
+    # speculative target verification than for normal cached q_len=1 decode.
+    # Serialize speculative decode attention rows by default for correctness.
+    "VLLM_METAX_SERIALIZE_SPEC_DECODE_ATTENTION": lambda: bool(
+        int(os.environ.get("VLLM_METAX_SERIALIZE_SPEC_DECODE_ATTENTION", "1"))
+    ),
+    # If unset/auto, Qwen3 DSpark recomputes only punctuation-led near-tie
+    # logits in fp32 to avoid greedy speculative verification tie flips. Set to
+    # 0 to disable or 1 to force full fp32 logits for debugging.
+    "VLLM_METAX_USE_FP32_LOGITS": lambda: (
+        None
+        if os.environ.get("VLLM_METAX_USE_FP32_LOGITS") is None
+        or os.environ["VLLM_METAX_USE_FP32_LOGITS"].lower() == "auto"
+        else bool(int(os.environ["VLLM_METAX_USE_FP32_LOGITS"]))
     ),
     "VLLM_FUSED_MOE_CHUNK_SIZE": lambda: int(
         os.getenv("VLLM_FUSED_MOE_CHUNK_SIZE", str(16 * 1024))

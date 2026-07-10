@@ -10,6 +10,7 @@
 # Remove at: after triton3.6+metax is released.
 # -----------------------------------------------
 from vllm.triton_utils import tl, triton
+MAX_SPEC_LEN = 128
 
 
 @triton.jit
@@ -216,3 +217,39 @@ vllm.v1.worker.gpu.block_table._compute_slot_mappings_kernel = (
 import vllm.v1.worker.gpu.sample.penalties
 
 vllm.v1.worker.gpu.sample.penalties._penalties_kernel = _penalties_kernel
+
+
+def _apply_penalties(
+    logits,
+    expanded_idx_mapping,
+    token_ids,
+    expanded_local_pos,
+    repetition_penalty,
+    frequency_penalty,
+    presence_penalty,
+    prompt_bin_mask,
+    output_bin_counts,
+) -> None:
+    num_tokens, vocab_size = logits.shape
+    BLOCK_SIZE = 8192
+    num_blocks = triton.cdiv(vocab_size, BLOCK_SIZE)
+    _penalties_kernel[(num_tokens, num_blocks)](
+        logits,
+        logits.stride(0),
+        expanded_idx_mapping,
+        token_ids,
+        expanded_local_pos,
+        repetition_penalty,
+        frequency_penalty,
+        presence_penalty,
+        prompt_bin_mask,
+        prompt_bin_mask.stride(0),
+        output_bin_counts,
+        output_bin_counts.stride(0),
+        vocab_size,
+        BLOCK_SIZE=BLOCK_SIZE,
+        MAX_SPEC_LEN=MAX_SPEC_LEN,
+    )
+
+
+vllm.v1.worker.gpu.sample.penalties.apply_penalties = _apply_penalties

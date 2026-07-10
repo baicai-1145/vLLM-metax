@@ -3,4 +3,4 @@
 from . import parallel_state  # noqa: F401
 # ---------------------------
 # Note: enable for dsv4 branch with torch2.8
-# from . import torch_fix
+from . import torch_fix  # noqa: F401

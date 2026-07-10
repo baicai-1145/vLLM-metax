@@ -14,7 +14,7 @@ from typing import List, Dict, Iterator
 import os
 from vllm.utils.system_utils import update_environment_variables
 from vllm.platforms import current_platform
-from vllm.v1.engine.utils import get_device_indices
+from vllm.v1.engine.utils import get_physical_gpu_ids_for_local_dp_rank
 from unittest.mock import patch
 from vllm.config import VllmConfig
 
@@ -49,7 +49,10 @@ def set_device_control_env_var_with_maca(
     local_world_size = vllm_config.parallel_config.local_world_size
     evar = current_platform.device_control_env_var
 
-    value = get_device_indices(evar, local_dp_rank, world_size, local_world_size)
+    physical_gpu_ids = get_physical_gpu_ids_for_local_dp_rank(
+        evar, local_dp_rank, world_size, local_world_size
+    )
+    value = ",".join(str(i) for i in physical_gpu_ids)
     # /------------------------  Metax Modification -------------------------\
     with patch.dict(os.environ, values=((evar, value),)):
         os.environ["MACA_VISIBLE_DEVICES"] = value

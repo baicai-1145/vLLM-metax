@@ -626,7 +626,7 @@ class MacaPlatformBase(Platform):
         # Use oink if enabled for rms_norm
         # TODO(Laurawly/luka): remove this env var,
         #  users can just use IR op priority directly
-        rms_norm = default
+        rms_norm = ["native"] if mx_envs.VLLM_METAX_USE_NATIVE_RMS_NORM else default
         if envs.VLLM_USE_OINK_OPS:
             rms_norm = ["oink"] + default
 
@@ -795,17 +795,19 @@ mx_envs.override_vllm_env(
     "VLLM_ENGINE_READY_TIMEOUT_S", 7200, "set timeout to 7200s for model loading"
 )
 
-mx_envs.override_vllm_env(
-    "VLLM_FLOAT32_MATMUL_PRECISION",
-    "high",
-    "set float32 matmul precision to high for better performance on Maca platform",
-)
+if "VLLM_FLOAT32_MATMUL_PRECISION" not in os.environ:
+    mx_envs.override_vllm_env(
+        "VLLM_FLOAT32_MATMUL_PRECISION",
+        "high",
+        "set float32 matmul precision to high for better performance on Maca platform",
+    )
 
-mx_envs.override_vllm_env(
-    "VLLM_USE_V2_MODEL_RUNNER",
-    False,
-    "v2 model runner is still under development and not fully tested on Maca platform, disable it by default",
-)
+if "VLLM_USE_V2_MODEL_RUNNER" not in os.environ:
+    mx_envs.override_vllm_env(
+        "VLLM_USE_V2_MODEL_RUNNER",
+        False,
+        "v2 model runner is still under development and not fully tested on Maca platform, disable it by default",
+    )
 
 
 # --------------------------------------------------

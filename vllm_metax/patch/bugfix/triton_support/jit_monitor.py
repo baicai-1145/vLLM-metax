@@ -5,8 +5,10 @@
 #
 # Affected versions: v0.21.0
 # -----------------------------------------------
-import vllm
-from vllm.triton_utils.jit_monitor import logger
+from importlib import import_module
+
+_jit_monitor = import_module("vllm.utils.jit_monitor")
+logger = _jit_monitor.logger
 
 # ------------------------------------------------------------------
 # JIT monitor patch, this feature is not supported in
@@ -14,7 +16,7 @@ from vllm.triton_utils.jit_monitor import logger
 # ------------------------------------------------------------------
 
 
-def activate() -> None:
+def activate(*args, **kwargs) -> None:
     """Enable JIT compilation monitoring after warmup.
 
     Call once per worker process at the end of
@@ -37,4 +39,4 @@ def activate() -> None:
     return
 
 
-vllm.triton_utils.jit_monitor.activate = activate
+_jit_monitor.activate = activate

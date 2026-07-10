@@ -19,6 +19,7 @@ from vllm.compilation.compiler_interface import (
 
 import time
 
+import torch
 import torch.fx as fx
 
 from typing import Literal, Sequence, Any
@@ -43,6 +44,26 @@ from vllm.compilation.compiler_interface import (
     set_inductor_config,
     set_functorch_config,
 )
+
+
+def _patch_torch_accelerator_memory_api() -> None:
+    accelerator = getattr(torch, "accelerator", None)
+    if accelerator is None:
+        return
+    if not hasattr(accelerator, "get_memory_info"):
+        accelerator.get_memory_info = torch.cuda.mem_get_info
+    if not hasattr(accelerator, "memory_stats"):
+        accelerator.memory_stats = torch.cuda.memory_stats
+    if not hasattr(accelerator, "memory_reserved"):
+        accelerator.memory_reserved = torch.cuda.memory_reserved
+    if not hasattr(accelerator, "reset_peak_memory_stats"):
+        accelerator.reset_peak_memory_stats = torch.cuda.reset_peak_memory_stats
+    if not hasattr(accelerator, "empty_cache"):
+        accelerator.empty_cache = torch.cuda.empty_cache
+
+
+_patch_torch_accelerator_memory_api()
+
 
 
 # --------------------------------------------------
