@@ -2,6 +2,7 @@
 # 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import typing
+import os
 from collections.abc import Callable, Iterable, MutableSequence, Sequence
 from itertools import islice
 
@@ -17,12 +18,15 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState
-from .ops.mhc.torch import (
-    hc_head_fused_kernel as hc_head_fused_kernel_torch,
-    mhc_fused_post_pre as mhc_fused_post_pre_torch,
-    mhc_post as mhc_post_torch,
-    mhc_pre as mhc_pre_torch,
+from .ops.mhc.backend import (
+    get_mhc_backend_name,
+    hc_head_fused_kernel,
+    mhc_fused_post_pre,
+    mhc_post,
+    mhc_pre,
 )
+from .ops.mhc.debug_diff import compare_fused_post_pre, enabled as mhc_diff_enabled
+from .ops.mhc.torch import mhc_fused_post_pre as mhc_fused_post_pre_torch
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.fused_moe.layer import (
@@ -729,6 +733,21 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[MacaDeepseekV4Attenti
     return MacaDeepseekV4FlashMLAAttention
 
 
+_TILELANG_FUSED_STAGES = {
+    stage.strip()
+    for stage in os.getenv(
+        "VLLM_METAX_DSV4_MHC_TILELANG_FUSED_STAGES", "attn,ffn"
+    ).split(",")
+    if stage.strip()
+}
+
+
+def _mhc_fused_post_pre_for_stage(stage: str, *args, **kwargs):
+    if get_mhc_backend_name() == "tilelang" and stage not in _TILELANG_FUSED_STAGES:
+        return mhc_fused_post_pre_torch(*args, **kwargs)
+    return mhc_fused_post_pre(*args, **kwargs)
+
+
 class DeepseekV4DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -740,6 +759,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
+        self.layer_idx = extract_layer_index(prefix)
         self.hidden_size = config.hidden_size
 
         self.rms_norm_eps = config.rms_norm_eps
@@ -813,7 +833,7 @@ class DeepseekV4DecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = x
-            post_mix, res_mix, x = mhc_pre_torch(
+            post_mix, res_mix, x = mhc_pre(
                 x,
                 self.hc_attn_fn,
                 self.hc_attn_scale,
@@ -825,7 +845,10 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_sinkhorn_iters,
             )
         else:
-            residual, post_mix, res_mix, x = mhc_fused_post_pre_torch(
+            prev_x, prev_residual = x, residual
+            prev_post_mix, prev_res_mix = post_mix, res_mix
+            residual, post_mix, res_mix, x = _mhc_fused_post_pre_for_stage(
+                "attn",
                 x,
                 residual,
                 post_mix,
@@ -839,10 +862,30 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_post_alpha,
                 self.hc_sinkhorn_iters,
             )
+            if mhc_diff_enabled():
+                compare_fused_post_pre(
+                    layer_idx=self.layer_idx,
+                    stage="attn",
+                    x=prev_x,
+                    residual=prev_residual,
+                    post_layer_mix=prev_post_mix,
+                    comb_res_mix=prev_res_mix,
+                    fn=self.hc_attn_fn,
+                    hc_scale=self.hc_attn_scale,
+                    hc_base=self.hc_attn_base,
+                    rms_eps=self.rms_norm_eps,
+                    hc_pre_eps=self.hc_eps,
+                    hc_sinkhorn_eps=self.hc_eps,
+                    hc_post_mult_value=self.hc_post_alpha,
+                    sinkhorn_repeat=self.hc_sinkhorn_iters,
+                )
         x = self.attn_norm(x)
         x = self.attn(positions, x, None)
 
-        residual, post_mix, res_mix, x = mhc_fused_post_pre_torch(
+        prev_x, prev_residual = x, residual
+        prev_post_mix, prev_res_mix = post_mix, res_mix
+        residual, post_mix, res_mix, x = _mhc_fused_post_pre_for_stage(
+            "ffn",
             x,
             residual,
             post_mix,
@@ -857,6 +900,24 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_sinkhorn_iters,
             n_splits=1,
         )
+        if mhc_diff_enabled():
+            compare_fused_post_pre(
+                layer_idx=self.layer_idx,
+                stage="ffn",
+                x=prev_x,
+                residual=prev_residual,
+                post_layer_mix=prev_post_mix,
+                comb_res_mix=prev_res_mix,
+                fn=self.hc_ffn_fn,
+                hc_scale=self.hc_ffn_scale,
+                hc_base=self.hc_ffn_base,
+                rms_eps=self.rms_norm_eps,
+                hc_pre_eps=self.hc_eps,
+                hc_sinkhorn_eps=self.hc_eps,
+                hc_post_mult_value=self.hc_post_alpha,
+                sinkhorn_repeat=self.hc_sinkhorn_iters,
+                n_splits=1,
+            )
         x = self.ffn_norm(x)
         x = self.ffn(x, input_ids)
         return x, residual, post_mix, res_mix
@@ -1017,7 +1078,7 @@ class DeepseekV4Model(nn.Module):
                 residual,
             )
         if layer is not None:
-            hidden_states = mhc_post_torch(
+            hidden_states = mhc_post(
                 hidden_states, residual, post_mix, res_mix
             )
 
@@ -1028,7 +1089,7 @@ class DeepseekV4Model(nn.Module):
         num_tokens = hidden_states.shape[0]
         self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
-        hidden_states = hc_head_fused_kernel_torch(
+        hidden_states = hc_head_fused_kernel(
             hidden_states,
             self.hc_head_fn,
             self.hc_head_scale,

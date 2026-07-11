@@ -25,7 +25,9 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.fused_moe.layer import (
+    fused_moe_make_expert_params_mapping,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -48,10 +50,7 @@ from .model import (
     DeepseekV4DecoderLayer,
     make_deepseek_v4_expert_params_mapping,
 )
-from .ops.mhc.torch import (
-    hc_head_fused_kernel as hc_head_fused_kernel_torch,
-    mhc_post as mhc_post_torch,
-)
+from .ops.mhc.backend import hc_head_fused_kernel, mhc_post
 
 logger = init_logger(__name__)
 
@@ -161,7 +160,7 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
         hidden_states, residual, post_mix, res_mix = self.mtp_block(
             positions=positions, x=hidden_states, input_ids=None
         )
-        hidden_states = mhc_post_torch(hidden_states, residual, post_mix, res_mix)
+        hidden_states = mhc_post(hidden_states, residual, post_mix, res_mix)
         # Return the flat pre-hc_head residual so it can be re-fed as the
         # next spec step's `previous_hidden_states` when
         # num_speculative_tokens > 1. hc_head is deferred to compute_logits.
@@ -247,7 +246,7 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
         hidden_states = hidden_states.view(
             -1, mtp_layer.hc_mult, mtp_layer.config.hidden_size
         )
-        hidden_states = hc_head_fused_kernel_torch(
+        hidden_states = hc_head_fused_kernel(
             hidden_states,
             mtp_layer.hc_head_fn,
             mtp_layer.hc_head_scale,
@@ -348,7 +347,7 @@ class DeepSeekV4MTP(nn.Module):
                 self.config.n_routed_experts
             )
         else:
-            expert_mapping = FusedMoE.make_expert_params_mapping(
+            expert_mapping = fused_moe_make_expert_params_mapping(
                 self,
                 ckpt_gate_proj_name="w1",
                 ckpt_down_proj_name="w2",

@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 import torch
 
 from vllm.utils.torch_utils import direct_register_custom_op
 from .tilelang_kernels import (
     compute_num_split,
     _mhc_pre_big_fuse,
+    _mhc_pre_mix_debug,
     _mhc_post_fwd,
     mhc_fused_tilelang,
     hc_head_fuse_tilelang
@@ -214,6 +217,148 @@ def mhc_post_tilelang(
     return mhc_post_fwd(x, residual, post_layer_mix, comb_res_mix, out)
 
 
+def _mhc_post_torch_bmm(
+    x_flat: torch.Tensor,
+    residual_flat: torch.Tensor,
+    post_layer_mix_flat: torch.Tensor,
+    comb_res_mix_flat: torch.Tensor,
+) -> torch.Tensor:
+    term2 = torch.bmm(comb_res_mix_flat.transpose(1, 2), residual_flat.float())
+    return (
+        x_flat.float().unsqueeze(-2) * post_layer_mix_flat.unsqueeze(-1) + term2
+    ).bfloat16()
+
+
+def _mhc_apply_mix_torch_sum(
+    residual_cur: torch.Tensor,
+    gemm_out_mul: torch.Tensor,
+    gemm_out_sqrsum: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    n_splits: int,
+) -> torch.Tensor:
+    num_tokens = residual_cur.shape[0]
+    hc_mult = residual_cur.shape[1]
+    hidden_size = residual_cur.shape[2]
+    normalized_mixes = torch.empty(
+        num_tokens,
+        hc_mult * (2 + hc_mult),
+        dtype=torch.float32,
+        device=residual_cur.device,
+    )
+    pre_mix = torch.empty(
+        num_tokens,
+        hc_mult,
+        dtype=torch.float32,
+        device=residual_cur.device,
+    )
+    _mhc_pre_mix_debug(
+        hidden_size,
+        rms_eps,
+        hc_pre_eps,
+        n_splits=n_splits,
+        mhc_mult=hc_mult,
+    )(
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        normalized_mixes,
+        pre_mix,
+    )
+    return (
+        residual_cur.float() * pre_mix.view(num_tokens, hc_mult, 1)
+    ).sum(dim=-2).bfloat16()
+
+
+def _mhc_mixes_from_raw_torch(
+    residual_cur: torch.Tensor,
+    gemm_out_mul: torch.Tensor,
+    gemm_out_sqrsum: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from .torch import mhc_pre_split_mixes_ref, sinkhorn_normalize_ref
+
+    num_tokens = residual_cur.shape[0]
+    hc_mult = residual_cur.shape[1]
+    hidden_size = residual_cur.shape[2]
+    rms_group_size = hc_mult * hidden_size
+    rms = torch.rsqrt(gemm_out_sqrsum.sum(dim=0) / rms_group_size + rms_eps)
+    mixes = (gemm_out_mul.sum(dim=0) * rms.unsqueeze(-1)).unsqueeze(0)
+    pre_mix, post_mix, comb_mix = mhc_pre_split_mixes_ref(
+        mixes,
+        hc_scale,
+        hc_base,
+        hc_mult,
+        hc_post_mult_value,
+        hc_pre_eps,
+    )
+    comb_mix = sinkhorn_normalize_ref(
+        comb_mix,
+        repeat=sinkhorn_repeat,
+        eps=hc_sinkhorn_eps,
+    )
+    pre_mix = pre_mix.view(num_tokens, hc_mult, 1)
+    post_mix = post_mix.view(num_tokens, hc_mult, 1)
+    comb_mix = comb_mix.view(num_tokens, hc_mult, hc_mult)
+    return pre_mix, post_mix, comb_mix
+
+
+def _mhc_exact_sqrsum_torch(residual_cur: torch.Tensor) -> torch.Tensor:
+    residual_2d = residual_cur.view(residual_cur.shape[0], -1).float()
+    return residual_2d.square().sum(-1).view(1, residual_cur.shape[0])
+
+
+def _mhc_exact_raw_torch(
+    residual_cur: torch.Tensor,
+    fn: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    residual_2d = residual_cur.view(residual_cur.shape[0], -1).float()
+    gemm_out_mul = torch.nn.functional.linear(residual_2d, fn).view(
+        1, residual_cur.shape[0], fn.shape[0]
+    )
+    gemm_out_sqrsum = residual_2d.square().sum(-1).view(1, residual_cur.shape[0])
+    return gemm_out_mul, gemm_out_sqrsum
+
+
+def _mhc_pre_from_raw_torch(
+    residual_cur: torch.Tensor,
+    gemm_out_mul: torch.Tensor,
+    gemm_out_sqrsum: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    pre_mix, post_mix, comb_mix = _mhc_mixes_from_raw_torch(
+        residual_cur,
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+    )
+    layer_input = (
+        residual_cur.float() * pre_mix
+    ).sum(dim=-2).bfloat16()
+    return post_mix, comb_mix, layer_input
+
+
 def _mhc_post_tilelang_fake(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -279,17 +424,181 @@ def mhc_fused_post_pre_tilelang(
 
     residual_flat = residual.view(-1, hc_mult, hidden_size)
     num_tokens = residual_flat.shape[0]
+
+    if num_tokens != 1:
+        from .torch import mhc_fused_post_pre as mhc_fused_post_pre_torch
+
+        return mhc_fused_post_pre_torch(
+            x,
+            residual,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            n_splits,
+        )
+
     x_flat = x.view(num_tokens, hidden_size)
     post_layer_mix_flat = post_layer_mix.view(num_tokens, hc_mult)
     comb_res_mix_flat = comb_res_mix.view(num_tokens, hc_mult, hc_mult)
+
+    exact_raw_mode = os.getenv("VLLM_METAX_DSV4_MHC_EXACT_RAW", "0")
+    use_torch_pre = (
+        exact_raw_mode == "torch_pre"
+        or (
+            exact_raw_mode == "0"
+            and os.getenv("VLLM_METAX_DSV4_MHC_UNSAFE_TILELANG_PRE", "0") != "1"
+        )
+    )
+    if exact_raw_mode == "1" or use_torch_pre:
+        residual_cur = _mhc_post_torch_bmm(
+            x_flat,
+            residual_flat,
+            post_layer_mix_flat,
+            comb_res_mix_flat,
+        )
+        residual_cur_view = residual_cur.view(*outer_shape, hc_mult, hidden_size)
+        if use_torch_pre:
+            from .torch import mhc_pre as mhc_pre_torch
+
+            post_mix_cur, comb_mix_cur, layer_input_cur = mhc_pre_torch(
+                residual_cur_view,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+            )
+            return residual_cur_view, post_mix_cur, comb_mix_cur, layer_input_cur
+        post_mix_cur = torch.empty(
+            num_tokens,
+            hc_mult,
+            dtype=torch.float32,
+            device=residual.device,
+        )
+        comb_mix_cur = torch.empty(
+            num_tokens,
+            hc_mult2,
+            dtype=torch.float32,
+            device=residual.device,
+        )
+        layer_input_cur = torch.empty(
+            num_tokens,
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=residual.device,
+        )
+        residual_2d = residual_cur.view(num_tokens, hc_hidden_size).float()
+        gemm_out_mul = torch.nn.functional.linear(residual_2d, fn).view(
+            1, num_tokens, hc_mult3
+        )
+        gemm_out_sqrsum = residual_2d.square().sum(-1).view(1, num_tokens)
+        use_torch_split_from_raw = (
+            os.getenv("VLLM_METAX_DSV4_MHC_TORCH_SPLIT_FROM_RAW", "0") == "1"
+        )
+        if use_torch_split_from_raw:
+            post_mix_torch, comb_mix_torch, layer_input_torch = _mhc_pre_from_raw_torch(
+                residual_cur,
+                gemm_out_mul,
+                gemm_out_sqrsum,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+            )
+            return (
+                residual_cur.view(*outer_shape, hc_mult, hidden_size),
+                post_mix_torch.view(*outer_shape, hc_mult, 1),
+                comb_mix_torch.view(*outer_shape, hc_mult, hc_mult),
+                layer_input_torch.view(*outer_shape, hidden_size),
+            )
+        _mhc_pre_big_fuse(
+            hidden_size,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            n_splits=1,
+            mhc_mult=hc_mult,
+        )(
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            hc_scale,
+            hc_base,
+            residual_cur,
+            post_mix_cur,
+            comb_mix_cur,
+            layer_input_cur,
+        )
+        if os.getenv("VLLM_METAX_DSV4_MHC_TORCH_MIXES_BIG_LAYER", "0") == "1":
+            _, post_mix_torch, comb_mix_torch = _mhc_mixes_from_raw_torch(
+                residual_cur,
+                gemm_out_mul,
+                gemm_out_sqrsum,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+            )
+            return (
+                residual_cur.view(*outer_shape, hc_mult, hidden_size),
+                post_mix_torch.view(*outer_shape, hc_mult, 1),
+                comb_mix_torch.view(*outer_shape, hc_mult, hc_mult),
+                layer_input_cur.view(*outer_shape, hidden_size),
+            )
+        if os.getenv("VLLM_METAX_DSV4_MHC_USE_BIG_FUSE_LAYER", "0") != "1":
+            layer_input_cur.copy_(
+                _mhc_apply_mix_torch_sum(
+                    residual_cur,
+                    gemm_out_mul,
+                    gemm_out_sqrsum,
+                    hc_scale,
+                    hc_base,
+                    rms_eps,
+                    hc_pre_eps,
+                    n_splits=1,
+                )
+            )
+        return (
+            residual_cur.view(*outer_shape, hc_mult, hidden_size),
+            post_mix_cur.view(*outer_shape, hc_mult, 1),
+            comb_mix_cur.view(*outer_shape, hc_mult, hc_mult),
+            layer_input_cur.view(*outer_shape, hidden_size),
+        )
 
     fma_token_threshold = 16
     if num_tokens <= fma_token_threshold:
         # TODO(gnovack): investigate autotuning these heuristics
         tile_n = 2 if num_tokens < 8 else 3
-        n_splits = 8 if (num_tokens < 8 and hidden_size <= 4096) else 4
+        # Decode runs one token at a time.  Splitting the reduction changes the
+        # FP32 accumulation order enough to cross BF16 boundaries against the
+        # Torch MHC contract on real activations, so keep the single-token path
+        # unsplit until a split-k kernel is made numerically equivalent.
+        n_splits = 1 if num_tokens == 1 else 4
     else:
         n_splits = compute_num_split(num_tokens)
+
+    assert hidden_size % n_splits == 0
+    if num_tokens <= fma_token_threshold:
+        assert (hidden_size // n_splits) % 256 == 0
+        assert hc_mult3 % tile_n == 0
 
     gemm_out_mul = torch.empty(
         n_splits,
@@ -339,7 +648,26 @@ def mhc_fused_post_pre_tilelang(
             hc_mult3,
             tile_n=tile_n,
             split_k=n_splits,
+            round_weight=os.getenv(
+                "VLLM_METAX_DSV4_MHC_RAW_ROUND_WEIGHT", "1"
+            ) != "0",
         )
+        if (
+            num_tokens == 1
+            and n_splits == 1
+            and os.getenv(
+                "VLLM_METAX_DSV4_MHC_EXACT_RAW_FROM_TILE_POST", "0"
+            ) == "1"
+        ):
+            exact_mul, exact_sqrsum = _mhc_exact_raw_torch(residual_cur, fn)
+            gemm_out_mul.copy_(exact_mul)
+            gemm_out_sqrsum.copy_(exact_sqrsum)
+        if (
+            num_tokens == 1
+            and n_splits == 1
+            and os.getenv("VLLM_METAX_DSV4_MHC_EXACT_SQRSUM", "0") == "1"
+        ):
+            gemm_out_sqrsum.copy_(_mhc_exact_sqrsum_torch(residual_cur))
     else:
         kernel = _mhc_post_fwd(residual.shape[-2], residual.shape[-1])
         kernel(
@@ -358,6 +686,29 @@ def mhc_fused_post_pre_tilelang(
             gemm_out_mul,
             gemm_out_sqrsum,
             n_splits,
+        )
+
+    use_torch_split_from_raw = (
+        os.getenv("VLLM_METAX_DSV4_MHC_TORCH_SPLIT_FROM_RAW", "0") == "1"
+    )
+    if use_torch_split_from_raw:
+        post_mix_torch, comb_mix_torch, layer_input_torch = _mhc_pre_from_raw_torch(
+            residual_cur,
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+        )
+        return (
+            residual_cur.view(*outer_shape, hc_mult, hidden_size),
+            post_mix_torch.view(*outer_shape, hc_mult, 1),
+            comb_mix_torch.view(*outer_shape, hc_mult, hc_mult),
+            layer_input_torch.view(*outer_shape, hidden_size),
         )
 
     _mhc_pre_big_fuse(
@@ -379,6 +730,19 @@ def mhc_fused_post_pre_tilelang(
         comb_mix_cur,
         layer_input_cur,
     )
+    if os.getenv("VLLM_METAX_DSV4_MHC_USE_BIG_FUSE_LAYER", "0") != "1":
+        layer_input_cur.copy_(
+            _mhc_apply_mix_torch_sum(
+                residual_cur,
+                gemm_out_mul,
+                gemm_out_sqrsum,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                n_splits=n_splits,
+            )
+        )
 
     return (
         residual_cur.view(*outer_shape, hc_mult, hidden_size),

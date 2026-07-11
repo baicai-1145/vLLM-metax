@@ -15,3 +15,4 @@ from . import eagle
 from . import topk_topp_sampler
 from . import mrv2
 from . import jit_monitor
+from . import fused_mtp_input_rmsnorm

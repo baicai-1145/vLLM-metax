@@ -50,16 +50,21 @@ class MacaDeepseekV4FlashMLAAttention(MacaDeepseekV4Attention):
         head_dim = q2.shape[2]
         value_dim = output.shape[-1]
 
-        flat_cache = swa_cache.reshape(-1, swa_cache.shape[-1]).float()
         combined = swa_indices[:, 0, :]
         if topk_indices is not None:
             combined = torch.cat([topk_indices[:, 0, :], combined], dim=-1)
 
         invalid = combined < 0
         gather_idx = combined.masked_fill(invalid, 0)
-        gathered = flat_cache.index_select(0, gather_idx.reshape(-1)).view(
+        flat_idx = gather_idx.reshape(-1)
+        cache_block_size = swa_cache.shape[1]
+        # The paged cache has padded block strides. Gather selected rows before
+        # converting to FP32 instead of materializing the entire KV pool.
+        block_idx = torch.div(flat_idx, cache_block_size, rounding_mode="floor")
+        block_offset = torch.remainder(flat_idx, cache_block_size)
+        gathered = swa_cache[block_idx, block_offset, 0].view(
             batch, -1, head_dim
-        )
+        ).float()
 
         attn = torch.matmul(q2, gathered.transpose(1, 2))
         attn.masked_fill_(invalid.unsqueeze(1), float("-inf"))
@@ -139,8 +144,7 @@ class MacaDeepseekV4FlashMLAAttention(MacaDeepseekV4Attention):
 
         swa_only = self.compress_ratio <= 1
         short_context_only = (
-            swa_metadata.seq_lens is not None
-            and int(swa_metadata.seq_lens.max().item()) <= self.window_size
+            swa_metadata.is_short_context(self.window_size)
         )
         effective_swa_only = swa_only or short_context_only
         # SWA-only layers (compress_ratio <= 1) don't have their own KV cache

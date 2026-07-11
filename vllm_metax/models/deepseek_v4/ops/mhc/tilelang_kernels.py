@@ -21,9 +21,12 @@ if TYPE_CHECKING or current_platform.is_cuda_alike():
         )
     import tilelang
     import tilelang.language as T
+    from tilelang.language.math_intrinsics import ieee_add, ieee_mul
 else:
     tilelang = None  # type: ignore[assignment]
     T = None  # type: ignore[assignment]
+    ieee_add = None  # type: ignore[assignment]
+    ieee_mul = None  # type: ignore[assignment]
 
 
 @cache
@@ -31,7 +34,17 @@ def compute_num_split(num_tokrns: int) -> int:
     return 16 if num_tokrns >= 512 else 64
 
 
+def _tf32_round(value):
+    bits = T.reinterpret(value, T.int32)
+    return T.reinterpret(T.bitwise_and(bits + 0x1000, -0x2000), T.float32)
+
+
+def _torch_like_scale_add(value, scale, base):
+    return ieee_add(ieee_mul(value, scale, "rn"), base, "rn")
+
+
 @tilelang.jit(
+    execution_backend="cython",
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
@@ -83,6 +96,9 @@ def _mhc_pre_big_fuse(
                     mixes[j] *= rms[0]
                 T.copy(mixes, mixes_shared, disable_tma=True)
 
+            # The second warp consumes values published by the first warp.
+            T.sync_threads()
+
             if T.get_thread_binding() < 64:
                 ##################################################################
                 # _mhc_pre_split_mixes_fwd (post & comb)
@@ -90,15 +106,19 @@ def _mhc_pre_big_fuse(
                 for j in T.Parallel(mhc_mult):
                     post_mix[pid, j] = (
                         T.sigmoid(
-                            mixes_shared[j + mhc_mult] * mhc_scale[1]
-                            + mhc_base[j + mhc_mult]
+                            _torch_like_scale_add(
+                                mixes_shared[j + mhc_mult],
+                                mhc_scale[1],
+                                mhc_base[j + mhc_mult],
+                            )
                         )
                         * mhc_post_mult_value
                     )
                 for j, k in T.Parallel(mhc_mult, mhc_mult):
-                    cm[j, k] = (
-                        mixes_shared[j * mhc_mult + k + mhc_mult * 2] * mhc_scale[2]
-                        + mhc_base[j * mhc_mult + k + mhc_mult * 2]
+                    cm[j, k] = _torch_like_scale_add(
+                        mixes_shared[j * mhc_mult + k + mhc_mult * 2],
+                        mhc_scale[2],
+                        mhc_base[j * mhc_mult + k + mhc_mult * 2],
                     )
 
                 ##################################################################
@@ -137,11 +157,15 @@ def _mhc_pre_big_fuse(
             else:
                 ##################################################################
                 # _mhc_pre_split_mixes_fwd (pre)
-                pre_mix_shared = T.alloc_shared(mhc_mult, T.float32)
-                for j in T.Parallel(mhc_mult):
-                    pre_mix_shared[j] = (
+                pre_mix = T.alloc_fragment(mhc_mult, T.float32)
+                for j in T.serial(mhc_mult):
+                    pre_mix[j] = (
                         T.sigmoid(
-                            mixes_shared[j] * mhc_scale[0] + mhc_base[j],
+                            _torch_like_scale_add(
+                                mixes_shared[j],
+                                mhc_scale[0],
+                                mhc_base[j],
+                            ),
                         )
                         + mhc_pre_eps
                     )
@@ -156,10 +180,43 @@ def _mhc_pre_big_fuse(
                     ol = T.alloc_fragment(hidden_block, T.float32)
                     T.clear(ol)
 
-                    for i_mhc in T.serial(mhc_mult):
-                        pre = pre_mix_shared[i_mhc]
+                    if mhc_mult == 4:
+                        pre0 = T.alloc_fragment(1, T.float32)
+                        pre1 = T.alloc_fragment(1, T.float32)
+                        pre2 = T.alloc_fragment(1, T.float32)
+                        pre3 = T.alloc_fragment(1, T.float32)
+                        pre0[0] = pre_mix[0]
+                        pre1[0] = pre_mix[1]
+                        pre2[0] = pre_mix[2]
+                        pre3[0] = pre_mix[3]
+                        x0 = T.alloc_fragment(hidden_block, T.float32)
+                        x1 = T.alloc_fragment(hidden_block, T.float32)
+                        x2 = T.alloc_fragment(hidden_block, T.float32)
+                        x3 = T.alloc_fragment(hidden_block, T.float32)
+                        T.copy(xs[0, 0], x0, disable_tma=True)
+                        T.copy(xs[1, 0], x1, disable_tma=True)
+                        T.copy(xs[2, 0], x2, disable_tma=True)
+                        T.copy(xs[3, 0], x3, disable_tma=True)
                         for i1_h in T.Parallel(hidden_block):
-                            ol[i1_h] += pre * xl[i_mhc, i1_h]
+                            term0 = ieee_mul(pre0[0], x0[i1_h], "rn")
+                            term1 = ieee_mul(pre1[0], x1[i1_h], "rn")
+                            term2 = ieee_mul(pre2[0], x2[i1_h], "rn")
+                            term3 = ieee_mul(pre3[0], x3[i1_h], "rn")
+                            ol[i1_h] = ieee_add(
+                                ieee_add(term0, term2, "rn"),
+                                ieee_add(term1, term3, "rn"),
+                                "rn",
+                            )
+                    else:
+                        for i_mhc in T.serial(mhc_mult):
+                            mhc_idx = mhc_mult - 1 - i_mhc
+                            pre = pre_mix[mhc_idx]
+                            for i1_h in T.Parallel(hidden_block):
+                                ol[i1_h] = ieee_add(
+                                    ol[i1_h],
+                                    ieee_mul(pre, xl[mhc_idx, i1_h], "rn"),
+                                    "rn",
+                                )
 
                     T.copy(ol, layer_input[pid, i0_h * hidden_block], disable_tma=True)
 
@@ -167,6 +224,56 @@ def _mhc_pre_big_fuse(
 
 
 @tilelang.jit(
+    execution_backend="cython",
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
+        tilelang.PassConfigKey.TL_DISABLE_VECTORIZE_256: True,
+    },
+)
+def _mhc_pre_mix_debug(
+    hidden_size: int,
+    rms_eps: float,
+    mhc_pre_eps: float,
+    n_splits: int = 16,
+    mhc_mult: int = 4,
+):
+    num_tokens = T.dynamic("num_tokens")
+    mhc_mult3 = mhc_mult * (2 + mhc_mult)
+
+    @T.prim_func
+    def mhc_pre_mix_debug(
+        gemm_out_mul: T.Tensor[(n_splits, num_tokens, mhc_mult3), T.float32],
+        gemm_out_sqrsum: T.Tensor[(n_splits, num_tokens), T.float32],
+        mhc_scale: T.Tensor[(3,), T.float32],
+        mhc_base: T.Tensor[(mhc_mult3,), T.float32],
+        normalized_mixes: T.Tensor[(num_tokens, mhc_mult3), T.float32],
+        pre_mix: T.Tensor[(num_tokens, mhc_mult), T.float32],
+    ) -> None:
+        with T.Kernel(num_tokens, threads=64) as pid:
+            rms = T.alloc_fragment(1, T.float32)
+            mixes = T.alloc_fragment(mhc_mult3, T.float32)
+            rms[0] = 0
+            for i_split in T.serial(n_splits):
+                rms[0] += gemm_out_sqrsum[i_split, pid]
+            rms[0] = T.rsqrt(rms[0] / (mhc_mult * hidden_size) + rms_eps)
+            for j in T.Parallel(mhc_mult3):
+                mixes[j] = 0
+                for i_split in T.serial(n_splits):
+                    mixes[j] += gemm_out_mul[i_split, pid, j]
+                mixes[j] *= rms[0]
+                normalized_mixes[pid, j] = mixes[j]
+            for j in T.Parallel(mhc_mult):
+                pre_mix[pid, j] = (
+                    T.sigmoid(_torch_like_scale_add(mixes[j], mhc_scale[0], mhc_base[j]))
+                    + mhc_pre_eps
+                )
+
+    return mhc_pre_mix_debug
+
+
+@tilelang.jit(
+    execution_backend="cython",
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
@@ -210,11 +317,23 @@ def _mhc_post_fwd(
                 T.copy(b_shared, b_local)
                 T.copy(d_shared, d_local)
                 for i_mhco, i1_h in T.Parallel(mhc, h_blk):
-                    x_local[i_mhco, i1_h] = c_local[i_mhco] * d_local[i1_h]
+                    x_local[i_mhco, i1_h] = 0.0
                     for i_mhci in T.serial(mhc):
-                        x_local[i_mhco, i1_h] += (
-                            a_local[i_mhci, i_mhco] * b_local[i_mhci, i1_h]
+                        mhc_idx = mhc - 1 - i_mhci
+                        x_local[i_mhco, i1_h] = ieee_add(
+                            x_local[i_mhco, i1_h],
+                            ieee_mul(
+                                _tf32_round(a_local[mhc_idx, i_mhco]),
+                                b_local[mhc_idx, i1_h],
+                                "rn",
+                            ),
+                            "rn",
                         )
+                    x_local[i_mhco, i1_h] = ieee_add(
+                        x_local[i_mhco, i1_h],
+                        ieee_mul(c_local[i_mhco], d_local[i1_h], "rn"),
+                        "rn",
+                    )
                 T.copy(x_local, x_shared)
 
                 T.copy(x_shared, x[pid_n, 0, i0_h * h_blk], disable_tma=True)
@@ -223,6 +342,7 @@ def _mhc_post_fwd(
 
 
 @tilelang.jit(
+    execution_backend="cython",
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
@@ -245,6 +365,7 @@ def mhc_fused_tilelang(
     h_blk: int = 256,
     tile_n: int = 1,
     split_k: int = 1,
+    round_weight: bool = True,
 ) -> tilelang.JITKernel:
     """Fused mhc post-mapping + pre-norm GEMM FMA"""
     m = T.dynamic("num_tokens")
@@ -287,12 +408,13 @@ def mhc_fused_tilelang(
 
         T.copy(post_mix[i_n, 0], s_post)
         T.copy(comb_mix[i_n, 0, 0], s_comb)
+        T.sync_threads()
 
         for j in T.unroll(hc):
             pm[j] = s_post[j]
         for j in T.unroll(hc):
             for k in T.unroll(hc):
-                cm[k, j] = s_comb[k, j]
+                cm[k, j] = _tf32_round(s_comb[k, j])
 
         # Each thread owns h_iters elements of the k-split's h slice.
         for it in T.serial(h_iters):
@@ -300,9 +422,22 @@ def mhc_fused_tilelang(
 
             # Compute new residual from layer output and past residual
             for j in T.unroll(hc):
-                new_r[j] = pm[j] * x_in[i_n, h_idx]
+                new_r[j] = 0.0
                 for k in T.unroll(hc):
-                    new_r[j] += cm[k, j] * residual_in[i_n, k, h_idx]
+                    mhc_idx = k
+                    new_r[j] = ieee_add(
+                        new_r[j],
+                        ieee_mul(cm[mhc_idx, j], residual_in[i_n, mhc_idx, h_idx], "rn"),
+                        "rn",
+                    )
+                new_r[j] = ieee_add(
+                    new_r[j],
+                    ieee_mul(pm[j], x_in[i_n, h_idx], "rn"),
+                    "rn",
+                )
+                # mhc_post returns BF16. The following prenorm/GEMM must
+                # consume that rounded value, not the pre-cast FP32 value.
+                new_r[j] = T.cast(T.cast(new_r[j], T.bfloat16), T.float32)
 
             # populate residual_out and compute sqr sum
             if i_nt == 0:
@@ -313,7 +448,13 @@ def mhc_fused_tilelang(
             # Per-thread FMA into acc[n]
             for n in T.unroll(tile_n):
                 for j in T.unroll(hc):
-                    acc[n] += weight_t[i_nt * tile_n + n, j, h_idx] * new_r[j]
+                    weight_value = T.alloc_var(T.float32)
+                    weight_value = weight_t[i_nt * tile_n + n, j, h_idx]
+                    if round_weight:
+                        weight_value = _tf32_round(weight_value)
+                    acc[n] += (
+                        weight_value * new_r[j]
+                    )
 
         for n in T.unroll(tile_n):
             acc[n] = T.warp_reduce_sum(acc[n])
@@ -343,6 +484,7 @@ def mhc_fused_tilelang(
                 rp_out[i_ks, i_n] = v2
 
 @tilelang.jit(
+    execution_backend="cython",
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
@@ -417,8 +559,16 @@ def hc_head_fuse_tilelang(
         rsqrt_val[0] = T.rsqrt(sqrsum_r[0] / hc_dim + rms_eps)
         for m in T.Parallel(hc_mult):
             pre_mix_shared[m] = (
-                T.sigmoid(mixes_r[m] * rsqrt_val[0] * hc_scale[0] + hc_base[m]) + hc_eps
+                T.sigmoid(
+                    _torch_like_scale_add(
+                        mixes_r[m] * rsqrt_val[0],
+                        hc_scale[0],
+                        hc_base[m],
+                    )
+                )
+                + hc_eps
             )
+        T.sync_threads()
 
         # ------------------------------------------------------------------
         # Pass 2 – apply_mix: pipelined weighted sum over residual channels

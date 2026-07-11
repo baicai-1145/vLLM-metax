@@ -446,8 +446,7 @@ class MacaDeepseekV4Indexer(nn.Module):
             swa_metadata = attn_metadata.get(self.prefix.replace('.indexer', '.swa_cache'))
             if (
                 swa_metadata is not None
-                and getattr(swa_metadata, 'seq_lens', None) is not None
-                and int(swa_metadata.seq_lens.max().item()) <= self.config.sliding_window
+                and swa_metadata.is_short_context(self.config.sliding_window)
             ):
                 assert self.topk_indices_buffer is not None
                 self.topk_indices_buffer[: hidden_states.shape[0]].fill_(-1)

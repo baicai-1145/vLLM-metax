@@ -149,6 +149,7 @@ class DeepseekSparseSWAMetadata:
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
     block_size: int
+    max_seq_len: int  # Host-side batch max; avoids a device sync in every layer.
     seq_lens: torch.Tensor | None = None  # [num_seqs]
     query_start_loc: torch.Tensor | None = None  # [num_seqs + 1]
     query_start_loc_cpu: torch.Tensor | None = None  # [num_seqs + 1]
@@ -181,6 +182,9 @@ class DeepseekSparseSWAMetadata:
     tile_sched_swaonly: "FlashMLASchedMeta | None" = None
     tile_sched_c4a: "FlashMLASchedMeta | None" = None
     tile_sched_c128a: "FlashMLASchedMeta | None" = None
+
+    def is_short_context(self, window_size: int) -> bool:
+        return self.max_seq_len <= window_size
 
 
 class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
@@ -327,6 +331,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         tile_sched = self.build_tile_scheduler(num_decode_tokens)
 
         return DeepseekSparseSWAMetadata(
+            max_seq_len=common_attn_metadata.max_seq_len,
             seq_lens=seq_lens,
             query_start_loc=query_start_loc,
             query_start_loc_cpu=query_start_loc_cpu,
