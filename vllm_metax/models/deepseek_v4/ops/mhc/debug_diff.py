@@ -19,6 +19,7 @@ import torch
 _CALL_COUNT = 0
 _MISMATCH_COUNT = 0
 _RAW_CAPTURE_CALL_COUNT = 0
+_FUSED_CAPTURE_CALL_COUNT = 0
 
 
 def enabled() -> bool:
@@ -61,6 +62,54 @@ def _dump_dir() -> Path | None:
 
 def _clone_arg(value: torch.Tensor) -> torch.Tensor:
     return value.detach().contiguous().clone()
+
+
+def maybe_capture_mhc_fused_post_prenorm(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    fn: torch.Tensor,
+    residual_cur: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    **params: Any,
+) -> None:
+    """Persist detached exact decode boundaries only when explicitly enabled."""
+    global _FUSED_CAPTURE_CALL_COUNT
+    directory = os.getenv("VLLM_METAX_DSV4_MHC_FUSED_CAPTURE_DIR")
+    if not directory or tuple(residual_cur.shape) != (1, 4, 4096):
+        return
+    ranks = os.getenv("VLLM_METAX_DSV4_MHC_RAW_CAPTURE_RANKS", "")
+    rank = _rank()
+    if ranks and rank not in {item.strip() for item in ranks.split(",")}:
+        return
+    limit = int(os.getenv("VLLM_METAX_DSV4_MHC_RAW_CAPTURE_MAX_CALLS", "0"))
+    if limit and _FUSED_CAPTURE_CALL_COUNT >= limit:
+        return
+    call = _FUSED_CAPTURE_CALL_COUNT
+    _FUSED_CAPTURE_CALL_COUNT += 1
+    residual_2d = residual_cur.view(1, -1).float()
+    payload = {
+        "schema_version": 2,
+        "rank": int(rank) if rank.isdigit() else rank,
+        "call": call,
+        "x_flat": _clone_arg(x).cpu(),
+        "residual_flat": _clone_arg(residual).cpu(),
+        "post_layer_mix_flat": _clone_arg(post_mix).cpu(),
+        "comb_res_mix_flat": _clone_arg(comb_mix).cpu(),
+        "fn": _clone_arg(fn).cpu(),
+        "residual_cur_bf16": _clone_arg(residual_cur).cpu(),
+        "residual_cur_fp32": _clone_arg(residual_2d).cpu(),
+        "gemm_out_mul": _clone_arg(torch.nn.functional.linear(residual_2d, fn).view(1, 1, 24)).cpu(),
+        "gemm_out_sqrsum": _clone_arg(residual_2d.square().sum(-1).view(1, 1)).cpu(),
+        "hc_scale": _clone_arg(hc_scale).cpu(),
+        "hc_base": _clone_arg(hc_base).cpu(),
+        "params": params,
+    }
+    path = Path(directory)
+    path.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, path / f"rank{rank}_call{call}.pt")
 
 
 def _as_raw_bits(tensor: torch.Tensor) -> torch.Tensor:

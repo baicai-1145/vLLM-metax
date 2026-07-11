@@ -41,6 +41,17 @@ _REQUIRED_PARAMS = {
     "sinkhorn_repeat",
     "n_splits",
 }
+_FUSED_REQUIRED_KEYS = {
+    "schema_version",
+    "rank",
+    "call",
+    "x_flat",
+    "residual_flat",
+    "post_layer_mix_flat",
+    "comb_res_mix_flat",
+    "residual_cur_bf16",
+    "params",
+}
 
 
 def _file_key(path: Path) -> tuple[int, int]:
@@ -122,6 +133,104 @@ def load_payload(path: str | Path, device: str = "cpu") -> dict[str, Any]:
     ):
         out[key] = out[key].to(device)
     return out
+
+
+def load_fused_post_payload(path: str | Path, device: str = "cpu") -> dict[str, Any]:
+    payload_path = Path(path)
+    payload = torch.load(payload_path, map_location="cpu", weights_only=False)
+    _require(set(payload) >= _FUSED_REQUIRED_KEYS, payload_path, "fused keys")
+    _require(payload["schema_version"] == 2, payload_path, "schema_version must be 2")
+    file_rank, file_call = _file_key(payload_path)
+    _require(payload["rank"] == file_rank, payload_path, "rank does not match filename")
+    _require(payload["call"] == file_call, payload_path, "call does not match filename")
+    _require(tuple(payload["x_flat"].shape) == (1, 4096), payload_path, "x shape")
+    _require(tuple(payload["residual_flat"].shape) == (1, 4, 4096), payload_path, "residual shape")
+    _require(tuple(payload["post_layer_mix_flat"].shape) == (1, 4), payload_path, "post shape")
+    _require(tuple(payload["comb_res_mix_flat"].shape) == (1, 4, 4), payload_path, "comb shape")
+    _require(payload["x_flat"].dtype == torch.bfloat16, payload_path, "x dtype")
+    _require(payload["residual_flat"].dtype == torch.bfloat16, payload_path, "residual dtype")
+    _require(payload["post_layer_mix_flat"].dtype == torch.float32, payload_path, "post dtype")
+    _require(payload["comb_res_mix_flat"].dtype == torch.float32, payload_path, "comb dtype")
+    _require(payload["residual_cur_bf16"].dtype == torch.bfloat16, payload_path, "output dtype")
+    return {
+        key: value.to(device) if isinstance(value, torch.Tensor) else value
+        for key, value in payload.items()
+    }
+
+
+def run_exact_mhc_post_tilelang(
+    payload: dict[str, Any], out: torch.Tensor | None = None
+) -> torch.Tensor:
+    from vllm_metax.models.deepseek_v4.ops.mhc.tilelang_kernels import _mhc_post_exact_tl
+
+    return _mhc_post_exact_tl(
+        payload["x_flat"],
+        payload["residual_flat"],
+        payload["post_layer_mix_flat"],
+        payload["comb_res_mix_flat"],
+        out=out,
+    )
+
+
+def run_post_diff(
+    corpus: str | Path,
+    *,
+    device: str,
+    require_bitwise: bool,
+    check_graph_replay: bool,
+    max_files: int | None,
+) -> dict[str, Any]:
+    files = iter_corpus_files(corpus)
+    if max_files is not None:
+        files = files[:max_files]
+    result: dict[str, Any] = {
+        "files": len(files), "passed": 0, "failed": 0,
+        "first_failure": None, "bitwise": bool(require_bitwise),
+    }
+    for path in files:
+        payload = load_fused_post_payload(path, device=device)
+        got = run_exact_mhc_post_tilelang(payload)
+        diff = tensor_diff(payload["residual_cur_bf16"], got)
+        if diff["equal"]:
+            result["passed"] += 1
+        else:
+            result["failed"] += 1
+            if result["first_failure"] is None:
+                result["first_failure"] = {"file": str(path), "diff": diff}
+    if check_graph_replay:
+        result["graph_replay"] = check_post_graph_replay(files, device=device)
+    return result
+
+
+def check_post_graph_replay(files: list[Path], *, device: str) -> dict[str, Any]:
+    if device != "cuda":
+        return {"skipped": True, "reason": "cuda graph replay requires cuda device"}
+    if len(files) < 2:
+        raise ValueError("graph replay requires at least two fused payloads")
+    first, second = [load_fused_post_payload(path, device=device) for path in files[:2]]
+    keys = ("x_flat", "residual_flat", "post_layer_mix_flat", "comb_res_mix_flat")
+    inputs = {key: first[key].detach().clone() for key in keys}
+    output = torch.empty_like(first["residual_cur_bf16"])
+    for _ in range(3):
+        run_exact_mhc_post_tilelang({**first, **inputs})
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    input_ptrs = {key: value.data_ptr() for key, value in inputs.items()}
+    with torch.cuda.graph(graph):
+        run_exact_mhc_post_tilelang({**first, **inputs}, out=output)
+    output_ptr = output.data_ptr()
+    for source in (first, second):
+        for key in keys:
+            inputs[key].copy_(source[key])
+        graph.replay()
+        torch.cuda.synchronize()
+        if not tensor_diff(source["residual_cur_bf16"], output)["equal"]:
+            raise AssertionError(f"post graph replay mismatch: {source}")
+        if output.data_ptr() != output_ptr or any(
+            inputs[key].data_ptr() != input_ptrs[key] for key in keys
+        ):
+            raise AssertionError("post graph replay pointer changed")
+    return {"passed": True, "replays": 2, "pointers_stable": True}
 
 
 def _torch_trace_from_payload(payload: dict[str, Any]) -> dict[str, torch.Tensor]:
@@ -209,6 +318,14 @@ def run_diff(
     benchmark: bool = False,
     max_files: int | None = None,
 ) -> dict[str, Any]:
+    if candidate == "post-mma":
+        return run_post_diff(
+            corpus,
+            device=device,
+            require_bitwise=require_bitwise,
+            check_graph_replay=check_graph_replay,
+            max_files=max_files,
+        )
     files = iter_corpus_files(corpus)
     if max_files is not None:
         files = files[:max_files]
@@ -340,7 +457,9 @@ def check_direct_graph_replay(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("corpus", type=Path)
-    parser.add_argument("--candidate", choices=("torch", "tilelang"), required=True)
+    parser.add_argument(
+        "--candidate", choices=("torch", "tilelang", "post-mma"), required=True
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--require-bitwise", action="store_true")
     parser.add_argument("--check-graph-replay", action="store_true")

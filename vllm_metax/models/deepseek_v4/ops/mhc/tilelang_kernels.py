@@ -470,6 +470,92 @@ def _mhc_post_fwd(
     return _mhc_post_fwd_kernel
 
 
+def _mhc_post_exact_tl(
+    x_flat: torch.Tensor,
+    residual_flat: torch.Tensor,
+    post_layer_mix_flat: torch.Tensor,
+    comb_res_mix_flat: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Fixed decode-shape TileLang post candidate with a stable output buffer."""
+    expected = (1, 4, 4096)
+    if x_flat.dtype != torch.bfloat16 or tuple(x_flat.shape) != (1, 4096):
+        raise ValueError("exact MHC post requires x BF16[1,4096]")
+    if residual_flat.dtype != torch.bfloat16 or tuple(residual_flat.shape) != expected:
+        raise ValueError("exact MHC post requires residual BF16[1,4,4096]")
+    if post_layer_mix_flat.dtype != torch.float32 or tuple(post_layer_mix_flat.shape) != (1, 4):
+        raise ValueError("exact MHC post requires post mix FP32[1,4]")
+    if comb_res_mix_flat.dtype != torch.float32 or tuple(comb_res_mix_flat.shape) != (1, 4, 4):
+        raise ValueError("exact MHC post requires comb mix FP32[1,4,4]")
+    if out is None:
+        out = torch.empty_like(residual_flat)
+    if out.dtype != torch.bfloat16 or tuple(out.shape) != expected:
+        raise ValueError("exact MHC post requires output BF16[1,4,4096]")
+    _mhc_post_exact_mma()(
+        comb_res_mix_flat, residual_flat, post_layer_mix_flat, x_flat, out
+    )
+    return out
+
+
+@tilelang.jit(
+    execution_backend="cython",
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        tilelang.PassConfigKey.TL_DISABLE_VECTORIZE_256: True,
+    },
+)
+def _mhc_post_exact_mma() -> tilelang.JITKernel:
+    """Exact post map using the MetaX TF32 MMA path.
+
+    The MMA emitter requires M/K tiles compatible with the 16x16x8 TF32
+    instruction. The logical four MHC streams are therefore embedded in a
+    128x32 by 32x128 tile; padded rows and K values are zero and cannot affect
+    the first four output rows.
+    """
+
+    @T.prim_func
+    def mhc_post_exact_mma(
+        comb_mix: T.Tensor[(1, 4, 4), T.float32],
+        residual: T.Tensor[(1, 4, 4096), T.bfloat16],
+        post_mix: T.Tensor[(1, 4), T.float32],
+        x: T.Tensor[(1, 4096), T.bfloat16],
+        out: T.Tensor[(1, 4, 4096), T.bfloat16],
+    ) -> None:
+        with T.Kernel(32, threads=128) as bx:
+            a_shared = T.alloc_shared((128, 32), T.tfloat32)
+            b_shared = T.alloc_shared((32, 128), T.tfloat32)
+            c_local = T.alloc_fragment((128, 128), T.float32)
+
+            T.clear(c_local)
+            for i, k in T.Parallel(128, 32):
+                if i < 4 and k < 4:
+                    a_shared[i, k] = T.cast(
+                        _tf32_round(comb_mix[0, k, i]), T.tfloat32
+                    )
+                else:
+                    a_shared[i, k] = T.cast(0.0, T.tfloat32)
+
+            for k, j in T.Parallel(32, 128):
+                if k < 4:
+                    b_shared[k, j] = T.cast(
+                        T.cast(residual[0, k, bx * 128 + j], T.float32),
+                        T.tfloat32,
+                    )
+                else:
+                    b_shared[k, j] = T.cast(0.0, T.tfloat32)
+
+            T.gemm(a_shared, b_shared, c_local, False, False)
+
+            for i, j in T.Parallel(4, 128):
+                post_term = ieee_mul(
+                    post_mix[0, i], T.cast(x[0, bx * 128 + j], T.float32), "rn"
+                )
+                value = ieee_add(c_local[i, j], post_term, "rn")
+                out[0, i, bx * 128 + j] = T.cast(value, T.bfloat16)
+
+    return mhc_post_exact_mma
+
+
 @tilelang.jit(
     execution_backend="cython",
     pass_configs={

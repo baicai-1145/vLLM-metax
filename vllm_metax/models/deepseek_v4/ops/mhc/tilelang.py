@@ -525,6 +525,24 @@ def mhc_fused_post_pre_tilelang(
             post_layer_mix_flat,
             comb_res_mix_flat,
         )
+        from .debug_diff import maybe_capture_mhc_fused_post_prenorm
+
+        maybe_capture_mhc_fused_post_prenorm(
+            x_flat,
+            residual_flat,
+            post_layer_mix_flat,
+            comb_res_mix_flat,
+            fn,
+            residual_cur,
+            hc_scale,
+            hc_base,
+            rms_eps=rms_eps,
+            hc_pre_eps=hc_pre_eps,
+            hc_sinkhorn_eps=hc_sinkhorn_eps,
+            hc_post_mult_value=hc_post_mult_value,
+            sinkhorn_repeat=sinkhorn_repeat,
+            n_splits=1,
+        )
         residual_cur_view = residual_cur.view(*outer_shape, hc_mult, hidden_size)
         if use_torch_pre:
             from .torch import mhc_pre as mhc_pre_torch

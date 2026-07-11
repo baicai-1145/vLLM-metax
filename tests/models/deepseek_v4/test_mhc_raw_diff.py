@@ -115,6 +115,19 @@ def test_tensor_diff_reports_fp32_and_bf16_raw_mismatch():
     assert bf16_diff["lhs_bits"] != bf16_diff["rhs_bits"]
 
 
+def test_exact_post_contract_rejects_non_decode_shape():
+    from vllm_metax.models.deepseek_v4.ops.mhc.tilelang_kernels import (
+        _mhc_post_exact_tl,
+    )
+
+    x = torch.zeros((1, 8), dtype=torch.bfloat16)
+    residual = torch.zeros((1, 4, 8), dtype=torch.bfloat16)
+    post_mix = torch.zeros((1, 4), dtype=torch.float32)
+    comb_mix = torch.zeros((1, 4, 4), dtype=torch.float32)
+    with pytest.raises(ValueError, match=r"x BF16\[1,4096\]"):
+        _mhc_post_exact_tl(x, residual, post_mix, comb_mix)
+
+
 def test_assert_bitwise_trace_equal_rejects_stage_mismatch():
     reference = {"stage": torch.tensor([1.0], dtype=torch.float32)}
     candidate = {"stage": torch.tensor([2.0], dtype=torch.float32)}
