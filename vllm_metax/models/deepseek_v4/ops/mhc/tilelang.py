@@ -503,6 +503,21 @@ def mhc_fused_post_pre_tilelang(
             1, num_tokens, hc_mult3
         )
         gemm_out_sqrsum = residual_2d.square().sum(-1).view(1, num_tokens)
+        from .debug_diff import maybe_capture_mhc_pre_raw
+
+        maybe_capture_mhc_pre_raw(
+            residual_cur,
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            n_splits=1,
+        )
         use_torch_split_from_raw = (
             os.getenv("VLLM_METAX_DSV4_MHC_TORCH_SPLIT_FROM_RAW", "0") == "1"
         )
@@ -687,6 +702,22 @@ def mhc_fused_post_pre_tilelang(
             gemm_out_sqrsum,
             n_splits,
         )
+
+    from .debug_diff import maybe_capture_mhc_pre_raw
+
+    maybe_capture_mhc_pre_raw(
+        residual_cur,
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits=n_splits,
+    )
 
     use_torch_split_from_raw = (
         os.getenv("VLLM_METAX_DSV4_MHC_TORCH_SPLIT_FROM_RAW", "0") == "1"
