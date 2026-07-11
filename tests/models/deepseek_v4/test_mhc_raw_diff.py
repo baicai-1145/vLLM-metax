@@ -243,3 +243,43 @@ def test_cli_writes_json_summary(tmp_path):
 
     assert exit_code == 0
     assert json.loads(json_path.read_text())["passed"] == 1
+
+
+def test_exact_decode_contract_selector():
+    from vllm_metax.models.deepseek_v4.ops.mhc.tilelang import (
+        _is_exact_mhc_decode_contract,
+    )
+
+    assert _is_exact_mhc_decode_contract(
+        num_tokens=1,
+        hc_mult=4,
+        hidden_size=4096,
+        n_splits=1,
+        rms_eps=1e-6,
+        hc_pre_eps=1e-6,
+        hc_sinkhorn_eps=1e-6,
+        hc_post_mult_value=2.0,
+        sinkhorn_repeat=20,
+    )
+    assert not _is_exact_mhc_decode_contract(
+        num_tokens=2,
+        hc_mult=4,
+        hidden_size=4096,
+        n_splits=1,
+        rms_eps=1e-6,
+        hc_pre_eps=1e-6,
+        hc_sinkhorn_eps=1e-6,
+        hc_post_mult_value=2.0,
+        sinkhorn_repeat=20,
+    )
+    assert not _is_exact_mhc_decode_contract(
+        num_tokens=1,
+        hc_mult=4,
+        hidden_size=4096,
+        n_splits=1,
+        rms_eps=1e-5,
+        hc_pre_eps=1e-6,
+        hc_sinkhorn_eps=1e-6,
+        hc_post_mult_value=2.0,
+        sinkhorn_repeat=20,
+    )

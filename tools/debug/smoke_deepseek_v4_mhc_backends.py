@@ -8,6 +8,8 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 
+from vllm_metax.models.deepseek_v4.ops.mhc.debug_diff import tensor_diff
+
 
 def _load_model_tensor(model: str, name: str) -> torch.Tensor:
     model_path = Path(model)
@@ -117,7 +119,7 @@ def run_backend(
     }
 
 
-def check_graph_replay(hidden: int) -> None:
+def check_graph_replay(hidden: int, raw_corpus: str | None = None) -> None:
     os.environ['VLLM_METAX_DSV4_MHC_BACKEND'] = 'tilelang'
     os.environ['VLLM_METAX_DSV4_MHC_TILELANG_OPS'] = 'fused,post,head'
     mod = importlib.import_module('vllm_metax.models.deepseek_v4.ops.mhc.backend')
@@ -141,13 +143,13 @@ def check_graph_replay(hidden: int) -> None:
             1e-6,
             1e-6,
             2.0,
-            3,
+            20,
         )
         post_out = mod.mhc_post(x, residual, post, comb)
         head = mod.hc_head_fused_kernel(
             residual, head_fn, head_scale, head_base, 1e-6, 1e-6
         )
-        return fused[0], fused[3], post_out, head
+        return fused[0], fused[1], fused[2], fused[3], post_out, head
 
     for _ in range(2):
         outputs = sequence()
@@ -157,19 +159,29 @@ def check_graph_replay(hidden: int) -> None:
     with torch.cuda.graph(graph):
         outputs = sequence()
     torch.cuda.synchronize()
+    output_ptrs = [output.data_ptr() for output in outputs]
     graph.replay()
     torch.cuda.synchronize()
-    before = [output.float().abs().max().item() for output in outputs]
+    before = [output.detach().clone() for output in outputs]
     residual.zero_()
     x.zero_()
+    expected_after = [output.detach().clone() for output in sequence()]
     graph.replay()
     torch.cuda.synchronize()
-    after = [output.float().abs().max().item() for output in outputs]
-    if any(value == 0.0 for value in before) or any(value != 0.0 for value in after):
+    if [output.data_ptr() for output in outputs] != output_ptrs:
+        raise RuntimeError('TileLang graph replay changed output data_ptrs')
+    if any(torch.equal(old, new) for old, new in zip(before, outputs)):
         raise RuntimeError(
-            f'TileLang graph replay did not refresh output: {before=} {after=}'
+            'TileLang graph replay did not refresh every fused/post/head output'
         )
-    print(f'graph replay: before={before} after_zero_input={after}')
+    for index, (actual, expected) in enumerate(zip(outputs, expected_after)):
+        diff = tensor_diff(actual, expected)
+        if not diff['equal']:
+            raise RuntimeError(f'graph replay output {index} mismatch: {diff}')
+    print(
+        'graph replay: refreshed fused_residual/fused_post/fused_comb/'
+        'fused_layer_input/post/head'
+    )
 
 
 def main():
@@ -181,10 +193,11 @@ def main():
     parser.add_argument('--layer', type=int, default=0)
     parser.add_argument('--kind', choices=('attn', 'ffn'), default='attn')
     parser.add_argument('--check-graph-replay', action='store_true')
+    parser.add_argument('--raw-corpus')
     args = parser.parse_args()
 
     if args.check_graph_replay:
-        check_graph_replay(args.hidden)
+        check_graph_replay(args.hidden, args.raw_corpus)
         return
 
     torch_out = run_backend(

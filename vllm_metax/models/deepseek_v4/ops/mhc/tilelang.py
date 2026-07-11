@@ -5,15 +5,77 @@ import os
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
 from .tilelang_kernels import (
     compute_num_split,
+    _mhc_pre_from_raw_exact_fuse,
     _mhc_pre_big_fuse,
     _mhc_pre_mix_debug,
     _mhc_post_fwd,
     mhc_fused_tilelang,
     hc_head_fuse_tilelang
 )
+
+logger = init_logger(__name__)
+_MHC_DECODE_IMPL_LOGGED: set[str] = set()
+_MHC_DECODE_DISPATCH_COUNTS: dict[str, int] = {}
+
+
+def _require_exact_mhc_tilelang() -> bool:
+    return os.getenv("VLLM_METAX_DSV4_MHC_REQUIRE_EXACT_TILELANG", "0") == "1"
+
+
+def _is_exact_mhc_decode_contract(
+    *,
+    num_tokens: int,
+    hc_mult: int,
+    hidden_size: int,
+    n_splits: int,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> bool:
+    return (
+        num_tokens == 1
+        and hc_mult == 4
+        and hidden_size == 4096
+        and n_splits == 1
+        and rms_eps == 1e-6
+        and hc_pre_eps == 1e-6
+        and hc_sinkhorn_eps == 1e-6
+        and hc_post_mult_value == 2.0
+        and sinkhorn_repeat == 20
+    )
+
+
+def _log_mhc_decode_impl(
+    name: str,
+    *,
+    fail_closed: bool,
+    explicit: bool = False,
+) -> None:
+    _MHC_DECODE_DISPATCH_COUNTS[name] = _MHC_DECODE_DISPATCH_COUNTS.get(name, 0) + 1
+    key = f"{name}:{fail_closed}:{explicit}"
+    if key in _MHC_DECODE_IMPL_LOGGED:
+        return
+    _MHC_DECODE_IMPL_LOGGED.add(key)
+    if name == "exact_tilelang":
+        logger.warning(
+            "DeepSeek V4 MHC decode implementation: exact_tilelang "
+            "fail_closed=%s dispatch_count=%d",
+            str(fail_closed).lower(),
+            _MHC_DECODE_DISPATCH_COUNTS[name],
+        )
+    elif name == "torch_oracle":
+        logger.warning(
+            "DeepSeek V4 MHC decode implementation: torch_oracle "
+            "explicit=%s dispatch_count=%d",
+            str(explicit).lower(),
+            _MHC_DECODE_DISPATCH_COUNTS[name],
+        )
 
 
 def mhc_pre_tilelang(
@@ -518,10 +580,59 @@ def mhc_fused_post_pre_tilelang(
             sinkhorn_repeat,
             n_splits=1,
         )
+        target_exact = _is_exact_mhc_decode_contract(
+            num_tokens=num_tokens,
+            hc_mult=hc_mult,
+            hidden_size=hidden_size,
+            n_splits=1,
+            rms_eps=rms_eps,
+            hc_pre_eps=hc_pre_eps,
+            hc_sinkhorn_eps=hc_sinkhorn_eps,
+            hc_post_mult_value=hc_post_mult_value,
+            sinkhorn_repeat=sinkhorn_repeat,
+        )
+        require_exact = _require_exact_mhc_tilelang()
         use_torch_split_from_raw = (
             os.getenv("VLLM_METAX_DSV4_MHC_TORCH_SPLIT_FROM_RAW", "0") == "1"
         )
+        if target_exact and use_torch_split_from_raw and require_exact:
+            raise RuntimeError(
+                "VLLM_METAX_DSV4_MHC_REQUIRE_EXACT_TILELANG=1 conflicts with "
+                "VLLM_METAX_DSV4_MHC_TORCH_SPLIT_FROM_RAW=1"
+            )
+        if target_exact and not use_torch_split_from_raw:
+            post_mix_exact, comb_mix_exact, layer_input_exact = (
+                _mhc_pre_from_raw_exact_fuse(
+                    residual_cur,
+                    gemm_out_mul,
+                    gemm_out_sqrsum,
+                    hc_scale,
+                    hc_base,
+                    rms_eps,
+                    hc_pre_eps,
+                    hc_sinkhorn_eps,
+                    hc_post_mult_value,
+                    sinkhorn_repeat,
+                    n_splits=1,
+                    post_mix_out=post_mix_cur,
+                    comb_mix_out=comb_mix_cur,
+                    layer_input_out=layer_input_cur,
+                )
+            )
+            _log_mhc_decode_impl("exact_tilelang", fail_closed=require_exact)
+            return (
+                residual_cur.view(*outer_shape, hc_mult, hidden_size),
+                post_mix_exact.view(*outer_shape, hc_mult, 1),
+                comb_mix_exact.view(*outer_shape, hc_mult, hc_mult),
+                layer_input_exact.view(*outer_shape, hidden_size),
+            )
         if use_torch_split_from_raw:
+            if target_exact:
+                _log_mhc_decode_impl(
+                    "torch_oracle",
+                    fail_closed=False,
+                    explicit=True,
+                )
             post_mix_torch, comb_mix_torch, layer_input_torch = _mhc_pre_from_raw_torch(
                 residual_cur,
                 gemm_out_mul,
@@ -718,11 +829,54 @@ def mhc_fused_post_pre_tilelang(
         sinkhorn_repeat,
         n_splits=n_splits,
     )
+    target_exact = _is_exact_mhc_decode_contract(
+        num_tokens=num_tokens,
+        hc_mult=hc_mult,
+        hidden_size=hidden_size,
+        n_splits=n_splits,
+        rms_eps=rms_eps,
+        hc_pre_eps=hc_pre_eps,
+        hc_sinkhorn_eps=hc_sinkhorn_eps,
+        hc_post_mult_value=hc_post_mult_value,
+        sinkhorn_repeat=sinkhorn_repeat,
+    )
+    require_exact = _require_exact_mhc_tilelang()
 
     use_torch_split_from_raw = (
         os.getenv("VLLM_METAX_DSV4_MHC_TORCH_SPLIT_FROM_RAW", "0") == "1"
     )
+    if target_exact and use_torch_split_from_raw and require_exact:
+        raise RuntimeError(
+            "VLLM_METAX_DSV4_MHC_REQUIRE_EXACT_TILELANG=1 conflicts with "
+            "VLLM_METAX_DSV4_MHC_TORCH_SPLIT_FROM_RAW=1"
+        )
+    if target_exact and not use_torch_split_from_raw:
+        post_mix_exact, comb_mix_exact, layer_input_exact = _mhc_pre_from_raw_exact_fuse(
+            residual_cur,
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            n_splits=n_splits,
+            post_mix_out=post_mix_cur,
+            comb_mix_out=comb_mix_cur,
+            layer_input_out=layer_input_cur,
+        )
+        _log_mhc_decode_impl("exact_tilelang", fail_closed=require_exact)
+        return (
+            residual_cur.view(*outer_shape, hc_mult, hidden_size),
+            post_mix_exact.view(*outer_shape, hc_mult, 1),
+            comb_mix_exact.view(*outer_shape, hc_mult, hc_mult),
+            layer_input_exact.view(*outer_shape, hidden_size),
+        )
     if use_torch_split_from_raw:
+        if target_exact:
+            _log_mhc_decode_impl("torch_oracle", fail_closed=False, explicit=True)
         post_mix_torch, comb_mix_torch, layer_input_torch = _mhc_pre_from_raw_torch(
             residual_cur,
             gemm_out_mul,

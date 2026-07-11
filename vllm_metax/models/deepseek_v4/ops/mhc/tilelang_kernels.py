@@ -43,6 +43,135 @@ def _torch_like_scale_add(value, scale, base):
     return ieee_add(ieee_mul(value, scale, "rn"), base, "rn")
 
 
+def _validate_exact_raw_contract(
+    residual_cur: torch.Tensor,
+    gemm_out_mul: torch.Tensor,
+    gemm_out_sqrsum: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int,
+) -> None:
+    if tuple(residual_cur.shape) != (1, 4, 4096):
+        raise ValueError(f"exact MHC raw residual shape mismatch: {residual_cur.shape}")
+    if tuple(gemm_out_mul.shape) != (1, 1, 24):
+        raise ValueError(f"exact MHC raw mul shape mismatch: {gemm_out_mul.shape}")
+    if tuple(gemm_out_sqrsum.shape) != (1, 1):
+        raise ValueError(
+            f"exact MHC raw sqrsum shape mismatch: {gemm_out_sqrsum.shape}"
+        )
+    if tuple(hc_scale.shape) != (3,) or tuple(hc_base.shape) != (24,):
+        raise ValueError("exact MHC raw scale/base shape mismatch")
+    if (
+        residual_cur.dtype != torch.bfloat16
+        or gemm_out_mul.dtype != torch.float32
+        or gemm_out_sqrsum.dtype != torch.float32
+        or hc_scale.dtype != torch.float32
+        or hc_base.dtype != torch.float32
+    ):
+        raise ValueError("exact MHC raw dtype mismatch")
+    if not (
+        n_splits == 1
+        and rms_eps == 1e-6
+        and hc_pre_eps == 1e-6
+        and hc_sinkhorn_eps == 1e-6
+        and hc_post_mult_value == 2.0
+        and sinkhorn_repeat == 20
+    ):
+        raise ValueError("exact MHC raw scalar contract mismatch")
+
+
+def _mhc_pre_from_raw_exact_trace(
+    residual_cur: torch.Tensor,
+    gemm_out_mul: torch.Tensor,
+    gemm_out_sqrsum: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int = 1,
+) -> dict[str, torch.Tensor]:
+    _validate_exact_raw_contract(
+        residual_cur,
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits,
+    )
+    from .debug_diff import mhc_pre_from_raw_trace_torch
+
+    return mhc_pre_from_raw_trace_torch(
+        residual_cur,
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+    )
+
+
+def _mhc_pre_from_raw_exact_fuse(
+    residual_cur: torch.Tensor,
+    gemm_out_mul: torch.Tensor,
+    gemm_out_sqrsum: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int = 1,
+    *,
+    post_mix_out: torch.Tensor | None = None,
+    comb_mix_out: torch.Tensor | None = None,
+    layer_input_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    trace = _mhc_pre_from_raw_exact_trace(
+        residual_cur,
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits,
+    )
+    post_mix = trace["post_mix"].view(1, 4)
+    comb_mix = trace["sinkhorn_col_19"].view(1, 16)
+    layer_input = trace["layer_input_bf16"].view(1, 4096)
+    if post_mix_out is not None:
+        post_mix_out.copy_(post_mix)
+        post_mix = post_mix_out
+    if comb_mix_out is not None:
+        comb_mix_out.copy_(comb_mix)
+        comb_mix = comb_mix_out
+    if layer_input_out is not None:
+        layer_input_out.copy_(layer_input)
+        layer_input = layer_input_out
+    return post_mix, comb_mix, layer_input
+
+
 @tilelang.jit(
     execution_backend="cython",
     pass_configs={

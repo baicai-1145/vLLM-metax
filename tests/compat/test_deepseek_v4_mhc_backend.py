@@ -1,6 +1,7 @@
 import importlib
 import importlib.util
 from types import SimpleNamespace
+import pytest
 
 
 def _reload_backend(monkeypatch, value):
@@ -58,6 +59,22 @@ def test_tilelang_backend_falls_back_when_deep_gemm_symbol_is_missing(
     assert mod.mhc_post is torch_mod.mhc_post
     assert mod.mhc_fused_post_pre is torch_mod.mhc_fused_post_pre
     assert mod.hc_head_fused_kernel is torch_mod.hc_head_fused_kernel
+
+
+def test_tilelang_backend_raises_when_required_and_deep_gemm_symbol_is_missing(
+    monkeypatch,
+):
+    original_import_module = importlib.import_module
+
+    def import_module(name, package=None):
+        if name == 'deep_gemm':
+            return SimpleNamespace()
+        return original_import_module(name, package)
+
+    monkeypatch.setattr(importlib, 'import_module', import_module)
+    monkeypatch.setenv('VLLM_METAX_DSV4_MHC_REQUIRE_EXACT_TILELANG', '1')
+    with pytest.raises(RuntimeError, match='REQUIRE_EXACT_TILELANG'):
+        _reload_backend(monkeypatch, 'tilelang')
 
 
 def test_tilelang_backend_can_keep_final_ops_on_torch(monkeypatch):

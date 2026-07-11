@@ -27,11 +27,19 @@ _TILELANG_OPS = {
     if op.strip()
 }
 _VALID_TILELANG_OPS = {"pre", "post", "fused", "head"}
+_REQUIRE_EXACT_TILELANG = (
+    os.getenv("VLLM_METAX_DSV4_MHC_REQUIRE_EXACT_TILELANG", "0") == "1"
+)
 if not _TILELANG_OPS <= _VALID_TILELANG_OPS:
     unknown = sorted(_TILELANG_OPS - _VALID_TILELANG_OPS)
     logger.warning("Unknown TileLang MHC ops %s; ignoring them", unknown)
     _TILELANG_OPS &= _VALID_TILELANG_OPS
 if _MHC_BACKEND not in ("torch", "tilelang"):
+    if _REQUIRE_EXACT_TILELANG:
+        raise RuntimeError(
+            "VLLM_METAX_DSV4_MHC_REQUIRE_EXACT_TILELANG=1 requires "
+            "VLLM_METAX_DSV4_MHC_BACKEND=tilelang"
+        )
     logger.warning(
         "Unknown VLLM_METAX_DSV4_MHC_BACKEND=%s; falling back to torch",
         _MHC_BACKEND,
@@ -45,17 +53,34 @@ def get_mhc_backend_name() -> str:
 
 def _tilelang_runtime_ready() -> bool:
     if importlib.util.find_spec("tilelang") is None:
+        if _REQUIRE_EXACT_TILELANG:
+            raise RuntimeError(
+                "VLLM_METAX_DSV4_MHC_REQUIRE_EXACT_TILELANG=1 but tilelang is not installed"
+            )
         logger.warning("TileLang MHC backend requested but tilelang is not installed")
         return False
     if importlib.util.find_spec("deep_gemm") is None:
+        if _REQUIRE_EXACT_TILELANG:
+            raise RuntimeError(
+                "VLLM_METAX_DSV4_MHC_REQUIRE_EXACT_TILELANG=1 but deep_gemm is not installed"
+            )
         logger.warning("TileLang MHC backend requested but deep_gemm is not installed")
         return False
     try:
         dg = importlib.import_module("deep_gemm")
     except Exception as exc:
+        if _REQUIRE_EXACT_TILELANG:
+            raise RuntimeError(
+                "VLLM_METAX_DSV4_MHC_REQUIRE_EXACT_TILELANG=1 but deep_gemm import failed"
+            ) from exc
         logger.warning("TileLang MHC backend requested but deep_gemm import failed: %s", exc)
         return False
     if getattr(dg, "tf32_hc_prenorm_gemm", None) is None:
+        if _REQUIRE_EXACT_TILELANG:
+            raise RuntimeError(
+                "VLLM_METAX_DSV4_MHC_REQUIRE_EXACT_TILELANG=1 but "
+                "deep_gemm.tf32_hc_prenorm_gemm is missing"
+            )
         logger.warning(
             "TileLang MHC backend requested but deep_gemm.tf32_hc_prenorm_gemm is missing"
         )
@@ -106,6 +131,11 @@ if _MHC_BACKEND == "tilelang" and _tilelang_runtime_ready():
             )
         logger.info("DeepSeek V4 MHC backend: tilelang ops=%s", sorted(_TILELANG_OPS))
     except Exception as exc:
+        if _REQUIRE_EXACT_TILELANG:
+            raise RuntimeError(
+                "VLLM_METAX_DSV4_MHC_REQUIRE_EXACT_TILELANG=1 but TileLang MHC "
+                "backend initialization failed"
+            ) from exc
         logger.warning(
             "Failed to enable TileLang MHC backend (%s); falling back to torch",
             exc,
@@ -122,3 +152,7 @@ else:
     hc_head_fused_kernel = hc_head_fused_kernel_torch
     if _MHC_BACKEND == "tilelang":
         _MHC_BACKEND = "torch"
+    elif _REQUIRE_EXACT_TILELANG:
+        raise RuntimeError(
+            "VLLM_METAX_DSV4_MHC_REQUIRE_EXACT_TILELANG=1 requires tilelang backend"
+        )

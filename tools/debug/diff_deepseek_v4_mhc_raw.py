@@ -143,13 +143,24 @@ def _torch_trace_from_payload(payload: dict[str, Any]) -> dict[str, torch.Tensor
 def run_exact_mhc_pre_from_raw_tilelang(
     payload: dict[str, Any],
 ) -> dict[str, torch.Tensor]:
-    try:
-        from vllm_metax.models.deepseek_v4.ops.mhc.tilelang_kernels import (  # noqa: F401
-            _mhc_pre_from_raw_exact_trace,
-        )
-    except ImportError as exc:
-        raise RuntimeError("exact TileLang raw trace kernel is unavailable") from exc
-    raise NotImplementedError("Task 4 wires the exact TileLang raw trace kernel")
+    from vllm_metax.models.deepseek_v4.ops.mhc.tilelang_kernels import (
+        _mhc_pre_from_raw_exact_trace,
+    )
+
+    params = payload["params"]
+    return _mhc_pre_from_raw_exact_trace(
+        payload["residual_cur"],
+        payload["gemm_out_mul"],
+        payload["gemm_out_sqrsum"],
+        payload["hc_scale"],
+        payload["hc_base"],
+        params["rms_eps"],
+        params["hc_pre_eps"],
+        params["hc_sinkhorn_eps"],
+        params["hc_post_mult_value"],
+        params["sinkhorn_repeat"],
+        params["n_splits"],
+    )
 
 
 def _clone_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -196,8 +207,11 @@ def run_diff(
     require_bitwise: bool,
     check_graph_replay: bool = False,
     benchmark: bool = False,
+    max_files: int | None = None,
 ) -> dict[str, Any]:
     files = iter_corpus_files(corpus)
+    if max_files is not None:
+        files = files[:max_files]
     summary: dict[str, Any] = {
         "files": len(files),
         "passed": 0,
@@ -244,8 +258,83 @@ def run_diff(
             "files_per_s": (len(files) / elapsed_s) if elapsed_s else None,
         }
     if check_graph_replay:
-        summary["graph_replay"] = "not_implemented_for_candidate_" + candidate
+        summary["graph_replay"] = check_direct_graph_replay(
+            files,
+            candidate=candidate,
+            device=device,
+        )
     return summary
+
+
+def _final_outputs(trace: dict[str, torch.Tensor]) -> tuple[torch.Tensor, ...]:
+    return (
+        trace["post_mix"],
+        trace["sinkhorn_col_19"],
+        trace["layer_input_bf16"],
+    )
+
+
+def check_direct_graph_replay(
+    files: list[Path],
+    *,
+    candidate: str,
+    device: str,
+) -> dict[str, Any]:
+    if candidate != "tilelang":
+        return {"skipped": True, "reason": "graph replay is only defined for tilelang"}
+    if len(files) < 2:
+        raise ValueError("graph replay requires at least two corpus files")
+    first = load_payload(files[0], device=device)
+    second = load_payload(files[1], device=device)
+
+    inputs = {
+        key: first[key].detach().clone()
+        for key in (
+            "residual_cur",
+            "gemm_out_mul",
+            "gemm_out_sqrsum",
+            "hc_scale",
+            "hc_base",
+        )
+    }
+    payload = {**first, **inputs, "params": dict(first["params"])}
+    expected_first = _final_outputs(_torch_trace_from_payload(_clone_payload(first)))
+    expected_second = _final_outputs(_torch_trace_from_payload(_clone_payload(second)))
+
+    # Warm outside capture.
+    outputs = _final_outputs(run_exact_mhc_pre_from_raw_tilelang(payload))
+    if device != "cuda":
+        for actual, expected in zip(outputs, expected_first):
+            diff = tensor_diff(actual, expected)
+            if not diff["equal"]:
+                raise AssertionError(f"graph warmup output mismatch: {diff}")
+        return {"skipped": True, "reason": "cuda graph replay requires cuda device"}
+
+    torch.cuda.synchronize()
+    ptrs = {
+        "inputs": {key: value.data_ptr() for key, value in inputs.items()},
+        "outputs": [],
+    }
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = _final_outputs(run_exact_mhc_pre_from_raw_tilelang(payload))
+    torch.cuda.synchronize()
+    ptrs["outputs"] = [value.data_ptr() for value in outputs]
+
+    for source, expected in ((first, expected_first), (second, expected_second)):
+        for key in inputs:
+            inputs[key].copy_(source[key])
+        graph.replay()
+        torch.cuda.synchronize()
+        for actual, ref in zip(outputs, expected):
+            diff = tensor_diff(actual, ref)
+            if not diff["equal"]:
+                raise AssertionError(f"graph replay output mismatch: {diff}")
+        if any(inputs[key].data_ptr() != ptrs["inputs"][key] for key in inputs):
+            raise AssertionError("graph replay input pointer changed")
+        if [value.data_ptr() for value in outputs] != ptrs["outputs"]:
+            raise AssertionError("graph replay output pointer changed")
+    return {"passed": True, "files": [str(files[0]), str(files[1])]}
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -256,6 +345,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--require-bitwise", action="store_true")
     parser.add_argument("--check-graph-replay", action="store_true")
     parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument("--max-files", type=int)
     parser.add_argument("--json-out", type=Path)
     return parser.parse_args(argv)
 
@@ -269,6 +359,7 @@ def main(argv: list[str] | None = None) -> int:
         require_bitwise=args.require_bitwise,
         check_graph_replay=args.check_graph_replay,
         benchmark=args.benchmark,
+        max_files=args.max_files,
     )
     text = json.dumps(summary, indent=2, sort_keys=True)
     print(text)
