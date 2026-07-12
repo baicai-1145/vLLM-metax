@@ -90,3 +90,21 @@ def test_tilelang_backend_can_keep_final_ops_on_torch(monkeypatch):
     assert mod.mhc_fused_post_pre is tilelang_mod.mhc_fused_post_pre_tilelang
     assert mod.mhc_post is torch_mod.mhc_post
     assert mod.hc_head_fused_kernel is torch_mod.hc_head_fused_kernel
+
+
+def test_exact_post_mma_requires_tilelang_backend(monkeypatch):
+    monkeypatch.setenv('VLLM_METAX_DSV4_MHC_EXACT_POST_MMA', '1')
+    with pytest.raises(RuntimeError, match='EXACT_POST_MMA'):
+        _reload_backend(monkeypatch, 'torch')
+
+
+def test_exact_post_mma_selects_tilelang_post_when_available(monkeypatch):
+    monkeypatch.setenv('VLLM_METAX_DSV4_MHC_EXACT_POST_MMA', '1')
+    monkeypatch.setenv('VLLM_METAX_DSV4_MHC_TILELANG_OPS', 'fused')
+    mod = _reload_backend(monkeypatch, 'tilelang')
+    if mod.get_mhc_backend_name() != 'tilelang':
+        pytest.skip('TileLang/DeepGEMM runtime is unavailable')
+    tilelang_mod = importlib.import_module(
+        'vllm_metax.models.deepseek_v4.ops.mhc.tilelang'
+    )
+    assert mod.mhc_post is tilelang_mod.mhc_post_tilelang

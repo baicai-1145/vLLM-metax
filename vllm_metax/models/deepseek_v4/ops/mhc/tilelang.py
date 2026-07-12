@@ -13,6 +13,7 @@ from .tilelang_kernels import (
     _mhc_pre_big_fuse,
     _mhc_pre_mix_debug,
     _mhc_post_fwd,
+    _mhc_post_exact_tl,
     mhc_fused_tilelang,
     hc_head_fuse_tilelang
 )
@@ -24,6 +25,14 @@ _MHC_DECODE_DISPATCH_COUNTS: dict[str, int] = {}
 
 def _require_exact_mhc_tilelang() -> bool:
     return os.getenv("VLLM_METAX_DSV4_MHC_REQUIRE_EXACT_TILELANG", "0") == "1"
+
+
+def _exact_post_mma_enabled() -> bool:
+    return os.getenv("VLLM_METAX_DSV4_MHC_EXACT_POST_MMA", "0") == "1"
+
+
+def _exact_post_mma_debug_enabled() -> bool:
+    return os.getenv("VLLM_METAX_DSV4_MHC_EXACT_POST_MMA_DEBUG", "0") == "1"
 
 
 def _is_exact_mhc_decode_contract(
@@ -76,6 +85,102 @@ def _log_mhc_decode_impl(
             str(explicit).lower(),
             _MHC_DECODE_DISPATCH_COUNTS[name],
         )
+    elif name == "torch_prefill":
+        logger.warning(
+            "DeepSeek V4 MHC decode implementation: torch_prefill "
+            "explicit=true exact_post_mma_decode_only=true dispatch_count=%d",
+            _MHC_DECODE_DISPATCH_COUNTS[name],
+        )
+    elif name == "tilelang_prefill":
+        logger.warning(
+            "DeepSeek V4 MHC decode implementation: tilelang_prefill "
+            "explicit=true exact_post_mma_decode_only=true dispatch_count=%d",
+            _MHC_DECODE_DISPATCH_COUNTS[name],
+        )
+    elif name == "exact_post_mma":
+        logger.warning(
+            "DeepSeek V4 MHC decode implementation: exact_post_mma "
+            "fail_closed=%s dispatch_count=%d",
+            str(fail_closed).lower(),
+            _MHC_DECODE_DISPATCH_COUNTS[name],
+        )
+
+
+def _mhc_post_exact_decode(
+    x_flat: torch.Tensor,
+    residual_flat: torch.Tensor,
+    post_layer_mix_flat: torch.Tensor,
+    comb_res_mix_flat: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run the opt-in exact post kernel and fail closed on contract violations."""
+    expected = (1, 4, 4096)
+    if (
+        x_flat.dtype != torch.bfloat16
+        or tuple(x_flat.shape) != (1, 4096)
+        or residual_flat.dtype != torch.bfloat16
+        or tuple(residual_flat.shape) != expected
+        or post_layer_mix_flat.dtype != torch.float32
+        or tuple(post_layer_mix_flat.shape) != (1, 4)
+        or comb_res_mix_flat.dtype != torch.float32
+        or tuple(comb_res_mix_flat.shape) != (1, 4, 4)
+    ):
+        raise RuntimeError(
+            "VLLM_METAX_DSV4_MHC_EXACT_POST_MMA requires the decode contract "
+            "(x=BF16[1,4096], residual=BF16[1,4,4096], mixes=FP32)"
+        )
+    tensors = (x_flat, residual_flat, post_layer_mix_flat, comb_res_mix_flat)
+    if any(tensor.device.type != "cuda" for tensor in tensors):
+        raise RuntimeError(
+            "VLLM_METAX_DSV4_MHC_EXACT_POST_MMA requires CUDA tensors"
+        )
+    if any(not tensor.is_contiguous() for tensor in tensors):
+        raise RuntimeError(
+            "VLLM_METAX_DSV4_MHC_EXACT_POST_MMA requires contiguous tensors"
+        )
+    if out is None:
+        out = torch.empty_like(residual_flat)
+    if (
+        out.dtype != torch.bfloat16
+        or tuple(out.shape) != expected
+        or out.device != residual_flat.device
+        or not out.is_contiguous()
+    ):
+        raise RuntimeError(
+            "VLLM_METAX_DSV4_MHC_EXACT_POST_MMA requires a contiguous "
+            "caller-owned BF16[1,4,4096] output"
+        )
+
+    _mhc_post_exact_tl(
+        x_flat,
+        residual_flat,
+        post_layer_mix_flat,
+        comb_res_mix_flat,
+        out=out,
+    )
+    _log_mhc_decode_impl("exact_post_mma", fail_closed=True)
+
+    if _exact_post_mma_debug_enabled():
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "VLLM_METAX_DSV4_MHC_EXACT_POST_MMA_DEBUG cannot run during "
+                "CUDA graph capture"
+            )
+        expected_out = _mhc_post_torch_bmm(
+            x_flat,
+            residual_flat,
+            post_layer_mix_flat,
+            comb_res_mix_flat,
+        )
+        torch.cuda.synchronize()
+        if not torch.equal(expected_out, out):
+            from .debug_diff import tensor_diff
+
+            raise RuntimeError(
+                "VLLM_METAX_DSV4_MHC_EXACT_POST_MMA differential mismatch: "
+                f"{tensor_diff(expected_out, out)}"
+            )
+    return out
 
 
 def mhc_pre_tilelang(
@@ -274,6 +379,28 @@ def mhc_post_tilelang(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
+    if _exact_post_mma_enabled():
+        if post_layer_mix.shape[-1:] == (1,):
+            post_layer_mix = post_layer_mix.view(residual.shape[0], residual.shape[1])
+        x_flat = x.view(x.shape[0], x.shape[-1])
+        if (
+            tuple(x_flat.shape) == (1, 4096)
+            and tuple(residual.shape) == (1, 4, 4096)
+            and tuple(post_layer_mix.shape) == (1, 4)
+            and tuple(comb_res_mix.shape) == (1, 4, 4)
+        ):
+            return _mhc_post_exact_decode(
+                x_flat,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+            )
+        # vLLM invokes the standalone op for non-decode dummy/prefill shapes.
+        # Keep that path explicit and observable; the exact decode candidate is
+        # never silently claimed for an unsupported shape.
+        _log_mhc_decode_impl("tilelang_prefill", fail_closed=False, explicit=True)
+    if post_layer_mix.ndim == residual.ndim - 1:
+        post_layer_mix = post_layer_mix.unsqueeze(-1)
     out = torch.empty_like(residual)
 
     return mhc_post_fwd(x, residual, post_layer_mix, comb_res_mix, out)
@@ -488,6 +615,8 @@ def mhc_fused_post_pre_tilelang(
     num_tokens = residual_flat.shape[0]
 
     if num_tokens != 1:
+        if _exact_post_mma_enabled():
+            _log_mhc_decode_impl("torch_prefill", fail_closed=False, explicit=True)
         from .torch import mhc_fused_post_pre as mhc_fused_post_pre_torch
 
         return mhc_fused_post_pre_torch(
@@ -510,7 +639,38 @@ def mhc_fused_post_pre_tilelang(
     post_layer_mix_flat = post_layer_mix.view(num_tokens, hc_mult)
     comb_res_mix_flat = comb_res_mix.view(num_tokens, hc_mult, hc_mult)
 
+    exact_post_mma = _exact_post_mma_enabled()
+    if exact_post_mma and not _is_exact_mhc_decode_contract(
+        num_tokens=num_tokens,
+        hc_mult=hc_mult,
+        hidden_size=hidden_size,
+        n_splits=n_splits,
+        rms_eps=rms_eps,
+        hc_pre_eps=hc_pre_eps,
+        hc_sinkhorn_eps=hc_sinkhorn_eps,
+        hc_post_mult_value=hc_post_mult_value,
+        sinkhorn_repeat=sinkhorn_repeat,
+    ):
+        raise RuntimeError(
+            "VLLM_METAX_DSV4_MHC_EXACT_POST_MMA requires the exact decode "
+            "contract: tokens=1, hc_mult=4, hidden=4096, n_splits=1"
+        )
+
     exact_raw_mode = os.getenv("VLLM_METAX_DSV4_MHC_EXACT_RAW", "0")
+    if exact_post_mma:
+        if exact_raw_mode == "torch_pre":
+            raise RuntimeError(
+                "VLLM_METAX_DSV4_MHC_EXACT_POST_MMA conflicts with "
+                "VLLM_METAX_DSV4_MHC_EXACT_RAW=torch_pre"
+            )
+        if os.getenv("VLLM_METAX_DSV4_MHC_TORCH_SPLIT_FROM_RAW", "0") == "1":
+            raise RuntimeError(
+                "VLLM_METAX_DSV4_MHC_EXACT_POST_MMA conflicts with "
+                "VLLM_METAX_DSV4_MHC_TORCH_SPLIT_FROM_RAW=1"
+            )
+        # The exact post candidate is paired with the existing exact raw/pre
+        # decode path; do not silently return the legacy Torch pre branch.
+        exact_raw_mode = "1"
     use_torch_pre = (
         exact_raw_mode == "torch_pre"
         or (
@@ -519,12 +679,21 @@ def mhc_fused_post_pre_tilelang(
         )
     )
     if exact_raw_mode == "1" or use_torch_pre:
-        residual_cur = _mhc_post_torch_bmm(
-            x_flat,
-            residual_flat,
-            post_layer_mix_flat,
-            comb_res_mix_flat,
-        )
+        if exact_post_mma:
+            residual_cur = _mhc_post_exact_decode(
+                x_flat,
+                residual_flat,
+                post_layer_mix_flat,
+                comb_res_mix_flat,
+                out=torch.empty_like(residual_flat),
+            )
+        else:
+            residual_cur = _mhc_post_torch_bmm(
+                x_flat,
+                residual_flat,
+                post_layer_mix_flat,
+                comb_res_mix_flat,
+            )
         from .debug_diff import maybe_capture_mhc_fused_post_prenorm
 
         maybe_capture_mhc_fused_post_prenorm(
@@ -609,7 +778,7 @@ def mhc_fused_post_pre_tilelang(
             hc_post_mult_value=hc_post_mult_value,
             sinkhorn_repeat=sinkhorn_repeat,
         )
-        require_exact = _require_exact_mhc_tilelang()
+        require_exact = _require_exact_mhc_tilelang() or exact_post_mma
         use_torch_split_from_raw = (
             os.getenv("VLLM_METAX_DSV4_MHC_TORCH_SPLIT_FROM_RAW", "0") == "1"
         )
@@ -858,7 +1027,7 @@ def mhc_fused_post_pre_tilelang(
         hc_post_mult_value=hc_post_mult_value,
         sinkhorn_repeat=sinkhorn_repeat,
     )
-    require_exact = _require_exact_mhc_tilelang()
+    require_exact = _require_exact_mhc_tilelang() or exact_post_mma
 
     use_torch_split_from_raw = (
         os.getenv("VLLM_METAX_DSV4_MHC_TORCH_SPLIT_FROM_RAW", "0") == "1"

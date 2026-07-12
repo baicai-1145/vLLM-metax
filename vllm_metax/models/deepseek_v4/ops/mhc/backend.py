@@ -30,6 +30,9 @@ _VALID_TILELANG_OPS = {"pre", "post", "fused", "head"}
 _REQUIRE_EXACT_TILELANG = (
     os.getenv("VLLM_METAX_DSV4_MHC_REQUIRE_EXACT_TILELANG", "0") == "1"
 )
+_EXACT_POST_MMA = (
+    os.getenv("VLLM_METAX_DSV4_MHC_EXACT_POST_MMA", "0") == "1"
+)
 if not _TILELANG_OPS <= _VALID_TILELANG_OPS:
     unknown = sorted(_TILELANG_OPS - _VALID_TILELANG_OPS)
     logger.warning("Unknown TileLang MHC ops %s; ignoring them", unknown)
@@ -46,9 +49,25 @@ if _MHC_BACKEND not in ("torch", "tilelang"):
     )
     _MHC_BACKEND = "torch"
 
+if _EXACT_POST_MMA:
+    if _MHC_BACKEND != "tilelang":
+        raise RuntimeError(
+            "VLLM_METAX_DSV4_MHC_EXACT_POST_MMA=1 requires "
+            "VLLM_METAX_DSV4_MHC_BACKEND=tilelang"
+        )
+    if not _TILELANG_OPS & {"post", "fused"}:
+        raise RuntimeError(
+            "VLLM_METAX_DSV4_MHC_EXACT_POST_MMA=1 requires post or fused "
+            "in VLLM_METAX_DSV4_MHC_TILELANG_OPS"
+        )
+
 
 def get_mhc_backend_name() -> str:
     return _MHC_BACKEND
+
+
+def get_mhc_exact_post_mma_enabled() -> bool:
+    return _EXACT_POST_MMA
 
 
 def _tilelang_runtime_ready() -> bool:
@@ -113,7 +132,11 @@ if _MHC_BACKEND == "tilelang" and _tilelang_runtime_ready():
             hc_head_fused_kernel_tilelang,
         ) = _load_tilelang()
         mhc_pre = mhc_pre_tilelang if "pre" in _TILELANG_OPS else mhc_pre_torch
-        mhc_post = mhc_post_tilelang if "post" in _TILELANG_OPS else mhc_post_torch
+        mhc_post = (
+            mhc_post_tilelang
+            if "post" in _TILELANG_OPS or _EXACT_POST_MMA
+            else mhc_post_torch
+        )
         mhc_fused_post_pre = (
             mhc_fused_post_pre_tilelang
             if "fused" in _TILELANG_OPS

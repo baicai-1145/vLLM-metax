@@ -50,6 +50,10 @@ def main() -> None:
             "torch_profiler_with_stack": True,
             "torch_profiler_use_gzip": True,
             "torch_profiler_dump_cuda_time_total": True,
+            "delay_iterations": int(os.environ.get("PROFILE_DELAY_ITERATIONS", "0")),
+            "max_iterations": int(os.environ.get("PROFILE_MAX_ITERATIONS", "0")),
+            "active_iterations": int(os.environ.get("PROFILE_ACTIVE_ITERATIONS", "5")),
+            "ignore_frontend": os.environ.get("PROFILE_IGNORE_FRONTEND", "0") == "1",
         }
 
     llm = LLM(

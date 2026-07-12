@@ -128,6 +128,28 @@ def test_exact_post_contract_rejects_non_decode_shape():
         _mhc_post_exact_tl(x, residual, post_mix, comb_mix)
 
 
+def test_exact_post_mma_opt_in_is_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("VLLM_METAX_DSV4_MHC_EXACT_POST_MMA", raising=False)
+    from vllm_metax.models.deepseek_v4.ops.mhc.tilelang import (
+        _exact_post_mma_enabled,
+    )
+
+    assert not _exact_post_mma_enabled()
+
+
+def test_exact_post_mma_keeps_non_decode_shape_explicitly_out_of_scope(monkeypatch):
+    monkeypatch.setenv("VLLM_METAX_DSV4_MHC_EXACT_POST_MMA", "1")
+    from vllm_metax.models.deepseek_v4.ops.mhc import tilelang
+
+    x = torch.zeros((2, 4096), dtype=torch.bfloat16)
+    residual = torch.zeros((2, 4, 4096), dtype=torch.bfloat16)
+    post_mix = torch.zeros((2, 4, 1), dtype=torch.float32)
+    comb_mix = torch.zeros((2, 4, 4), dtype=torch.float32)
+    sentinel = object()
+    monkeypatch.setattr(tilelang, "mhc_post_fwd", lambda *args, **kwargs: sentinel)
+    assert tilelang.mhc_post_tilelang(x, residual, post_mix, comb_mix) is sentinel
+
+
 def test_assert_bitwise_trace_equal_rejects_stage_mismatch():
     reference = {"stage": torch.tensor([1.0], dtype=torch.float32)}
     candidate = {"stage": torch.tensor([2.0], dtype=torch.float32)}
