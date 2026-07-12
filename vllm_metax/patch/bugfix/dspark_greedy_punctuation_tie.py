@@ -75,10 +75,7 @@ def _apply_cache_tie_break(
             & ((top.values[:, 0] - top.values[:, 1]) <= margin)
         )
     exact_word_tie_rows = (
-        row_mask
-        & exact_word_tie_rows
-        & ~top1_is_punctuation
-        & ~top2_is_punctuation
+        row_mask & exact_word_tie_rows & ~top1_is_punctuation & ~top2_is_punctuation
     )
     structural_punctuation_rows = torch.zeros_like(row_mask)
     for baseline_token_id, cache_token_id in _STRUCTURAL_PUNCTUATION_TIE_PAIRS:
@@ -167,9 +164,7 @@ def _v1_rejection_sample(
         and sampling_metadata.all_greedy
         and draft_token_ids.shape[0] > 1
     ):
-        row_mask = _mask_v1_non_initial_draft_rows(
-            draft_token_ids, cu_num_draft_tokens
-        )
+        row_mask = _mask_v1_non_initial_draft_rows(draft_token_ids, cu_num_draft_tokens)
         previous_token_ids = torch.roll(draft_token_ids, shifts=1, dims=0)
         target_logits = _apply_cache_tie_break(
             target_logits,

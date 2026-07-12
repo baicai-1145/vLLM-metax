@@ -144,14 +144,38 @@ def load_fused_post_payload(path: str | Path, device: str = "cpu") -> dict[str, 
     _require(payload["rank"] == file_rank, payload_path, "rank does not match filename")
     _require(payload["call"] == file_call, payload_path, "call does not match filename")
     _require(tuple(payload["x_flat"].shape) == (1, 4096), payload_path, "x shape")
-    _require(tuple(payload["residual_flat"].shape) == (1, 4, 4096), payload_path, "residual shape")
-    _require(tuple(payload["post_layer_mix_flat"].shape) == (1, 4), payload_path, "post shape")
-    _require(tuple(payload["comb_res_mix_flat"].shape) == (1, 4, 4), payload_path, "comb shape")
+    _require(
+        tuple(payload["residual_flat"].shape) == (1, 4, 4096),
+        payload_path,
+        "residual shape",
+    )
+    _require(
+        tuple(payload["post_layer_mix_flat"].shape) == (1, 4),
+        payload_path,
+        "post shape",
+    )
+    _require(
+        tuple(payload["comb_res_mix_flat"].shape) == (1, 4, 4),
+        payload_path,
+        "comb shape",
+    )
     _require(payload["x_flat"].dtype == torch.bfloat16, payload_path, "x dtype")
-    _require(payload["residual_flat"].dtype == torch.bfloat16, payload_path, "residual dtype")
-    _require(payload["post_layer_mix_flat"].dtype == torch.float32, payload_path, "post dtype")
-    _require(payload["comb_res_mix_flat"].dtype == torch.float32, payload_path, "comb dtype")
-    _require(payload["residual_cur_bf16"].dtype == torch.bfloat16, payload_path, "output dtype")
+    _require(
+        payload["residual_flat"].dtype == torch.bfloat16, payload_path, "residual dtype"
+    )
+    _require(
+        payload["post_layer_mix_flat"].dtype == torch.float32,
+        payload_path,
+        "post dtype",
+    )
+    _require(
+        payload["comb_res_mix_flat"].dtype == torch.float32, payload_path, "comb dtype"
+    )
+    _require(
+        payload["residual_cur_bf16"].dtype == torch.bfloat16,
+        payload_path,
+        "output dtype",
+    )
     return {
         key: value.to(device) if isinstance(value, torch.Tensor) else value
         for key, value in payload.items()
@@ -161,7 +185,9 @@ def load_fused_post_payload(path: str | Path, device: str = "cpu") -> dict[str, 
 def run_exact_mhc_post_tilelang(
     payload: dict[str, Any], out: torch.Tensor | None = None
 ) -> torch.Tensor:
-    from vllm_metax.models.deepseek_v4.ops.mhc.tilelang_kernels import _mhc_post_exact_tl
+    from vllm_metax.models.deepseek_v4.ops.mhc.tilelang_kernels import (
+        _mhc_post_exact_tl,
+    )
 
     return _mhc_post_exact_tl(
         payload["x_flat"],
@@ -184,8 +210,11 @@ def run_post_diff(
     if max_files is not None:
         files = files[:max_files]
     result: dict[str, Any] = {
-        "files": len(files), "passed": 0, "failed": 0,
-        "first_failure": None, "bitwise": bool(require_bitwise),
+        "files": len(files),
+        "passed": 0,
+        "failed": 0,
+        "first_failure": None,
+        "bitwise": bool(require_bitwise),
     }
     for path in files:
         payload = load_fused_post_payload(path, device=device)
@@ -351,7 +380,9 @@ def run_diff(
                 assert_bitwise_trace_equal(reference, candidate_trace)
                 first_stage, first_diff = None, None
             except AssertionError:
-                first_stage, first_diff = _first_trace_failure(reference, candidate_trace)
+                first_stage, first_diff = _first_trace_failure(
+                    reference, candidate_trace
+                )
         else:
             first_stage, first_diff = _first_trace_failure(reference, candidate_trace)
 

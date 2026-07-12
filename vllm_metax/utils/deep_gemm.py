@@ -15,6 +15,9 @@ from typing import Any, Callable, NoReturn
 import torch
 
 import vllm.envs as envs
+from vllm_metax.kernels.int8_mqa_logits import (
+    int8_mqa_logits as _metax_int8_mqa_logits,
+)
 from vllm.utils.import_utils import has_deep_gemm
 from vllm.utils.deep_gemm import (
     is_deep_gemm_supported,
@@ -180,7 +183,9 @@ def bf16_paged_mqa_logits(
             dtype=torch.float32,
             device=q_bf16.device,
         )
-        flat_q = q_bf16.to(torch.float32).reshape(batch_size * next_n, num_heads, head_dim)
+        flat_q = q_bf16.to(torch.float32).reshape(
+            batch_size * next_n, num_heads, head_dim
+        )
         flat_w = weights.to(torch.float32).reshape(batch_size * next_n, num_heads)
         for b in range(batch_size):
             ctx_len = int(context_lens[b].item())
@@ -190,7 +195,9 @@ def bf16_paged_mqa_logits(
             block_size = kv_cache_bf16.shape[1]
             blocks_needed = (ctx_len + block_size - 1) // block_size
             block_ids = block_table[:blocks_needed].to(torch.int64)
-            gathered = kv_cache_bf16.index_select(0, block_ids).reshape(-1, kv_cache_bf16.shape[-1])[:ctx_len]
+            gathered = kv_cache_bf16.index_select(0, block_ids).reshape(
+                -1, kv_cache_bf16.shape[-1]
+            )[:ctx_len]
             if gathered.dim() == 3:
                 gathered = gathered[:, 0, :]
             gathered = gathered[..., :head_dim].to(torch.float32)
@@ -239,27 +246,13 @@ def int8_mqa_logits(
     Returns:
         Logits tensor of shape [M, N], dtype `torch.float32`.
     """
-    _lazy_init()
-    if _int8_mqa_logits_impl is None:
-        qf = q.to(torch.float32)
-        kf = kv[0].to(torch.float32) if isinstance(kv, tuple) else kv.to(torch.float32)
-        logits = torch.einsum("mhd,nd->mhn", qf, kf)
-        logits = (logits * weights.to(torch.float32).unsqueeze(-1)).sum(dim=1)
-        num_queries, num_keys = logits.shape
-        idx = torch.arange(num_keys, device=logits.device).unsqueeze(0)
-        start = cu_seqlen_ks.to(torch.int64).unsqueeze(1)
-        end = cu_seqlen_ke.to(torch.int64).unsqueeze(1)
-        valid = (idx >= start) & (idx < end)
-        logits.masked_fill_(~valid, float("-inf"))
-        return logits
-    return _int8_mqa_logits_impl(
+    return _metax_int8_mqa_logits(
         q,
         kv,
         weights,
         cu_seqlen_ks,
         cu_seqlen_ke,
         clean_logits,
-        backend="tilelang",
     )
 
 
@@ -303,7 +296,9 @@ def int8_paged_mqa_logits(
             dtype=torch.float32,
             device=q_bf16.device,
         )
-        flat_q = q_bf16.to(torch.float32).reshape(batch_size * next_n, num_heads, head_dim)
+        flat_q = q_bf16.to(torch.float32).reshape(
+            batch_size * next_n, num_heads, head_dim
+        )
         flat_w = weights.to(torch.float32).reshape(batch_size * next_n, num_heads)
         for b in range(batch_size):
             ctx_len = int(context_lens[b].item())
@@ -313,7 +308,9 @@ def int8_paged_mqa_logits(
             block_size = kv_cache_bf16.shape[1]
             blocks_needed = (ctx_len + block_size - 1) // block_size
             block_ids = block_table[:blocks_needed].to(torch.int64)
-            gathered = kv_cache_bf16.index_select(0, block_ids).reshape(-1, kv_cache_bf16.shape[-1])[:ctx_len]
+            gathered = kv_cache_bf16.index_select(0, block_ids).reshape(
+                -1, kv_cache_bf16.shape[-1]
+            )[:ctx_len]
             if gathered.dim() == 3:
                 gathered = gathered[:, 0, :]
             gathered = gathered[..., :head_dim].to(torch.float32)
@@ -341,9 +338,7 @@ def bf16_einsum(*args, **kwargs):
     _lazy_init()
     if _bf16_einsum is None:
         equation, lhs, rhs, out = args
-        result = torch.einsum(
-            equation, lhs.to(torch.bfloat16), rhs.to(torch.bfloat16)
-        )
+        result = torch.einsum(equation, lhs.to(torch.bfloat16), rhs.to(torch.bfloat16))
         out.copy_(result.to(out.dtype))
         return out
     return _bf16_einsum(*args, **kwargs)

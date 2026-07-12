@@ -118,6 +118,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
   // cuBLAS bf16 x bf16 -> fp32 router GEMM (fallback for non-SM90 / batch > 16)
   m.def("router_gemm_bf16_fp32(Tensor input, Tensor weight) -> Tensor");
   m.impl("router_gemm_bf16_fp32", torch::kCUDA, &router_gemm_bf16_fp32);
+
+  // In-place float32 GEMM: out = a @ b.T.
+  m.def("gemm_fp32_out(Tensor a, Tensor b, Tensor! out) -> ()");
+  m.impl("gemm_fp32_out", torch::kCUDA, &gemm_fp32_out);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

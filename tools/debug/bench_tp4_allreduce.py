@@ -50,7 +50,9 @@ def bench(fn, warmup: int, trials: int) -> dict[str, float]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--hidden-size", type=int, default=7168)
-    parser.add_argument("--seq-lens", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 64, 128])
+    parser.add_argument(
+        "--seq-lens", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 64, 128]
+    )
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--trials", type=int, default=200)
     parser.add_argument("--output-json", type=str, default=None)

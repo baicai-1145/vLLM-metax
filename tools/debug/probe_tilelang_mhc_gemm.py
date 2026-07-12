@@ -14,7 +14,10 @@ def tl_gemm_kernel(M: int, N: int, K: int, block_M: int, block_N: int, block_K: 
         B: T.Tensor((K, N), T.float32),
         C: T.Tensor((M, N), T.float32),
     ):
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (
+            bx,
+            by,
+        ):
             A_shared = T.alloc_shared((block_M, block_K), T.float32)
             B_shared = T.alloc_shared((block_K, block_N), T.float32)
             C_local = T.alloc_fragment((block_M, block_N), T.float32)
@@ -45,9 +48,7 @@ def main() -> None:
     )
     padded[: residual.shape[0]].copy_(residual)
     fn_t_24 = dump["inputs"]["fn"].cuda().t().contiguous()
-    fn_t = torch.zeros(
-        fn_t_24.shape[0], 32, dtype=torch.float32, device=fn_t_24.device
-    )
+    fn_t = torch.zeros(fn_t_24.shape[0], 32, dtype=torch.float32, device=fn_t_24.device)
     fn_t[:, : fn_t_24.shape[1]].copy_(fn_t_24)
     ref = torch.nn.functional.linear(residual, dump["inputs"]["fn"].cuda())
     kernel = tl_gemm_kernel(16, 32, residual.shape[1], 16, 32, args.block_k)

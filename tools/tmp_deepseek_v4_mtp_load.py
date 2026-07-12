@@ -4,9 +4,7 @@ from vllm import LLM
 
 
 def main() -> None:
-    model = os.environ.get(
-        "MODEL", "/home/waas/models/DeepSeek-V4-Flash-W4A16-FP8-MTP"
-    )
+    model = os.environ.get("MODEL", "/home/waas/models/DeepSeek-V4-Flash-W4A16-FP8-MTP")
     tensor_parallel_size = int(os.environ.get("TP", "1"))
     gpu_memory_utilization = float(os.environ.get("GPU_MEM", "0.7"))
     llm = LLM(

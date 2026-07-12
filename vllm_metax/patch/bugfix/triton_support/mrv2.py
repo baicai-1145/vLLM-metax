@@ -10,6 +10,7 @@
 # Remove at: after triton3.6+metax is released.
 # -----------------------------------------------
 from vllm.triton_utils import tl, triton
+
 MAX_SPEC_LEN = 128
 
 

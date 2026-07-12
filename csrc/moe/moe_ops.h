@@ -78,3 +78,7 @@ void shuffle_rows(const torch::Tensor& input_tensor,
 // cuBLAS bf16 x bf16 -> fp32 router GEMM (fallback for non-SM90 / batch > 16)
 torch::Tensor router_gemm_bf16_fp32(torch::Tensor const& input,
                                     torch::Tensor const& weight);
+
+// In-place float32 GEMM: out[M,N] = a[M,K] @ b[N,K].T.
+void gemm_fp32_out(torch::Tensor const& a, torch::Tensor const& b,
+                   torch::Tensor& out);

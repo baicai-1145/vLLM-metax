@@ -2,11 +2,15 @@
 # 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+import os
+from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import torch
 
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from .attention import MacaDeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import (
     combine_topk_swa_indices,
@@ -26,10 +30,362 @@ from vllm_metax.v1.attention.ops.flashmla import (
     flash_mla_sparse_fwd,
     flash_mla_with_kvcache,
 )
+from vllm_metax.kernels.sparse_mla_decode import (
+    SPARSE_MLA_DECODE_MODE,
+    sparse_mla_decode,
+)
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
+
+logger = init_logger(__name__)
+
+_SPARSE_MLA_DECODE_BACKEND_ENV = "VLLM_METAX_DSV4_SPARSE_MLA_DECODE_BACKEND"
+_SPARSE_MLA_DECODE_BACKENDS = {"native", "torch_reference"}
+_SPARSE_MLA_DECODE_SYNC_ENV = "VLLM_METAX_DSV4_SPARSE_MLA_DECODE_SYNC"
+_SPARSE_MLA_DECODE_DIFF_ENV = "VLLM_METAX_DSV4_SPARSE_MLA_DECODE_DIFF"
+_SPARSE_MLA_DECODE_DIFF_MAX_CALLS_ENV = (
+    "VLLM_METAX_DSV4_SPARSE_MLA_DECODE_DIFF_MAX_CALLS"
+)
+_SPARSE_MLA_DECODE_DIFF_DUMP_DIR_ENV = (
+    "VLLM_METAX_DSV4_SPARSE_MLA_DECODE_DIFF_DUMP_DIR"
+)
+_torch_reference_warning_emitted = False
+_sparse_mla_decode_sync_warning_emitted = False
+_sparse_mla_decode_diff_call_count = 0
+_sparse_mla_decode_diff_comparison_count = 0
+_sparse_mla_decode_diff_logged_count = 0
+_sparse_mla_decode_diff_first_mismatch_call: int | None = None
+
+
+def _get_sparse_mla_decode_backend() -> str:
+    backend = os.getenv(_SPARSE_MLA_DECODE_BACKEND_ENV, "native").strip().lower()
+    if backend not in _SPARSE_MLA_DECODE_BACKENDS:
+        allowed = ", ".join(sorted(_SPARSE_MLA_DECODE_BACKENDS))
+        raise ValueError(
+            f"Invalid {_SPARSE_MLA_DECODE_BACKEND_ENV}={backend!r}; "
+            f"expected one of: {allowed}"
+        )
+    return backend
+
+
+def _get_sparse_mla_decode_sync() -> bool:
+    value = os.getenv(_SPARSE_MLA_DECODE_SYNC_ENV, "0").strip()
+    if value not in {"0", "1"}:
+        raise ValueError(
+            f"Invalid {_SPARSE_MLA_DECODE_SYNC_ENV}={value!r}; "
+            "expected one of: 0, 1"
+        )
+    return value == "1"
+
+
+def _get_sparse_mla_decode_diff() -> bool:
+    value = os.getenv(_SPARSE_MLA_DECODE_DIFF_ENV, "0").strip()
+    if value not in {"0", "1"}:
+        raise ValueError(
+            f"Invalid {_SPARSE_MLA_DECODE_DIFF_ENV}={value!r}; "
+            "expected one of: 0, 1"
+        )
+    return value == "1"
+
+
+def _get_sparse_mla_decode_diff_max_calls() -> int:
+    value = os.getenv(_SPARSE_MLA_DECODE_DIFF_MAX_CALLS_ENV, "256").strip()
+    try:
+        calls = int(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid {_SPARSE_MLA_DECODE_DIFF_MAX_CALLS_ENV}={value!r}; "
+            "expected a non-negative integer"
+        ) from exc
+    if calls < 0:
+        raise ValueError(
+            f"Invalid {_SPARSE_MLA_DECODE_DIFF_MAX_CALLS_ENV}={value!r}; "
+            "expected a non-negative integer"
+        )
+    return calls
+
+
+def _sparse_mla_decode_diff_rank() -> str:
+    rank = os.getenv("RANK") or os.getenv("LOCAL_RANK")
+    if rank is not None:
+        return rank
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            return str(dist.get_rank())
+    except Exception:
+        pass
+    return str(os.getpid())
+
+
+def _sparse_mla_decode_diff_reset_state() -> None:
+    global _sparse_mla_decode_diff_call_count
+    global _sparse_mla_decode_diff_comparison_count
+    global _sparse_mla_decode_diff_logged_count
+    global _sparse_mla_decode_diff_first_mismatch_call
+    _sparse_mla_decode_diff_call_count = 0
+    _sparse_mla_decode_diff_comparison_count = 0
+    _sparse_mla_decode_diff_logged_count = 0
+    _sparse_mla_decode_diff_first_mismatch_call = None
+
+
+def _sparse_mla_decode_diff_stats(
+    native: torch.Tensor, reference: torch.Tensor
+) -> tuple[int, float]:
+    if native.shape != reference.shape or native.dtype != reference.dtype:
+        return max(native.numel(), reference.numel()), float("inf")
+    lhs = native.detach().contiguous()
+    rhs = reference.detach().contiguous()
+    # Compare complete element representations, including NaN payloads, rather
+    # than values (which would miss bitwise differences and signed zero).
+    lhs_bytes = lhs.view(torch.uint8).reshape(lhs.numel(), -1)
+    rhs_bytes = rhs.view(torch.uint8).reshape(rhs.numel(), -1)
+    mismatch = (lhs_bytes != rhs_bytes).any(dim=1)
+    mismatch_count = int(mismatch.sum().item())
+    if not mismatch_count:
+        return 0, 0.0
+    max_abs = float((lhs.float() - rhs.float()).abs().max().item())
+    return mismatch_count, max_abs
+
+
+def _get_sparse_mla_decode_diff_dump_dir() -> Path | None:
+    value = os.getenv(_SPARSE_MLA_DECODE_DIFF_DUMP_DIR_ENV)
+    return Path(value) if value and value.strip() else None
+
+
+def _sparse_mla_decode_diff_cpu_clone(value: torch.Tensor | None) -> torch.Tensor | None:
+    if value is None:
+        return None
+    return value.detach().contiguous().cpu().clone()
+
+
+def _sparse_mla_decode_diff_atomic_save(
+    payload: dict[str, object], path: Path
+) -> None:
+    temporary = path.with_name(
+        f".{path.name}.tmp-{os.getpid()}"
+    )
+    try:
+        torch.save(payload, temporary)
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _sparse_mla_decode_diff_dump(
+    *,
+    attention: "MacaDeepseekV4FlashMLAAttention",
+    call: int,
+    q_raw: torch.Tensor,
+    swa_cache_physical: torch.Tensor,
+    swa_indices: torch.Tensor,
+    topk_indices: torch.Tensor | None,
+    native_output: torch.Tensor,
+    reference_output: torch.Tensor,
+    reference_probs: torch.Tensor,
+    reference_fp32_output: torch.Tensor,
+    compress_ratio: int,
+    mode: str,
+    backend: str,
+) -> None:
+    if not _get_sparse_mla_decode_diff():
+        return
+    dump_dir = _get_sparse_mla_decode_diff_dump_dir()
+    if dump_dir is None:
+        return
+    try:
+        # The caller has synchronized the producing stream before entering this
+        # function, so all CPU clones below represent one coherent invocation.
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        rank = _sparse_mla_decode_diff_rank()
+        rank_value: int | str = int(rank) if rank.isdigit() else rank
+        tensors = {
+            "q_raw": q_raw,
+            "swa_cache_physical": swa_cache_physical,
+            "swa_indices": swa_indices,
+            "topk_indices": topk_indices,
+            "native_output": native_output,
+            "reference_output": reference_output,
+            "reference_probs": reference_probs,
+            "reference_fp32_output": reference_fp32_output,
+        }
+        from vllm_metax.kernels.sparse_mla_decode import (
+            sparse_mla_decode_compat_workspace,
+        )
+        workspace = sparse_mla_decode_compat_workspace()
+        if workspace is not None:
+            tensors.update({
+                "native_probs": workspace[0],
+                "native_values": workspace[1],
+                "native_transposed": workspace[2],
+                "native_fp32_output": workspace[3],
+            })
+        payload: dict[str, object] = {
+            "schema": "dsv4_sparse_mla_decode_diff",
+            "schema_version": 1,
+            "rank": rank_value,
+            "call": call,
+            "layer_prefix": getattr(attention, "prefix", None),
+            "backend": backend,
+            "mode": mode,
+            "scale": float(attention.scale),
+            "compress_ratio": int(compress_ratio),
+            **{name: _sparse_mla_decode_diff_cpu_clone(value)
+               for name, value in tensors.items()},
+            "shapes": {
+                name: (list(value.shape) if value is not None else None)
+                for name, value in tensors.items()
+            },
+            "strides": {
+                name: (list(value.stride()) if value is not None else None)
+                for name, value in tensors.items()
+            },
+            "dtypes": {
+                name: (str(value.dtype) if value is not None else None)
+                for name, value in tensors.items()
+            },
+        }
+        path = dump_dir / f"rank{rank}_call{call}.pt"
+        _sparse_mla_decode_diff_atomic_save(payload, path)
+        logger.warning("DIAGNOSTIC_ONLY sparse MLA decode diff dump: %s", path)
+    except Exception as exc:
+        # A debug artifact must never prevent restoration of the native output.
+        logger.warning("DIAGNOSTIC_ONLY sparse MLA decode diff dump failed: %s", exc)
+
+
+@torch.no_grad()
+def _maybe_diff_sparse_mla_decode(
+    *,
+    attention: "MacaDeepseekV4FlashMLAAttention",
+    q: torch.Tensor,
+    swa_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    topk_indices: torch.Tensor | None,
+    output: torch.Tensor,
+    compress_ratio: int,
+    mode: str,
+    q_raw: torch.Tensor | None = None,
+    swa_cache_physical: torch.Tensor | None = None,
+    backend: str = "native",
+) -> None:
+    """Compare native output with Torch without changing the native result."""
+    global _sparse_mla_decode_diff_call_count
+    global _sparse_mla_decode_diff_comparison_count
+    global _sparse_mla_decode_diff_logged_count
+    global _sparse_mla_decode_diff_first_mismatch_call
+
+    if _sparse_mla_decode_diff_first_mismatch_call is not None:
+        return
+    call = _sparse_mla_decode_diff_call_count
+    _sparse_mla_decode_diff_call_count += 1
+    native_output = output.detach().clone()
+    reference_output = torch.empty_like(output)
+    reference_probs, reference_fp32_output = attention._torch_sparse_decode(
+        q=q,
+        swa_cache=swa_cache,
+        swa_indices=swa_indices,
+        topk_indices=topk_indices,
+        output=reference_output,
+        scale=attention.scale,
+    )
+    if q.is_cuda:
+        torch.cuda.current_stream(q.device).synchronize()
+    mismatch_count, max_abs = _sparse_mla_decode_diff_stats(
+        native_output, reference_output
+    )
+    _sparse_mla_decode_diff_comparison_count += 1
+
+    max_calls = _get_sparse_mla_decode_diff_max_calls()
+    should_log = max_calls == 0 or _sparse_mla_decode_diff_logged_count < max_calls
+    if mismatch_count:
+        _sparse_mla_decode_diff_first_mismatch_call = call
+        should_log = True
+        _sparse_mla_decode_diff_dump(
+            attention=attention,
+            call=call,
+            q_raw=q_raw if q_raw is not None else q,
+            swa_cache_physical=(
+                swa_cache_physical if swa_cache_physical is not None else swa_cache
+            ),
+            swa_indices=swa_indices,
+            topk_indices=topk_indices,
+            native_output=native_output,
+            reference_output=reference_output,
+            reference_probs=reference_probs,
+            reference_fp32_output=reference_fp32_output,
+            compress_ratio=compress_ratio,
+            mode=mode,
+            backend=backend,
+        )
+    if should_log:
+        record = {
+            "event": "first_mismatch" if mismatch_count else "comparison",
+            "diagnostic": "sparse_mla_decode_diff",
+            "rank": _sparse_mla_decode_diff_rank(),
+            "call": call,
+            "layer_prefix": getattr(attention, "prefix", None),
+            "native_shape": list(native_output.shape),
+            "reference_shape": list(reference_output.shape),
+            "q_shape": list(q.shape),
+            "swa_cache_shape": list(swa_cache.shape),
+            "swa_indices_shape": list(swa_indices.shape),
+            "topk_indices_shape": (
+                list(topk_indices.shape) if topk_indices is not None else None
+            ),
+            "compress_ratio": compress_ratio,
+            "mode": mode,
+            "mismatch_count": mismatch_count,
+            "max_abs": max_abs,
+        }
+        logger.warning("DIAGNOSTIC_ONLY %s", json.dumps(record, sort_keys=True))
+        _sparse_mla_decode_diff_logged_count += 1
+    if mismatch_count:
+        summary = {
+            "event": "summary",
+            "diagnostic": "sparse_mla_decode_diff",
+            "rank": _sparse_mla_decode_diff_rank(),
+            "comparisons": _sparse_mla_decode_diff_comparison_count,
+            "first_mismatch_call": call,
+            "logged_records": _sparse_mla_decode_diff_logged_count,
+        }
+        logger.warning("DIAGNOSTIC_ONLY %s", json.dumps(summary, sort_keys=True))
+
+    # The reference is diagnostic-only; return the native bytes to the caller.
+    output.copy_(native_output)
+
+
+def _synchronize_sparse_mla_decode(q: torch.Tensor) -> None:
+    global _sparse_mla_decode_sync_warning_emitted
+    if not _sparse_mla_decode_sync_warning_emitted:
+        logger.warning(
+            "DIAGNOSTIC_ONLY: sparse MLA native decode stream synchronization "
+            "is enabled; this adds diagnostic synchronization overhead"
+        )
+        _sparse_mla_decode_sync_warning_emitted = True
+    torch.cuda.current_stream(q.device).synchronize()
+
+
+def _maybe_sync_sparse_mla_decode(q: torch.Tensor) -> None:
+    if _get_sparse_mla_decode_sync():
+        _synchronize_sparse_mla_decode(q)
+
+
+def _warn_torch_reference_decode() -> None:
+    global _torch_reference_warning_emitted
+    if _torch_reference_warning_emitted:
+        return
+    logger.warning(
+        "DIAGNOSTIC_ONLY: sparse MLA decode backend=%s; this Torch reference "
+        "path is not a native production backend",
+        "torch_reference",
+    )
+    _torch_reference_warning_emitted = True
 
 
 class MacaDeepseekV4FlashMLAAttention(MacaDeepseekV4Attention):
@@ -43,7 +399,7 @@ class MacaDeepseekV4FlashMLAAttention(MacaDeepseekV4Attention):
         topk_indices: torch.Tensor | None,
         output: torch.Tensor,
         scale: float,
-    ) -> None:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         q2 = q.squeeze(1).float()
         batch = q2.shape[0]
         q_heads = q2.shape[1]
@@ -71,6 +427,7 @@ class MacaDeepseekV4FlashMLAAttention(MacaDeepseekV4Attention):
         probs = torch.softmax(attn * scale, dim=-1)
         out = torch.matmul(probs, gathered[:, :, :value_dim])
         output.copy_(out.to(output.dtype))
+        return probs, out
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         return deep_gemm_bf16_o_proj(
@@ -215,6 +572,13 @@ class MacaDeepseekV4FlashMLAAttention(MacaDeepseekV4Attention):
         swa_indices = swa_metadata.decode_swa_indices
         swa_lens = swa_metadata.decode_swa_lens
 
+        # Keep the original decode inputs for the opt-in debug capture.  The
+        # Torch oracle below receives unsqueezed cache/query views, but the
+        # compressed cache and pre-unsqueeze query are useful for replay.
+        capture_q = q
+        capture_compressed_cache = kv_cache
+        capture_swa_cache = self.swa_cache_layer.kv_cache
+
         # We treat queries in the same seq as different queries
         # and later we only attend by generated indices.
         # q arrives pre-padded to self.padded_heads by the outer wrapper.
@@ -227,38 +591,111 @@ class MacaDeepseekV4FlashMLAAttention(MacaDeepseekV4Attention):
         if kv_cache is not None:
             kv_cache = kv_cache.unsqueeze(-2)
 
-        # One FlashMLASchedMeta per layer type, shared across all same-type
-        # layers within this decode step. The first forward call per type
-        # triggers the in-kernel planner (allocating tile_scheduler_metadata
-        # and num_splits via PyTorch's graph-aware allocator so CUDA graph
-        # capture reuses the same addresses on replay); subsequent same-type
-        # layers see have_initialized=True and skip the planner.
-        if self.compress_ratio <= 1:
-            tile_metadata = swa_metadata.tile_sched_swaonly
-        elif self.compress_ratio == 4:
-            tile_metadata = swa_metadata.tile_sched_c4a
-        elif self.compress_ratio == 128:
-            tile_metadata = swa_metadata.tile_sched_c128a
-        else:
-            raise ValueError(
-                f"Unsupported compress_ratio={self.compress_ratio}; "
-                "expected 1, 4, or 128."
+        decode_backend = _get_sparse_mla_decode_backend()
+        decode_sync = (
+            _get_sparse_mla_decode_sync() if decode_backend == "native" else False
+        )
+        decode_diff = (
+            _get_sparse_mla_decode_diff() if decode_backend == "native" else False
+        )
+        if decode_diff:
+            # Validate the bound before launching the native kernel.  The
+            # diagnostic remains strictly opt-in and native dispatch is never
+            # replaced by the reference result.
+            _get_sparse_mla_decode_diff_max_calls()
+        if decode_backend == "torch_reference":
+            _warn_torch_reference_decode()
+            self._torch_sparse_decode(
+                q=q,
+                swa_cache=swa_cache,
+                swa_indices=swa_indices,
+                topk_indices=topk_indices,
+                output=output,
+                scale=self.scale,
             )
-        assert tile_metadata is not None, (
-            "swa_metadata missing tile_sched entry for "
-            f"compress_ratio={self.compress_ratio}; "
-            "DeepseekSparseSWAMetadataBuilder.build_tile_scheduler did not "
-            "allocate one for this layer type."
-        )
+        else:
+            sparse_mla_decode(
+                q=capture_q,
+                swa_cache=capture_swa_cache,
+                compressed_cache=capture_compressed_cache,
+                swa_indices=swa_indices,
+                topk_indices=topk_indices,
+                swa_lens=swa_lens,
+                topk_lens=topk_lens,
+                swa_block_table=swa_metadata.block_table,
+                compressed_block_table=(
+                    attn_metadata.block_table
+                    if attn_metadata is not None and not swa_only
+                    else None
+                ),
+                swa_block_size=swa_metadata.block_size,
+                compressed_block_size=(
+                    attn_metadata.block_size // self.compress_ratio
+                    if attn_metadata is not None and not swa_only
+                    else None
+                ),
+                sm_scale=self.scale,
+                d_v=output.shape[-1],
+                attn_sink=self.attn_sink,
+                out=output,
+                token_to_req=swa_metadata.token_to_req_indices[:num_decode_tokens],
+                swa_indices_are_global=True,
+                compressed_indices_are_global=True,
+                compatibility_mode=True,
+            )
+            if decode_sync:
+                _synchronize_sparse_mla_decode(capture_q)
+            if decode_diff:
+                _maybe_diff_sparse_mla_decode(
+                    attention=self,
+                    q=q,
+                    swa_cache=swa_cache,
+                    swa_indices=swa_indices,
+                    topk_indices=topk_indices,
+                    output=output,
+                    compress_ratio=self.compress_ratio,
+                    mode=SPARSE_MLA_DECODE_MODE,
+                    q_raw=capture_q,
+                    swa_cache_physical=capture_swa_cache,
+                    backend=decode_backend,
+                )
 
-        self._torch_sparse_decode(
-            q=q,
-            swa_cache=swa_cache,
-            swa_indices=swa_indices,
-            topk_indices=topk_indices,
-            output=output,
-            scale=self.scale,
-        )
+        # Capture only after the reference output is complete.  Avoid even
+        # constructing metadata views when the opt-in hook is disabled.
+        if os.getenv("VLLM_METAX_DSV4_SPARSE_MLA_CAPTURE_DIR"):
+            from vllm_metax.models.deepseek_v4.ops.sparse_mla_debug import (
+                maybe_capture_sparse_mla_decode,
+            )
+
+            maybe_capture_sparse_mla_decode(
+                q=capture_q,
+                swa_cache=capture_swa_cache,
+                compressed_cache=capture_compressed_cache,
+                swa_indices=swa_indices,
+                topk_indices=topk_indices,
+                swa_lens=swa_lens,
+                topk_lens=topk_lens,
+                sm_scale=self.scale,
+                d_v=output.shape[-1],
+                attn_sink=self.attn_sink,
+                output=output,
+                swa_block_table=swa_metadata.block_table,
+                compressed_block_table=(
+                    attn_metadata.block_table
+                    if attn_metadata is not None and not swa_only
+                    else None
+                ),
+                swa_block_size=swa_metadata.block_size,
+                compressed_block_size=(
+                    attn_metadata.block_size // self.compress_ratio
+                    if attn_metadata is not None and not swa_only
+                    else None
+                ),
+                compress_ratio=self.compress_ratio,
+                window_size=self.window_size,
+                decode_backend=decode_backend,
+                native_decode_mode=SPARSE_MLA_DECODE_MODE,
+            )
 
     def _forward_prefill(
         self,
@@ -378,4 +815,5 @@ class MacaDeepseekV4FlashMLAAttention(MacaDeepseekV4Attention):
                 attn_sink=self.attn_sink,
                 topk_length=combined_lens,
                 out=output[query_start:query_end],
+                compress_ratio=self.compress_ratio,
             )

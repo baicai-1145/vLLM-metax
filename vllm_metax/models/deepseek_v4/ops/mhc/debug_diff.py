@@ -20,6 +20,7 @@ _CALL_COUNT = 0
 _MISMATCH_COUNT = 0
 _RAW_CAPTURE_CALL_COUNT = 0
 _FUSED_CAPTURE_CALL_COUNT = 0
+_RAW_NORM_CAPTURE_CALL_COUNT = 0
 
 
 def enabled() -> bool:
@@ -256,6 +257,92 @@ def mhc_pre_from_raw_trace_torch(
 def reset_mhc_pre_raw_capture_state() -> None:
     global _RAW_CAPTURE_CALL_COUNT
     _RAW_CAPTURE_CALL_COUNT = 0
+
+
+def reset_mhc_raw_norm_capture_state() -> None:
+    global _RAW_NORM_CAPTURE_CALL_COUNT
+    _RAW_NORM_CAPTURE_CALL_COUNT = 0
+
+
+@torch.no_grad()
+def maybe_capture_mhc_raw_norm(
+    *,
+    layer_idx: int,
+    stage: str,
+    residual_cur: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    pre_norm_output: torch.Tensor,
+    norm_weight: torch.Tensor,
+    normalized_output: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int,
+) -> None:
+    global _RAW_NORM_CAPTURE_CALL_COUNT
+    directory = os.getenv("VLLM_METAX_DSV4_MHC_RAW_NORM_CAPTURE_DIR")
+    if not directory:
+        return
+    rank = _rank()
+    ranks = os.getenv("VLLM_METAX_DSV4_MHC_RAW_CAPTURE_RANKS", "all")
+    if ranks != "all" and rank not in {
+        item.strip() for item in ranks.split(",") if item.strip()
+    }:
+        return
+    limit = int(os.getenv("VLLM_METAX_DSV4_MHC_RAW_CAPTURE_MAX_CALLS", "0"))
+    if limit and _RAW_NORM_CAPTURE_CALL_COUNT >= limit:
+        return
+    call = _RAW_NORM_CAPTURE_CALL_COUNT
+    _RAW_NORM_CAPTURE_CALL_COUNT += 1
+    residual_2d = residual_cur.view(-1, residual_cur.shape[-2] * residual_cur.shape[-1]).float()
+    gemm_out_mul = torch.nn.functional.linear(residual_2d, fn).view(
+        1, residual_2d.shape[0], -1
+    )
+    gemm_out_sqrsum = residual_2d.square().sum(-1).view(1, -1)
+    trace = mhc_pre_from_raw_trace_torch(
+        residual_cur,
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+    )
+    payload = {
+        "schema_version": 2,
+        "rank": int(rank) if rank.isdigit() else rank,
+        "call": call,
+        "layer_idx": layer_idx,
+        "stage": stage,
+        "residual_cur": _clone_arg(residual_cur).cpu(),
+        "fn": _clone_arg(fn).cpu(),
+        "gemm_out_mul": _clone_arg(gemm_out_mul).cpu(),
+        "gemm_out_sqrsum": _clone_arg(gemm_out_sqrsum).cpu(),
+        "hc_scale": _clone_arg(hc_scale).cpu(),
+        "hc_base": _clone_arg(hc_base).cpu(),
+        "pre_norm_output": _clone_arg(pre_norm_output).cpu(),
+        "norm_weight": _clone_arg(norm_weight).cpu(),
+        "normalized_output": _clone_arg(normalized_output).cpu(),
+        "trace": {name: _clone_arg(value).cpu() for name, value in trace.items()},
+        "params": {
+            "rms_eps": rms_eps,
+            "hc_pre_eps": hc_pre_eps,
+            "hc_sinkhorn_eps": hc_sinkhorn_eps,
+            "hc_post_mult_value": hc_post_mult_value,
+            "sinkhorn_repeat": sinkhorn_repeat,
+            "n_splits": n_splits,
+        },
+    }
+    capture_dir = Path(directory)
+    capture_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, capture_dir / f"rank{rank}_call{call}.pt")
 
 
 def _raw_capture_dir() -> Path | None:

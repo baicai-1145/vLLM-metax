@@ -55,6 +55,7 @@ if _is_flashmla_available()[0]:
         flash_mla_sparse_fwd,
         get_mla_metadata,
     )
+
     _flash_mla_with_kvcache_impl = flash_mla_with_kvcache
     _flash_mla_sparse_fwd_impl = flash_mla_sparse_fwd
 else:
@@ -118,6 +119,7 @@ def flash_mla_sparse_fwd_wrapper(
     attn_sink: torch.Tensor | None = None,
     topk_length: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    compress_ratio: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Sparse attention prefill kernel
@@ -138,23 +140,42 @@ def flash_mla_sparse_fwd_wrapper(
     - max_logits:  [s_q, h_q], float
     - lse: [s_q, h_q], float, 2-based log-sum-exp
     """
-    # TODO: MetaX flash_mla support
-    # /------------------------  Metax Modification -------------------------\
-    # s_kv = kv.shape[0]
-    # indices_valid = torch.logical_and(indices != -1, indices < s_kv)
-    # # [s_q, h_kv, topk] -> [s_q, h_kv] -> [s_q, 1]
-    # indices_all_valid_per_q = indices_valid.all(dim=2).all(dim=1, keepdim=True)
+    # Import lazily so importing vLLM on a host without Triton does not change
+    # the existing FlashMLA availability probe.  Unsupported inputs are
+    # rejected by the native implementation instead of taking a torch
+    # gather/matmul fallback that can hide production memory failures.
+    from vllm_metax.kernels.sparse_mla_prefill import sparse_mla_prefill
 
-    # MetaX sparse FlashMLA prefill currently traps in
-    # ``sparse_attn_global_fwd_kernel`` on DeepSeek V4 workloads. Use the
-    # local torch reference path so converted checkpoints can still be
-    # brought up and validated end to end.
-    results = torch_flash_mla_sparse_prefill(q, kv, indices, sm_scale)
-    if out is not None:
-        out.copy_(results[0])
-        results = (out, results[1], results[2])
-    # \------------------------- Metax Modification -------------------------/
-    return results
+    result = sparse_mla_prefill(
+        q=q,
+        kv=kv,
+        indices=indices,
+        sm_scale=sm_scale,
+        d_v=d_v,
+        attn_sink=attn_sink,
+        topk_length=topk_length,
+        out=out,
+    )
+    from vllm_metax.models.deepseek_v4.ops.sparse_mla_debug import (
+        maybe_capture_sparse_mla_prefill,
+    )
+
+    output, max_logits, lse = result
+    maybe_capture_sparse_mla_prefill(
+        q=q,
+        kv=kv,
+        indices=indices,
+        sm_scale=sm_scale,
+        d_v=d_v,
+        attn_sink=attn_sink,
+        topk_length=topk_length,
+        out=out,
+        output=output,
+        max_logits=max_logits,
+        lse=lse,
+        compress_ratio=compress_ratio,
+    )
+    return output, max_logits, lse
 
 
 def flash_mla_sparse_decode_wrapper(

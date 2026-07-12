@@ -32,14 +32,18 @@ def _is_attention_weight(name: str) -> bool:
     return bool(ATTN_RE.fullmatch(name))
 
 
-def _expand_block_scales(scale: torch.Tensor, weight_shape: tuple[int, int], block_shape: tuple[int, int]) -> torch.Tensor:
+def _expand_block_scales(
+    scale: torch.Tensor, weight_shape: tuple[int, int], block_shape: tuple[int, int]
+) -> torch.Tensor:
     block_m, block_k = block_shape
     expanded = torch.repeat_interleave(scale.to(torch.float32), block_m, dim=0)
     expanded = torch.repeat_interleave(expanded, block_k, dim=1)
     return expanded[: weight_shape[0], : weight_shape[1]]
 
 
-def _dequant_block_fp8(weight: torch.Tensor, scale: torch.Tensor, block_shape: tuple[int, int]) -> torch.Tensor:
+def _dequant_block_fp8(
+    weight: torch.Tensor, scale: torch.Tensor, block_shape: tuple[int, int]
+) -> torch.Tensor:
     expanded_scale = _expand_block_scales(scale, tuple(weight.shape), block_shape)
     return (weight.to(torch.float32) * expanded_scale).to(torch.bfloat16)
 
@@ -64,7 +68,9 @@ def _rewrite_config(src_cfg: dict) -> dict:
         raise ValueError("config.json has no quantization_config")
 
     cfg.setdefault("_rewrite_notes", {})["attention_fp8_rewritten_to_bf16"] = True
-    cfg.setdefault("_rewrite_notes", {})["source_quant_method"] = qcfg.get("quant_method")
+    cfg.setdefault("_rewrite_notes", {})["source_quant_method"] = qcfg.get(
+        "quant_method"
+    )
 
     config_groups = qcfg.get("config_groups", {})
     group0 = config_groups.get("group_0")
@@ -86,7 +92,9 @@ def _rewrite_index(src_index: dict) -> dict:
     new_index = json.loads(json.dumps(src_index))
     new_weight_map = {}
     for key, shard in src_index["weight_map"].items():
-        if key.endswith(".weight_scale") and _is_attention_weight(key.replace(".weight_scale", ".weight")):
+        if key.endswith(".weight_scale") and _is_attention_weight(
+            key.replace(".weight_scale", ".weight")
+        ):
             continue
         new_weight_map[key] = shard
     new_index["weight_map"] = new_weight_map
@@ -101,7 +109,11 @@ def convert_checkpoint(src_dir: Path, dst_dir: Path) -> None:
     index = _load_json(src_dir / "model.safetensors.index.json")
     cfg = _load_json(src_dir / "config.json")
 
-    block_shape = tuple(cfg["quantization_config"]["config_groups"]["group_0"]["weights"]["block_structure"])
+    block_shape = tuple(
+        cfg["quantization_config"]["config_groups"]["group_0"]["weights"][
+            "block_structure"
+        ]
+    )
     weight_map: dict[str, str] = index["weight_map"]
     shard_names = sorted(set(weight_map.values()))
 
@@ -112,7 +124,10 @@ def convert_checkpoint(src_dir: Path, dst_dir: Path) -> None:
 
         out_path = dst_dir / shard_name
         if out_path.exists():
-            print(f"[skip {shard_idx}/{len(shard_names)}] {shard_name} already exists", flush=True)
+            print(
+                f"[skip {shard_idx}/{len(shard_names)}] {shard_name} already exists",
+                flush=True,
+            )
             continue
 
         print(f"[convert {shard_idx}/{len(shard_names)}] {shard_name}", flush=True)
@@ -135,7 +150,9 @@ def convert_checkpoint(src_dir: Path, dst_dir: Path) -> None:
                     skip.add(scale_key)
                     continue
 
-                if key.endswith(".weight_scale") and _is_attention_weight(key.replace(".weight_scale", ".weight")):
+                if key.endswith(".weight_scale") and _is_attention_weight(
+                    key.replace(".weight_scale", ".weight")
+                ):
                     continue
 
                 tensors_out[key] = f.get_tensor(key)
@@ -151,7 +168,9 @@ def convert_checkpoint(src_dir: Path, dst_dir: Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Rewrite DeepSeek-V4 mixed FP8/W4A16 MTP checkpoint into BF16-attn + W4A16 experts.")
+    parser = argparse.ArgumentParser(
+        description="Rewrite DeepSeek-V4 mixed FP8/W4A16 MTP checkpoint into BF16-attn + W4A16 experts."
+    )
     parser.add_argument("src", type=Path)
     parser.add_argument("dst", type=Path)
     parser.add_argument("--resume", action="store_true")

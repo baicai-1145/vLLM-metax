@@ -364,6 +364,11 @@ if _build_custom_ops():
 else:
     print("Using precompiled kernels, skipping building custom ops.")
 
+# Sparse MLA's standalone GEMM uses a private namespace so it can coexist with
+# the prebuilt mcoplib._moe_C extension.
+if _is_maca():
+    ext_modules.append(CMakeExtension(name="vllm_metax._metax_sparse_C"))
+
 
 package_data = {
     "vllm_metax": [

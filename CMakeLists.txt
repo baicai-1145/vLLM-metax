@@ -545,3 +545,26 @@ define_gpu_extension_target(
   USE_SABI 3
   WITH_SOABI)
 endif()
+
+# _metax_sparse_C extension
+#
+# This target is intentionally built even when the standard custom extensions
+# are supplied by mcoplib.  Its namespace is unique so loading it cannot
+# duplicate mcoplib's _moe_C TORCH_LIBRARY registration.
+set(VLLM_METAX_SPARSE_EXT_SRC
+  "csrc/metax_sparse/torch_bindings.cpp"
+  "csrc/metax_sparse/gemm_fp32.cu")
+
+set_gencode_flags_for_srcs(
+  SRCS "${VLLM_METAX_SPARSE_EXT_SRC}"
+  CUDA_ARCHS "${CUDA_ARCHS}")
+
+define_gpu_extension_target(
+  _metax_sparse_C
+  DESTINATION vllm_metax
+  LANGUAGE ${VLLM_GPU_LANG}
+  SOURCES ${VLLM_METAX_SPARSE_EXT_SRC}
+  COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+  ARCHITECTURES ${VLLM_GPU_ARCHES}
+  USE_SABI 3
+  WITH_SOABI)

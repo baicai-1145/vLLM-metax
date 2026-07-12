@@ -1,9 +1,11 @@
 import os
+import math
+import statistics
 import time
 
 os.environ.setdefault("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
 
-from vllm import LLM, SamplingParams
+from vllm import LLM, SamplingParams, TokensPrompt
 
 
 def _parse_expected_token_ids(value: str) -> list[int]:
@@ -23,7 +25,13 @@ def main() -> None:
     tensor_parallel_size = int(os.environ.get("TP", "1"))
     gpu_memory_utilization = float(os.environ.get("GPU_MEM", "0.7"))
     enforce_eager = os.environ.get("ENFORCE_EAGER", "0") == "1"
-    max_tokens = int(os.environ.get("MAX_TOKENS", "16"))
+    max_model_len = int(os.environ.get("MAX_MODEL_LEN", "512"))
+    max_num_batched_tokens = int(os.environ.get("MAX_NUM_BATCHED_TOKENS", "0"))
+    max_tokens = int(os.environ.get("MAX_TOKENS", "100"))
+    input_tokens = int(os.environ.get("INPUT_TOKENS", "0"))
+    warmup_requests = int(os.environ.get("WARMUP_REQUESTS", "0"))
+    bench_runs = int(os.environ.get("BENCH_RUNS", "1"))
+    enable_prefix_caching = os.environ.get("ENABLE_PREFIX_CACHING", "1") == "1"
     num_speculative_tokens = int(os.environ.get("NUM_SPECULATIVE_TOKENS", "0"))
     profile_dir = os.environ.get("PROFILE_DIR")
 
@@ -59,20 +67,46 @@ def main() -> None:
     llm = LLM(
         model=model,
         trust_remote_code=True,
-        max_model_len=512,
+        max_model_len=max_model_len,
         tensor_parallel_size=tensor_parallel_size,
         enforce_eager=enforce_eager,
         compilation_config=compilation_config,
         speculative_config=speculative_config,
         profiler_config=profiler_config,
         gpu_memory_utilization=gpu_memory_utilization,
+        enable_prefix_caching=enable_prefix_caching,
+        **(
+            {"max_num_batched_tokens": max_num_batched_tokens}
+            if max_num_batched_tokens
+            else {}
+        ),
     )
     sampling_params = SamplingParams(
         temperature=0.0,
         max_tokens=max_tokens,
         min_tokens=1,
     )
-    prompts = ["Complete this sentence in one short clause: Speculative decoding is"]
+    if input_tokens:
+        tokenizer = llm.get_tokenizer()
+        seed_ids = tokenizer.encode(
+            "Deep learning inference performance depends on efficient kernels, "
+            "memory access, communication, and scheduling. ",
+            add_special_tokens=False,
+        )
+        if not seed_ids:
+            raise RuntimeError("tokenizer produced an empty prefill seed")
+        repeats = math.ceil(input_tokens / len(seed_ids))
+        prompt_token_ids = (seed_ids * repeats)[:input_tokens]
+        prompts = [TokensPrompt(prompt_token_ids=prompt_token_ids)]
+    else:
+        prompts = [
+            "Complete this sentence in one short clause: Speculative decoding is"
+        ]
+        prompt_token_ids = []
+
+    warmup_params = SamplingParams(temperature=0.0, max_tokens=1, min_tokens=1)
+    for _ in range(warmup_requests):
+        llm.generate(prompts, warmup_params, use_tqdm=False)
     if profile_dir:
         llm.generate(
             prompts,
@@ -80,8 +114,21 @@ def main() -> None:
             use_tqdm=False,
         )
         llm.start_profile()
-    started = time.perf_counter()
-    out = llm.generate(prompts, sampling_params)
+    elapsed_runs = []
+    out = None
+    if input_tokens:
+        print("PREFILL_BENCH_START", flush=True)
+    else:
+        print("DECODE_BENCH_START", flush=True)
+    for _ in range(bench_runs):
+        started = time.perf_counter()
+        out = llm.generate(prompts, sampling_params, use_tqdm=False)
+        elapsed_runs.append(time.perf_counter() - started)
+    if input_tokens:
+        print("PREFILL_BENCH_END", flush=True)
+    else:
+        print("DECODE_BENCH_END", flush=True)
+    assert out is not None
     output = out[0].outputs[0]
     text = output.text
     if not text.strip():
@@ -99,7 +146,10 @@ def main() -> None:
         )
         output = chat_out[0].outputs[0]
         text = output.text
-    elapsed = time.perf_counter() - started
+    elapsed = statistics.median(elapsed_runs)
+    sorted_elapsed = sorted(elapsed_runs)
+    p90_index = max(0, math.ceil(0.9 * len(sorted_elapsed)) - 1)
+    elapsed_p90 = sorted_elapsed[p90_index]
     if profile_dir:
         llm.stop_profile()
     output_tps = len(output.token_ids) / elapsed
@@ -110,6 +160,12 @@ def main() -> None:
     print("GENERATED_TOKENS", len(output.token_ids))
     print("GENERATE_SECONDS", f"{elapsed:.6f}")
     print("OUTPUT_TOKENS_PER_SECOND", f"{output_tps:.6f}")
+    if input_tokens:
+        print("PROMPT_TOKENS", len(prompt_token_ids))
+        print("PREFILL_RUN_SECONDS", [round(value, 6) for value in elapsed_runs])
+        print("PREFILL_MEDIAN_SECONDS", f"{elapsed:.6f}")
+        print("PREFILL_P90_SECONDS", f"{elapsed_p90:.6f}")
+        print("PREFILL_TOKENS_PER_SECOND", f"{input_tokens / elapsed:.6f}")
 
     expected_token_ids = os.environ.get("EXPECTED_TOKEN_IDS")
     if expected_token_ids:

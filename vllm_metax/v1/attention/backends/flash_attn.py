@@ -1022,9 +1022,8 @@ class FlashAttentionImpl(AttentionImpl):
             query_len = req_end - req_start
             for query_offset in range(query_len):
                 token_idx = req_start + query_offset
-                cache_seqlens = (
-                    seq_lens[req_idx : req_idx + 1]
-                    - (query_len - query_offset - 1)
+                cache_seqlens = seq_lens[req_idx : req_idx + 1] - (
+                    query_len - query_offset - 1
                 )
                 cu_seqlens_q = torch.tensor(
                     [0, 1], dtype=torch.int32, device=decode_query.device

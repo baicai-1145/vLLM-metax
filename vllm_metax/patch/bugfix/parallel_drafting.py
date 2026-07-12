@@ -17,9 +17,7 @@ def _init_parallel_drafting_params(self):
     if self.speculative_config.method == "dspark":
         self.pass_hidden_states_to_model = False
         return
-    if (
-        self.pass_hidden_states_to_model
-    ):
+    if self.pass_hidden_states_to_model:
         self.parallel_drafting_hidden_state_tensor = torch.empty(
             self.hidden_size, dtype=self.dtype, device=self.device
         )

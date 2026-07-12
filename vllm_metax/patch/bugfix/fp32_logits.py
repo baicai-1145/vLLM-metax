@@ -32,9 +32,7 @@ def _fp32_logits_mode() -> str:
             return "force"
         if override.lower() == "auto":
             return "auto"
-        raise ValueError(
-            "VLLM_METAX_USE_FP32_LOGITS must be one of 0, 1, or auto"
-        )
+        raise ValueError("VLLM_METAX_USE_FP32_LOGITS must be one of 0, 1, or auto")
 
     vllm_config = get_current_vllm_config_or_none()
     speculative_config = (
@@ -102,18 +100,12 @@ def _get_logits(
         dtype=top.indices.dtype,
     )
     argmax_indices = logits.argmax(dim=-1)
-    argmax_is_punctuation = (
-        argmax_indices[..., None] == punctuation_ids
-    ).any(dim=-1)
+    argmax_is_punctuation = (argmax_indices[..., None] == punctuation_ids).any(dim=-1)
     argmax_is_markdown_structural = (
         argmax_indices[..., None] == markdown_structural_ids
     ).any(dim=-1)
-    top1_is_punctuation = (
-        top.indices[..., 0, None] == punctuation_ids
-    ).any(dim=-1)
-    top2_is_punctuation = (
-        top.indices[..., 1, None] == punctuation_ids
-    ).any(dim=-1)
+    top1_is_punctuation = (top.indices[..., 0, None] == punctuation_ids).any(dim=-1)
+    top2_is_punctuation = (top.indices[..., 1, None] == punctuation_ids).any(dim=-1)
     top1_is_markdown_structural = (
         top.indices[..., 0, None] == markdown_structural_ids
     ).any(dim=-1)

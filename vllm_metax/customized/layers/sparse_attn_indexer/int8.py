@@ -2,6 +2,11 @@
 # 2026 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 """Custom Sparse Attention Indexer layers."""
 
+import json
+import os
+import threading
+from pathlib import Path
+
 import torch
 
 import vllm.envs as envs
@@ -32,6 +37,97 @@ from vllm_metax import _custom_ops as mx_ops
 logger = init_logger(__name__)
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
+_INDEXER_CACHE_LAYOUT_LOG_ENV = "VLLM_METAX_DSV4_INDEXER_CACHE_LAYOUT_LOG"
+_INDEXER_CACHE_LAYOUT_LOGGED = False
+_INDEXER_CACHE_LAYOUT_LOG_LOCK = threading.Lock()
+
+
+def _indexer_cache_layout_is_standard(
+    shape: tuple[int, ...],
+    stride: tuple[int, ...],
+    storage_offset: int,
+    is_contiguous: bool,
+) -> bool:
+    """Return whether metadata describes a zero-offset contiguous tensor."""
+    if storage_offset != 0 or not is_contiguous:
+        return False
+    expected_stride: list[int] = []
+    running = 1
+    for size in reversed(shape):
+        expected_stride.append(running)
+        running *= size
+    return stride == tuple(reversed(expected_stride))
+
+
+def _indexer_cache_layout_log_path(setting: str, rank: str) -> Path:
+    if setting.strip().lower() in {"1", "true", "yes", "on"}:
+        return Path("/root/vLLM-metax/.logs") / (
+            f"dsv4_indexer_cache_layout_rank{rank}.jsonl"
+        )
+    return Path(setting)
+
+
+def _indexer_cache_layout_rank() -> str:
+    rank = os.getenv("RANK") or os.getenv("LOCAL_RANK")
+    if rank is not None:
+        return rank
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            return str(dist.get_rank())
+    except Exception:
+        pass
+    return str(os.getpid())
+
+
+def _maybe_log_indexer_cache_layout(kv_cache: torch.Tensor) -> None:
+    """Write one cache-layout metadata record when explicitly enabled."""
+    global _INDEXER_CACHE_LAYOUT_LOGGED
+    setting = os.getenv(_INDEXER_CACHE_LAYOUT_LOG_ENV)
+    if not setting or setting.strip().lower() in {"0", "false", "off", "no"}:
+        return
+    with _INDEXER_CACHE_LAYOUT_LOG_LOCK:
+        if _INDEXER_CACHE_LAYOUT_LOGGED:
+            return
+        _INDEXER_CACHE_LAYOUT_LOGGED = True
+
+    rank = _indexer_cache_layout_rank()
+    shape = tuple(int(value) for value in kv_cache.shape)
+    stride = tuple(int(value) for value in kv_cache.stride())
+    metadata = {
+        "schema_version": 1,
+        "rank": int(rank) if rank.isdigit() else rank,
+        "shape": list(shape),
+        "stride": list(stride),
+        "dtype": str(kv_cache.dtype),
+        "storage_offset": int(kv_cache.storage_offset()),
+        "is_contiguous": bool(kv_cache.is_contiguous()),
+    }
+    metadata["is_standard_layout"] = _indexer_cache_layout_is_standard(
+        shape,
+        stride,
+        metadata["storage_offset"],
+        metadata["is_contiguous"],
+    )
+    path = _indexer_cache_layout_log_path(setting, rank)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = (json.dumps(metadata, separators=(",", ":")) + "\n").encode()
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(descriptor, payload)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        logger.exception("Failed to write indexer cache layout log: %s", path)
+
+
+def _reset_indexer_cache_layout_log_state() -> None:
+    """Reset the one-record budget for unit tests."""
+    global _INDEXER_CACHE_LAYOUT_LOGGED
+    with _INDEXER_CACHE_LAYOUT_LOG_LOCK:
+        _INDEXER_CACHE_LAYOUT_LOGGED = False
 
 
 def _fill_topk_indices_torch(logits: torch.Tensor, topk_indices: torch.Tensor) -> None:
@@ -197,6 +293,7 @@ def sparse_attn_indexer_int8(
         decode_metadata = attn_metadata_narrowed.decode
         assert decode_metadata is not None
         kv_cache = kv_cache_as_quant_view(kv_cache, head_dim, False)
+        _maybe_log_indexer_cache_layout(kv_cache)
         decode_lens = decode_metadata.decode_lens
         if decode_metadata.requires_padding:
             # pad in edge case where we have short chunked prefill length <

@@ -22,7 +22,10 @@ def _bf16_diff(lhs: torch.Tensor, rhs: torch.Tensor) -> dict:
     if not mask.any().item():
         return {"equal": True}
     flat = int(mask.flatten().nonzero()[0].item())
-    idx = tuple(int(v) for v in torch.unravel_index(torch.tensor(flat, device=mask.device), mask.shape))
+    idx = tuple(
+        int(v)
+        for v in torch.unravel_index(torch.tensor(flat, device=mask.device), mask.shape)
+    )
     return {
         "equal": False,
         "index": list(idx),
@@ -38,7 +41,10 @@ def _float_diff(lhs: torch.Tensor, rhs: torch.Tensor) -> dict:
     if not mask.any().item():
         return {"equal": True}
     flat = int(mask.flatten().nonzero()[0].item())
-    idx = tuple(int(v) for v in torch.unravel_index(torch.tensor(flat, device=mask.device), mask.shape))
+    idx = tuple(
+        int(v)
+        for v in torch.unravel_index(torch.tensor(flat, device=mask.device), mask.shape)
+    )
     return {
         "equal": False,
         "index": list(idx),
@@ -129,6 +135,8 @@ def _run_big_fuse_with_exact_raw(
         comb_mix.view(num_tokens, mhc_mult, mhc_mult),
         layer_input,
     )
+
+
 def _run_big_fuse_with_raw(
     residual_cur: torch.Tensor,
     gemm_out_mul: torch.Tensor,
@@ -308,7 +316,9 @@ def _scalar_post_value(
     terms = []
     if x_first:
         acc = acc + x_term
-        terms.append({"name": "x", "term": float(x_term.item()), "acc": float(acc.item())})
+        terms.append(
+            {"name": "x", "term": float(x_term.item()), "acc": float(acc.item())}
+        )
     for in_mhc_idx in comb_order:
         term = (
             comb_mix[token_idx, in_mhc_idx, out_mhc_idx]
@@ -329,7 +339,9 @@ def _scalar_post_value(
         )
     if not x_first:
         acc = acc + x_term
-        terms.append({"name": "x", "term": float(x_term.item()), "acc": float(acc.item())})
+        terms.append(
+            {"name": "x", "term": float(x_term.item()), "acc": float(acc.item())}
+        )
     return {
         "value_fp32": float(acc.item()),
         "value_bf16": float(acc.bfloat16().float().item()),
@@ -347,19 +359,27 @@ def _post_scalar_decomp(
         return None
     idx = diff["index"]
     token_idx, out_mhc_idx, hidden_idx = idx[-3], idx[-2], idx[-1]
-    x = inputs["x"].to(torch_residual_cur.device).view(
-        torch_residual_cur.shape[0], torch_residual_cur.shape[-1]
+    x = (
+        inputs["x"]
+        .to(torch_residual_cur.device)
+        .view(torch_residual_cur.shape[0], torch_residual_cur.shape[-1])
     )
-    residual = inputs["residual"].to(torch_residual_cur.device).view_as(
-        torch_residual_cur
+    residual = (
+        inputs["residual"].to(torch_residual_cur.device).view_as(torch_residual_cur)
     )
-    post_mix = inputs["post_layer_mix"].to(torch_residual_cur.device).view(
-        torch_residual_cur.shape[0], torch_residual_cur.shape[-2]
+    post_mix = (
+        inputs["post_layer_mix"]
+        .to(torch_residual_cur.device)
+        .view(torch_residual_cur.shape[0], torch_residual_cur.shape[-2])
     )
-    comb_mix = inputs["comb_res_mix"].to(torch_residual_cur.device).view(
-        torch_residual_cur.shape[0],
-        torch_residual_cur.shape[-2],
-        torch_residual_cur.shape[-2],
+    comb_mix = (
+        inputs["comb_res_mix"]
+        .to(torch_residual_cur.device)
+        .view(
+            torch_residual_cur.shape[0],
+            torch_residual_cur.shape[-2],
+            torch_residual_cur.shape[-2],
+        )
     )
     hc_mult = torch_residual_cur.shape[-2]
     forward_order = tuple(range(hc_mult))
@@ -376,24 +396,55 @@ def _post_scalar_decomp(
             "xterm": float(torch_xterm[token_idx, out_mhc_idx, hidden_idx].item()),
             "total_fp32": float(torch_total[token_idx, out_mhc_idx, hidden_idx].item()),
             "total_bf16": float(
-                torch_total[token_idx, out_mhc_idx, hidden_idx].bfloat16().float().item()
+                torch_total[token_idx, out_mhc_idx, hidden_idx]
+                .bfloat16()
+                .float()
+                .item()
             ),
         },
         "comb_forward_x_last": _scalar_post_value(
-            x, residual, post_mix, comb_mix, token_idx, out_mhc_idx, hidden_idx,
-            forward_order, x_first=False
+            x,
+            residual,
+            post_mix,
+            comb_mix,
+            token_idx,
+            out_mhc_idx,
+            hidden_idx,
+            forward_order,
+            x_first=False,
         ),
         "comb_reverse_x_last": _scalar_post_value(
-            x, residual, post_mix, comb_mix, token_idx, out_mhc_idx, hidden_idx,
-            reverse_order, x_first=False
+            x,
+            residual,
+            post_mix,
+            comb_mix,
+            token_idx,
+            out_mhc_idx,
+            hidden_idx,
+            reverse_order,
+            x_first=False,
         ),
         "x_first_comb_forward": _scalar_post_value(
-            x, residual, post_mix, comb_mix, token_idx, out_mhc_idx, hidden_idx,
-            forward_order, x_first=True
+            x,
+            residual,
+            post_mix,
+            comb_mix,
+            token_idx,
+            out_mhc_idx,
+            hidden_idx,
+            forward_order,
+            x_first=True,
         ),
         "x_first_comb_reverse": _scalar_post_value(
-            x, residual, post_mix, comb_mix, token_idx, out_mhc_idx, hidden_idx,
-            reverse_order, x_first=True
+            x,
+            residual,
+            post_mix,
+            comb_mix,
+            token_idx,
+            out_mhc_idx,
+            hidden_idx,
+            reverse_order,
+            x_first=True,
         ),
     }
 
@@ -530,12 +581,12 @@ def main() -> None:
     fused_residual, fused_raw, fused_sqrsum = _run_fused_raw(
         inputs["x"].to(args.device).view(residual_cur.shape[0], residual_cur.shape[-1]),
         inputs["residual"].to(args.device).view_as(residual_cur),
-        inputs["post_layer_mix"].to(args.device).view(
-            residual_cur.shape[0], residual_cur.shape[-2]
-        ),
-        inputs["comb_res_mix"].to(args.device).view(
-            residual_cur.shape[0], residual_cur.shape[-2], residual_cur.shape[-2]
-        ),
+        inputs["post_layer_mix"]
+        .to(args.device)
+        .view(residual_cur.shape[0], residual_cur.shape[-2]),
+        inputs["comb_res_mix"]
+        .to(args.device)
+        .view(residual_cur.shape[0], residual_cur.shape[-2], residual_cur.shape[-2]),
         inputs["fn"].to(args.device),
         n_splits,
     )
@@ -607,13 +658,9 @@ def main() -> None:
             "rerun_fused_sqrsum_vs_exact_sqrsum": _float_diff(
                 fused_sqrsum, exact_sqrsum
             ),
-            "rerun_fused_mixes_vs_exact_mixes": _float_diff(
-                fused_mixes, exact_mixes
-            ),
+            "rerun_fused_mixes_vs_exact_mixes": _float_diff(fused_mixes, exact_mixes),
             "rerun_fused_pre_vs_exact_pre": _float_diff(fused_pre, exact_pre),
-            "rerun_fused_post_vs_exact_post": _float_diff(
-                fused_post, exact_post_split
-            ),
+            "rerun_fused_post_vs_exact_post": _float_diff(fused_post, exact_post_split),
             "rerun_fused_comb_logits_vs_exact_comb_logits": _float_diff(
                 fused_comb, exact_comb_split
             ),

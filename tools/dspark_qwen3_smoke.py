@@ -332,9 +332,7 @@ def print_token_diff(
     tokenizer = AutoTokenizer.from_pretrained(TARGET, trust_remote_code=True)
     max_len = max(len(baseline_token_ids), len(dspark_token_ids))
     for pos in range(max_len):
-        baseline_id = (
-            baseline_token_ids[pos] if pos < len(baseline_token_ids) else None
-        )
+        baseline_id = baseline_token_ids[pos] if pos < len(baseline_token_ids) else None
         dspark_id = dspark_token_ids[pos] if pos < len(dspark_token_ids) else None
         if baseline_id == dspark_id:
             continue
@@ -367,14 +365,10 @@ def check_math_answer_equivalence(
     ):
         baseline_normalized = baseline_text.lower()
         dspark_normalized = dspark_text.lower()
-        baseline_missing = [
-            term for term in terms if term not in baseline_normalized
-        ]
+        baseline_missing = [term for term in terms if term not in baseline_normalized]
         dspark_missing = [term for term in terms if term not in dspark_normalized]
         if baseline_missing:
-            failures.append(
-                f"prompt {index} baseline missing terms {baseline_missing}"
-            )
+            failures.append(f"prompt {index} baseline missing terms {baseline_missing}")
         if dspark_missing:
             failures.append(f"prompt {index} DSpark missing terms {dspark_missing}")
     return failures

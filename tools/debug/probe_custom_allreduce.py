@@ -22,7 +22,9 @@ def main() -> None:
     from vllm import _custom_ops as ops
     from vllm.config.parallel import ParallelConfig
     from vllm.distributed.device_communicators import custom_all_reduce as car_mod
-    from vllm.distributed.device_communicators.all_reduce_utils import gpu_p2p_access_check
+    from vllm.distributed.device_communicators.all_reduce_utils import (
+        gpu_p2p_access_check,
+    )
     from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
     from vllm.platforms import current_platform
 
@@ -47,14 +49,20 @@ def main() -> None:
     try:
         pc = ParallelConfig(tensor_parallel_size=world_size)
         if rank == 0:
-            print("ParallelConfig.disable_custom_all_reduce", pc.disable_custom_all_reduce)
+            print(
+                "ParallelConfig.disable_custom_all_reduce", pc.disable_custom_all_reduce
+            )
     except Exception as exc:
         if rank == 0:
             print("ParallelConfig_error", repr(exc))
 
-    physical_device_id = current_platform.visible_device_id_to_physical_device_id(local_rank)
+    physical_device_id = current_platform.visible_device_id_to_physical_device_id(
+        local_rank
+    )
     tensor = torch.tensor([physical_device_id], dtype=torch.int, device="cpu")
-    gather_list = [torch.tensor([0], dtype=torch.int, device="cpu") for _ in range(world_size)]
+    gather_list = [
+        torch.tensor([0], dtype=torch.int, device="cpu") for _ in range(world_size)
+    ]
     dist.all_gather(gather_list, tensor, group=cpu_group)
     physical_ids = [t.item() for t in gather_list]
     fully_connected = current_platform.is_fully_connected(physical_ids)
@@ -79,8 +87,12 @@ def main() -> None:
     shape_results = {}
     if custom is not None:
         for seq_len in args.seq_lens:
-            sample = torch.ones((seq_len, args.hidden_size), dtype=torch.bfloat16, device=device)
-            shape_results[f"{seq_len}x{args.hidden_size}"] = bool(custom.should_custom_ar(sample))
+            sample = torch.ones(
+                (seq_len, args.hidden_size), dtype=torch.bfloat16, device=device
+            )
+            shape_results[f"{seq_len}x{args.hidden_size}"] = bool(
+                custom.should_custom_ar(sample)
+            )
 
     summary = {
         "rank": rank,

@@ -35,9 +35,7 @@ def _compute_global_target_argmax_scalar(
     )
     max_block_idx = tl.argmax(local_max, axis=0)
     return tl.load(
-        target_local_argmax_ptr
-        + logit_idx * target_local_argmax_stride
-        + max_block_idx
+        target_local_argmax_ptr + logit_idx * target_local_argmax_stride + max_block_idx
     ).to(tl.int64)
 
 

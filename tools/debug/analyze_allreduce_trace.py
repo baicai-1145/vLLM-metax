@@ -49,7 +49,8 @@ def load_rank(path: str) -> dict:
         data = json.load(f)
     events = data["traceEvents"]
     decode_ann = [
-        e for e in events
+        e
+        for e in events
         if e.get("ph") == "X"
         and e.get("cat") in {"user_annotation", "gpu_user_annotation"}
         and str(e.get("name", "")).startswith("execute_context_0")
@@ -63,17 +64,32 @@ def load_rank(path: str) -> dict:
         end_ts = max(e["ts"] + e.get("dur", 0) for e in xs)
 
     cpu_allreduce = [
-        e for e in events
-        if e.get("ph") == "X" and e.get("cat") == "cpu_op" and e.get("name") == "vllm::all_reduce"
+        e
+        for e in events
+        if e.get("ph") == "X"
+        and e.get("cat") == "cpu_op"
+        and e.get("name") == "vllm::all_reduce"
     ]
     mccl_kernels = [
-        e for e in events
-        if e.get("ph") == "X" and e.get("cat") == "kernel" and "mcclKernel_AllReduce" in e.get("name", "")
+        e
+        for e in events
+        if e.get("ph") == "X"
+        and e.get("cat") == "kernel"
+        and "mcclKernel_AllReduce" in e.get("name", "")
     ]
-    fallback_cpu_names = {"aten::sum", "aten::add", "aten::div", "aten::copy_", "aten::mul"}
+    fallback_cpu_names = {
+        "aten::sum",
+        "aten::add",
+        "aten::div",
+        "aten::copy_",
+        "aten::mul",
+    }
     fallback_cpu = [
-        e for e in events
-        if e.get("ph") == "X" and e.get("cat") == "cpu_op" and e.get("name") in fallback_cpu_names
+        e
+        for e in events
+        if e.get("ph") == "X"
+        and e.get("cat") == "cpu_op"
+        and e.get("name") in fallback_cpu_names
     ]
     fallback_kernel_substrings = {
         "aten_add_kernel": "add",
@@ -101,7 +117,9 @@ def load_rank(path: str) -> dict:
                 fallback_kernel_dur[label] += e.get("dur", 0)
                 break
 
-    runtime = [e for e in events if e.get("ph") == "X" and e.get("cat") == "cuda_runtime"]
+    runtime = [
+        e for e in events if e.get("ph") == "X" and e.get("cat") == "cuda_runtime"
+    ]
     runtime_counts = Counter(e.get("name", "") for e in runtime)
     runtime_dur = defaultdict(float)
     for e in runtime:
@@ -161,7 +179,9 @@ def main() -> None:
             "fallback_cpu_counts": dict(fallback_cpu_by_name),
             "fallback_cpu_total_ms": {k: v / 1000 for k, v in fallback_cpu_dur.items()},
             "fallback_kernel_counts": dict(r["fallback_kernel_counts"]),
-            "fallback_kernel_total_ms": {k: v / 1000 for k, v in r["fallback_kernel_dur"].items()},
+            "fallback_kernel_total_ms": {
+                k: v / 1000 for k, v in r["fallback_kernel_dur"].items()
+            },
             "cuda_runtime_top": [
                 {
                     "name": name,
@@ -178,18 +198,22 @@ def main() -> None:
     for idx in range(min_mccl_count):
         starts = [r["mccl_kernels"][idx]["ts"] - r["start_ts"] for r in ranks]
         durs = [r["mccl_kernels"][idx].get("dur", 0) for r in ranks]
-        aligned.append({
-            "idx": idx,
-            "start_skew_us": max(starts) - min(starts),
-            "duration_skew_us": max(durs) - min(durs),
-            "max_duration_us": max(durs),
-            "min_duration_us": min(durs),
-            "mean_duration_us": statistics.fmean(durs),
-        })
+        aligned.append(
+            {
+                "idx": idx,
+                "start_skew_us": max(starts) - min(starts),
+                "duration_skew_us": max(durs) - min(durs),
+                "max_duration_us": max(durs),
+                "min_duration_us": min(durs),
+                "mean_duration_us": statistics.fmean(durs),
+            }
+        )
     skew_values = [x["start_skew_us"] for x in aligned]
     dur_values = [x["mean_duration_us"] for x in aligned]
     worst_skew = sorted(aligned, key=lambda x: x["start_skew_us"], reverse=True)[:20]
-    worst_duration = sorted(aligned, key=lambda x: x["max_duration_us"], reverse=True)[:20]
+    worst_duration = sorted(aligned, key=lambda x: x["max_duration_us"], reverse=True)[
+        :20
+    ]
 
     result = {
         "trace_paths": paths,

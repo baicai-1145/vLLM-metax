@@ -65,7 +65,6 @@ def _patch_torch_accelerator_memory_api() -> None:
 _patch_torch_accelerator_memory_api()
 
 
-
 # --------------------------------------------------
 # This hotfix is to revert:
 #   https://github.com/vllm-project/vllm/pull/36093

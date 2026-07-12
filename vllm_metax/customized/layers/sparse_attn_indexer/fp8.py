@@ -45,6 +45,7 @@ def _fill_topk_indices_torch(logits: torch.Tensor, topk_indices: torch.Tensor) -
     topk_view = topk.reshape(-1, k)
     topk_indices_view[:, :k].copy_(topk_view)
 
+
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
 
