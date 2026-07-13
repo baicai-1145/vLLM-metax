@@ -227,8 +227,9 @@ After-profile 对比显示 downstream RMS `59.095 -> 29.413 ms`（`-50.23%`，
 `139.048 -> 69.208 us/call`），exact MHC grouped `84.266 -> 54.550 ms`
 （`-35.26%`）。新 trace 的 MCCL residency 呈 rank-asymmetric：ranks 0-2
 约 `48 ms`，rank 3 为 `3.289 ms`。该 residency 是同步/等待证据，不能
-作为纯通信链路时间相加；下一诊断是 rank arrival/collective wait。Plan 04
-仍未开始。
+作为纯通信链路时间相加；下一诊断已拆分为
+[`03.5-mccl-rank-skew.md`](03.5-mccl-rank-skew.md)，用于区分 rank arrival、
+collective transfer tail 和 graph/host gap。Plan 04 仍未开始。
 
 主要 artifacts：
 

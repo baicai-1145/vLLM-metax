@@ -6,18 +6,20 @@
 
 ## 推荐执行顺序
 
-| 顺序 | 会话文档                       | 状态/目的                                      | 依赖              |
-| ---: | ------------------------------ | ---------------------------------------------- | ----------------- |
-|    0 | `00-shared-contract.md`        | 冻结 A100/C500 同口径基线和全局门禁            | 无                |
-|    1 | `01-sparse-mla.md`             | 完成：累计约 +5%，含输出序列限制               | 00                |
-|    2 | `02-mhc-rmsnorm.md`            | 完成/接受 opt-in exact path；默认关闭          | 00                |
-|    3 | `03-o-proj.md`                 | 完成：精确融合 no-go，保持基线                 | 00，建议 01 后    |
-|    4 | `04-w4a16-moe.md`              | 未开始                                         | 00                |
-|    5 | `05-tp-communication.md`       | 优化 87 次/token 小消息 TP collective          | 00，建议 01-04 后 |
-|    6 | `06-cudagraph-launch.md`       | 减少 graph break、launch gap 和分配            | 01-05             |
-|    7 | `07-integration-acceptance.md` | 汇总收益、回归和最终推广决策                   | 01-06             |
+| 顺序 | 会话文档                       | 状态/目的                                | 依赖              |
+| ---: | ------------------------------ | ---------------------------------------- | ----------------- |
+|    0 | `00-shared-contract.md`        | 冻结 A100/C500 同口径基线和全局门禁      | 无                |
+|    1 | `01-sparse-mla.md`             | 完成：累计约 +5%，含输出序列限制         | 00                |
+|    2 | `02-mhc-rmsnorm.md`            | 完成/接受 opt-in exact path；默认关闭    | 00                |
+|    3 | `03-o-proj.md`                 | 完成：精确融合 no-go，保持基线           | 00，建议 01 后    |
+|  3.5 | `03.5-mccl-rank-skew.md`       | 未开始：归因 rank arrival，路由 04/05/06 | 00，01-03 后      |
+|    4 | `04-w4a16-moe.md`              | 未开始                                   | 00，03.5 路由     |
+|    5 | `05-tp-communication.md`       | 优化 87 次/token 小消息 TP collective    | 00，03.5 路由     |
+|    6 | `06-cudagraph-launch.md`       | 减少 graph break、launch gap 和分配      | 00，03.5 路由     |
+|    7 | `07-integration-acceptance.md` | 汇总收益、回归和最终推广决策             | 01-06             |
 
-Sparse MLA、MHC、O-proj、MoE 可以在文件写集合不重叠时并行推进。执行上必须
+Sparse MLA、MHC、O-proj、MoE 的静态调研可以在文件写集合不重叠时并行推进；
+Plan 04、05、06 的性能实现和推广必须等待 Plan 03.5 路由。执行上必须
 decode-first，但 prefill 的 OOM blocker 要立即建立复现和修复门禁，不能等 decode
 完成后再处理。TP 通信和 CUDA Graph 会影响所有阶段，应该在主要计算 kernel
 稳定后再做最终推广。
