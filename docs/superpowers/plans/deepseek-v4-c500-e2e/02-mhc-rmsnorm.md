@@ -183,6 +183,59 @@ exact on 相比 off 为 `+62.07%` TPS、`-38.30%` median latency。原始结果�
 `.logs/plan02_sigmoid_fdiv_benchmark_20260714/`。该结论仅适用于显式 opt-in
 exact path；不得静默改变 runtime default。
 
+## 2026-07-14 Plan02-on 最新 decode profile
+
+在同一 frozen TP=4、PIECEWISE、MTP=0、`MAX_TOKENS=100`、exact-on workload
+上，profiler 在 delay 4 后采集了 5 个 steady `execute_context`；trace 不含
+token IDs，因此这里只报告 stage/时间归因，不声称具体 token 结果。rank0 device
+self 为 `175.944 ms / 5 steps`：
+
+- MHC exact grouped：`84.266 ms`（`47.9%`）；其中 downstream RMS 为
+  `59.095 ms / 425`（`33.59%`，`139.048 us`/次）。
+- MoE：`29.474 ms`（`16.8%`）；MCCL allreduce：`6.599 ms / 435`
+  （`3.75%`）。
+- graph internal gap：`3.925 ms/step`；inter-step gaps 合计
+  `9.253 ms`；约 `2348` kernels/token、`61–62` memcopies/token、`44`
+  graph launches/token。
+- trace busy：graph 内约 `89.2–89.9%`，完整窗口 `85.9%`。
+
+这是 profiler-instrumented TPS 证据，不替代同 workload 正常 benchmark 的
+`25.8759 TPS`。下一项应验证 downstream RMS MHC kernel/fusion；不要因
+`mx-smi` 低采样把该瓶颈误判为 host-only。原始 artifacts：
+`.logs/plan02_on_decode_profile_20260714/{summary.txt,analysis.json,trace/}`。
+Plan 04 仍未开始。
+
+## 2026-07-14 downstream RMS Sinkhorn 优化验收
+
+在主树 SHA `28ea10c` 上，`mhc_downstream_rms_kernel` 将 4x4 Sinkhorn 的
+行/列归一化改为 `tid<4` 并行；每个四元素求和保持原操作顺序，保留
+`__fdiv_rn` 和 20 次 repeat，未改变后续 BF16 pre-norm/RMS contract。该
+优化通过全部验收，状态为 **accepted**（仅适用于显式 Plan 02-on path，
+runtime 默认仍关闭；本记录不伪造 commit）。
+
+- 21 tests passed；1892/1892 real late payloads bitwise，graph replay 9/9，
+  pointers/allocations stable，无 fallback。
+- Isolated latency：eager median/P90 `151.81/153.09 -> 81.92/83.456 us`；
+  graph median/P90 `166.14/167.68 -> 97.024/98.816 us`。
+- TP=4 PIECEWISE：23-token gate（index 22 为 `372`）和 100-token IDs 均
+  byte-for-byte 通过，native dispatch，无 fallback。
+- 同一正常 5-run workload：`25.875913 TPS`、`3.864598 s` median latency
+  -> `30.640709 TPS`、`3.263632 s`；`+18.414%` TPS、`-15.551%` latency；
+  GPU average `[29.7333, 29.5333, 29.5333, 29.6000]%`。
+
+After-profile 对比显示 downstream RMS `59.095 -> 29.413 ms`（`-50.23%`，
+`139.048 -> 69.208 us/call`），exact MHC grouped `84.266 -> 54.550 ms`
+（`-35.26%`）。新 trace 的 MCCL residency 呈 rank-asymmetric：ranks 0-2
+约 `48 ms`，rank 3 为 `3.289 ms`。该 residency 是同步/等待证据，不能
+作为纯通信链路时间相加；下一诊断是 rank arrival/collective wait。Plan 04
+仍未开始。
+
+主要 artifacts：
+
+- `.logs/mhc_downstream_sinkhorn_parallel_main_final_20260714/`
+- `.logs/mhc_downstream_sinkhorn_parallel_main_e2e_20260714/`
+- `.logs/mhc_downstream_sinkhorn_parallel_after_profile_20260714/`
+
 ## 会话任务提示
 
 ```text

@@ -187,6 +187,91 @@ def test_mhc_downstream_rms_uses_round_to_nearest_sigmoid_division():
     assert torch.equal(post_out, expected_post)
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires a CUDA-compatible device"
+)
+def test_mhc_downstream_rms_matches_torch_reference_non_symmetric_sinkhorn():
+    import vllm_metax._metax_sparse_C  # noqa: F401
+
+    from vllm_metax.models.deepseek_v4.ops.mhc import debug_diff
+
+    torch.manual_seed(123)
+    residual = torch.randn(1, 4, 4096, device="cuda", dtype=torch.float32).bfloat16()
+    gemm_out = torch.randn(24, device="cuda", dtype=torch.float32)
+    sqrsum = residual.float().square().sum().reshape(1)
+    scale = torch.tensor([0.25, -0.5, 0.375], device="cuda", dtype=torch.float32)
+    base = torch.linspace(-0.75, 0.75, 24, device="cuda", dtype=torch.float32)
+    base[8:24] = torch.tensor(
+        [
+            1.7,
+            -0.4,
+            0.2,
+            -1.1,
+            -0.3,
+            1.2,
+            -0.8,
+            0.6,
+            0.9,
+            -1.5,
+            0.4,
+            0.1,
+            -0.7,
+            0.8,
+            1.4,
+            -0.2,
+        ],
+        device="cuda",
+    )
+    norm_weight = torch.randn(4096, device="cuda", dtype=torch.float32).bfloat16()
+    post_out = torch.empty(4, device="cuda", dtype=torch.float32)
+    comb_out = torch.empty(16, device="cuda", dtype=torch.float32)
+    pre_norm_out = torch.empty(4096, device="cuda", dtype=torch.bfloat16)
+    norm_out = torch.empty_like(pre_norm_out)
+    params = _trace_kwargs()
+
+    op = torch.ops._metax_sparse_C
+    op.mhc_downstream_rms_out(
+        residual,
+        gemm_out,
+        sqrsum,
+        scale,
+        base,
+        norm_weight,
+        post_out,
+        comb_out,
+        pre_norm_out,
+        norm_out,
+        params["rms_eps"],
+        params["hc_pre_eps"],
+        params["hc_sinkhorn_eps"],
+        params["hc_post_mult_value"],
+        params["sinkhorn_repeat"],
+    )
+    torch.cuda.synchronize()
+
+    trace = debug_diff.mhc_pre_from_raw_trace_torch(
+        residual,
+        gemm_out.view(1, 1, 24),
+        sqrsum.view(1, 1),
+        scale,
+        base,
+        **params,
+    )
+    reference_comb = trace["sinkhorn_col_19"].reshape(-1)
+    reference_pre_norm = trace["layer_input_bf16"].reshape(-1)
+    reference_inverse_rms = torch.rsqrt(
+        reference_pre_norm.float().square().sum() / 4096 + params["rms_eps"]
+    )
+    reference_norm = (
+        (reference_pre_norm.float() * reference_inverse_rms).bfloat16().float()
+        * norm_weight.float()
+    ).bfloat16()
+
+    assert torch.equal(comb_out, reference_comb)
+    assert torch.equal(pre_norm_out, reference_pre_norm)
+    assert torch.equal(norm_out, reference_norm)
+
+
 def test_first_trace_failure_accepts_native_output_subset():
     cli = _load_cli()
     reference = {

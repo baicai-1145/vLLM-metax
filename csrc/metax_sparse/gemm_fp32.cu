@@ -527,6 +527,7 @@ __global__ void mhc_downstream_rms_kernel(
     c10::BFloat16* pre_norm_out, c10::BFloat16* norm_out, float rms_eps,
     float pre_eps, float sinkhorn_eps, float post_mult, int repeat) {
   __shared__ float pre_mix[4];
+  __shared__ float values[16];
   __shared__ float reduction[512];
   __shared__ float inverse_rms;
   int const tid = threadIdx.x;
@@ -549,7 +550,6 @@ __global__ void mhc_downstream_rms_kernel(
       post_out[index] = __fmul_rn(mhc_sigmoid(post_logit), post_mult);
     }
 
-    float values[16];
 #pragma unroll
     for (int row = 0; row < 4; ++row) {
       float logits[4];
@@ -575,35 +575,42 @@ __global__ void mhc_downstream_rms_kernel(
             __fmul_rn(exponentials[col], reciprocal), sinkhorn_eps);
       }
     }
+  }
+  __syncthreads();
+
 #pragma unroll
-    for (int iteration = 0; iteration < 20; ++iteration) {
-      if (iteration > 0) {
-#pragma unroll
-        for (int row = 0; row < 4; ++row) {
-          float const pair0 =
-              __fadd_rn(values[row * 4], values[row * 4 + 1]);
-          float const pair1 =
-              __fadd_rn(values[row * 4 + 2], values[row * 4 + 3]);
-          float const sum = __fadd_rn(pair0, pair1);
-#pragma unroll
-          for (int col = 0; col < 4; ++col) {
-            values[row * 4 + col] = __fdiv_rn(
-                values[row * 4 + col], __fadd_rn(sum, sinkhorn_eps));
-          }
-        }
-      }
-#pragma unroll
-      for (int col = 0; col < 4; ++col) {
-        float const pair0 = __fadd_rn(values[col], values[8 + col]);
-        float const pair1 = __fadd_rn(values[4 + col], values[12 + col]);
+  for (int iteration = 0; iteration < 20; ++iteration) {
+    if (iteration > 0) {
+      if (tid < 4) {
+        int const row = tid;
+        float const pair0 =
+            __fadd_rn(values[row * 4], values[row * 4 + 1]);
+        float const pair1 =
+            __fadd_rn(values[row * 4 + 2], values[row * 4 + 3]);
         float const sum = __fadd_rn(pair0, pair1);
 #pragma unroll
-        for (int row = 0; row < 4; ++row) {
+        for (int col = 0; col < 4; ++col) {
           values[row * 4 + col] = __fdiv_rn(
               values[row * 4 + col], __fadd_rn(sum, sinkhorn_eps));
         }
       }
+      __syncthreads();
     }
+    if (tid < 4) {
+      int const col = tid;
+      float const pair0 = __fadd_rn(values[col], values[8 + col]);
+      float const pair1 = __fadd_rn(values[4 + col], values[12 + col]);
+      float const sum = __fadd_rn(pair0, pair1);
+#pragma unroll
+      for (int row = 0; row < 4; ++row) {
+        values[row * 4 + col] = __fdiv_rn(
+            values[row * 4 + col], __fadd_rn(sum, sinkhorn_eps));
+      }
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
 #pragma unroll
     for (int index = 0; index < 16; ++index) {
       comb_out[index] = values[index];
