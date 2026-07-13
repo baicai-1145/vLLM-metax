@@ -553,8 +553,7 @@ endif()
 # duplicate mcoplib's _moe_C TORCH_LIBRARY registration.
 set(VLLM_METAX_SPARSE_EXT_SRC
   "csrc/metax_sparse/torch_bindings.cpp"
-  "csrc/metax_sparse/gemm_fp32.cu"
-  "csrc/metax_sparse/o_proj_probe.cu")
+  "csrc/metax_sparse/gemm_fp32.cu")
 
 set_gencode_flags_for_srcs(
   SRCS "${VLLM_METAX_SPARSE_EXT_SRC}"

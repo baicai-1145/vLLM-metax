@@ -100,18 +100,11 @@ stage 时间没有改善，eager 反而回退；完整对比见
 并发 stream 或重叠 graph replay 间互相覆写，因此 workspace 复用实现和环境变量
 已全部删除，不能作为 Plan 03 性能或正确性路径。
 
-另实现了隔离的 C500 BF16 route-B probe：
-`csrc/metax_sparse/o_proj_probe.cu` 将 inverse-RoPE load 与 grouped `wo_a`
-累加融合，注册为 `metax_o_proj_probe::fused_bf16_out`，不接入生产 dispatch。
-通过项目正常 CMake/MACA 构建后，真实 corpus 两个 payload 均 bitwise exact；
-7/7 malformed input rejection、caller-owned output、CUDA graph 5/5 replay 和
-稳定 pointer 均通过，完整证据为 `.logs/plan03_oproj_probe_validation_final.json`。
-
-但该 kernel 在 one-token `[1,16,512]` 上相对生产 inverse-RoPE + DeepGEMM
+曾实现隔离的 C500 BF16 route-B probe，将 inverse-RoPE load 与 grouped `wo_a`
+累加融合。它在 one-token `[1,16,512]` 上相对生产 inverse-RoPE + DeepGEMM
 `wo_a` 只有 `0.082944 ms` 对 `0.089088 ms`（median，1.074x；P90 1.173x），
-达不到 2x。两个真实 capture 的 `o`/`z` 为零；非零 synthetic 输入虽在宽松
-allclose 下通过，但不是 bitwise exact。因此该 probe 不能进入生产路径，也不能
-满足 Plan 03 的性能验收。
+且真实非零输入不能 bitwise exact。该 probe、TileLang MMA 版本及其生产扩展编译
+均已删除；历史验证保留在 `.logs/plan03_oproj_probe_validation_final.json`。
 
 本机 GPU0 的实际持续 HBM roofline 已补测：4 GiB BF16 copy 的 median 为
 `1.442 TB/s`，BF16 read/reduction 为 `1.596 TB/s`；`mx-smi` cropped window
@@ -133,13 +126,12 @@ vector 和 wave 拓扑近似，仍不能严格复现 vendor kernel 的 MMA/归�
 TP=4 frozen IDs 继续分歧。因此 scalar 和 TileLang MMA probe 都保持隔离且不进入
 生产 dispatch。
 
-已增加默认关闭的精确路径 `VLLM_METAX_DSV4_O_PROJ_DIRECT_BMM=1`：保留生产
-inverse-RoPE BF16 输出，随后使用 caller-owned `torch.bmm(..., out=z)` 直接调用
-vendor BF16 GEMV，消除 compiled einsum 的 `triton_poi_fused_copy_0`。真实非零
-payload、20/20 deterministic fuzz、CUDA graph 10/10 replay 均 bitwise exact，
-稳定 pointer 且无 fallback；见 `.logs/plan03_direct_bmm_kernel_gate.json`。
-TP=4 PIECEWISE frozen 16-token IDs 完全一致，见
-`.logs/plan03_direct_bmm_tp4_piecewise_16tok.log`。
+随后评估了 direct-BMM 候选：保留生产 inverse-RoPE BF16 输出，使用 caller-owned
+`torch.bmm(..., out=z)` 调用 vendor BF16 GEMV，消除 compiled einsum 的
+`triton_poi_fused_copy_0`。真实非零 payload、20/20 deterministic fuzz、CUDA
+graph 10/10 replay 均 bitwise exact，稳定 pointer 且无 fallback；见
+`.logs/plan03_direct_bmm_kernel_gate.json`。TP=4 PIECEWISE frozen 16-token IDs 完全
+一致，见 `.logs/plan03_direct_bmm_tp4_piecewise_16tok.log`。
 
 复审要求补齐 `T>1` 从 GEMV 进入 GEMM 形态后的交错 output stride 门禁。生产维度
 `n_groups=2`、`heads_per_group=8`、`head_dim=512`、`o_lora_rank=1024` 下，
@@ -149,23 +141,24 @@ bitwise exact；每个 shape 的 eager 10 次与 CUDA graph 10 次 replay 全部
 `aten::bmm` 且无 fallback。结果和 captures 位于
 `.logs/plan03_direct_bmm_prefill_gate_20260713/`。
 
-生产 trace 中 intermediate copy 从 215 次降为 0；O-proj median span 从
-`86.430 us` 降至 `84.081 us`，但 all-reduce P90 波动使全段 P90 从
-`137.829 us` 升至 `149.042 us`。isolated prefix median 为 `0.049920 ms`，
-相对 baseline `0.086784 ms` 为 1.738x。证据位于
-`.logs/plan03_direct_bmm_profile.summary.txt`。该路径解决了数值 correctness 和
-中间 copy，但尚未单独证明 Plan 03 的全部端到端性能验收完成。
+生产 trace 中 intermediate copy 从 215 次降为 0，但每次 O-proj 的主序列仅从
+inverse-RoPE、`wo_a`、copy、`wo_b` 四个 stage 降为三个，未达到总 launch 数量
+减半。O-proj median span 从 `86.430 us` 降至 `84.081 us`（-2.72%），P90 则从
+`137.829 us` 升至 `149.042 us`。isolated prefix 为 1.738x，低于 2x；见
+`.logs/plan03_direct_bmm_profile.summary.txt`。
 
-同一正常非 profiler TP=4 workload（100-token、3 warmup、5 measured runs）下，
-direct-BMM median 为 `16.111944 tok/s`、`62.065757 ms/token`，相对冻结基线
-`15.233432 tok/s` 提升 `5.7670%`；30 个持续 decode telemetry samples 的四卡
-平均利用率为 `15.767%/15.833%/15.767%/15.867%`。原始日志、manifest 和
-summary 位于 `.logs/plan03_direct_bmm_normal_benchmark_20260713/`。runner 未输出
-decode 的逐次样本或 P90，因此不宣称正常 P90；TP=4 100-token 结果只用于性能，
-数值结论仍由 frozen token gate 和上述 kernel gates 给出。
+早期跨时段正常基准曾显示 `16.111944 tok/s` 对旧基线 `15.233432 tok/s`，但 runner
+没有输出逐次样本，不能用于最终推广。补齐 `DECODE_RUN_SECONDS` 和 P90 后，以两个
+独立进程重跑完全相同的 TP=4、100-token、3 warmup、5 measured workload：
 
-**状态：Plan 03 数值正确性已通过，性能验收仍在进行。** direct-BMM 继续默认
-关闭；在 kernel/copy 数量减半指标得到明确解释并完成性能决策前，不进入 Plan 04。
+- baseline：median `16.137783 tok/s`，P90 `15.848810 tok/s`，CV `0.8545%`；
+- direct-BMM：median `15.991597 tok/s`，P90 `15.906726 tok/s`，CV `0.8593%`；
+- candidate 相对 baseline median TPS 为 `-0.906%`，两者最终 100 token IDs 相同。
+
+完整 manifest、逐次 latency、telemetry 和原始输出位于
+`.logs/plan03_final_normal_baseline_20260713/` 与
+`.logs/plan03_final_normal_direct_bmm_20260713/`。因此不存在可验收的正常端到端
+提速，direct-BMM 环境变量、生产 dispatch 和对应测试已删除。
 
 本地 C500 API 审计没有发现可直接用于该阶段的 native fused O-proj API：
 `/opt/maca/include/mcflashinfer/gemm/group_gemm.cuh` 和 `mctlassEx` 只提供
@@ -173,8 +166,31 @@ generic grouped/universal GEMM，已有 `csrc/metax_sparse/torch_bindings.cpp`
 中的 fused RoPE 只覆盖 QK norm/KV-cache insertion。FP8 BMM API 也没有 inverse
 RoPE 融合和模型 scale recipe。当前 venv 可直接导入 `deep_gemm.einsum`，但它只
 覆盖 grouped GEMM，不覆盖 inverse-RoPE；`vllm_metax/utils/deep_gemm.py` 的
-实际 worker dispatch 仍需在生产 profile 中单独记录。没有这些 native/dispatch 证据，不能
-把 generic GEMM 或软件 FP8 cast 当作 Plan 03 的完成路径。
+实际 worker dispatch 已由生产 trace 记录。没有 fused prologue/API 时，generic
+GEMM 或软件 FP8 cast 不能替代精确路径；自定义 scalar/MMA 又无法复现 vendor GEMV
+归约顺序。
+
+## 最终验收结论（2026-07-13）
+
+| 门禁 | 结果 | 结论 |
+| ---- | ---- | ---- |
+| 真实 corpus、graph、pointer、TP=4 IDs | direct-BMM 全部通过 | correctness 通过 |
+| O-proj kernel/copy 总数至少减半 | 四个 stage 降为三个 | 未达到 |
+| isolated 2x 或硬上限证据 | 1.738x；`wo_b` 有带宽约束但不是完整 O-proj 硬下限 | 未达到 |
+| 正常 TP=4 端到端 | median TPS `-0.906%` | 未达到 |
+| fallback-free 生产推广 | 候选已撤出 | 保持原生产路径 |
+
+撤出候选后的默认生产路径已重新运行 TP=4 PIECEWISE 16-token frozen gate，退出码为
+0，输出 IDs 与冻结序列完全一致，且没有设置任何 Plan 03 opt-in 环境变量。manifest、
+stdout、summary 和 tracked diff hash 位于
+`.logs/plan03_final_default_tp4_16tok_20260713/`。该 16-token 结果仅用于 correctness，
+不报告为性能数据。
+
+**状态：Plan 03 已完成，结论为 no-go。** 所有可用本机原生 API、BF16 scalar、
+TileLang MMA、workspace 和 direct-BMM 路线均已完成验证；没有候选同时满足精确性和
+性能门禁。生产保持原 inverse-RoPE + grouped einsum + `wo_b` 路径，不宣称任何
+Plan 03 端到端提速。后续若出现带 inverse-RoPE prologue 的 C500 vendor GEMM API，
+应建立新计划重新开放该优化，而不是复用已拒绝的 probe。
 
 ## 会话任务提示
 

@@ -166,6 +166,9 @@ def main() -> None:
         print("PREFILL_MEDIAN_SECONDS", f"{elapsed:.6f}")
         print("PREFILL_P90_SECONDS", f"{elapsed_p90:.6f}")
         print("PREFILL_TOKENS_PER_SECOND", f"{input_tokens / elapsed:.6f}")
+    else:
+        print("DECODE_RUN_SECONDS", [round(value, 6) for value in elapsed_runs])
+        print("DECODE_P90_SECONDS", f"{elapsed_p90:.6f}")
 
     expected_token_ids = os.environ.get("EXPECTED_TOKEN_IDS")
     if expected_token_ids:

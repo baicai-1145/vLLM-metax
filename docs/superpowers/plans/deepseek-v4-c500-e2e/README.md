@@ -11,7 +11,7 @@
 |    0 | `00-shared-contract.md`        | 冻结 A100/C500 同口径基线和全局门禁            | 无                |
 |    1 | `01-sparse-mla.md`             | 替换 decode/prefill Torch sparse attention     | 00                |
 |    2 | `02-mhc-rmsnorm.md`            | 在已完成 exact post 基础上融合 raw/pre+RMSNorm | 00                |
-|    3 | `03-o-proj.md`                 | 优化 inverse-RoPE 与 O-projection              | 00，建议 01 后    |
+|    3 | `03-o-proj.md`                 | 完成：精确融合 no-go，保持基线                 | 00，建议 01 后    |
 |    4 | `04-w4a16-moe.md`              | 优化 batch-one W4A16 MoE                       | 00                |
 |    5 | `05-tp-communication.md`       | 优化 87 次/token 小消息 TP collective          | 00，建议 01-04 后 |
 |    6 | `06-cudagraph-launch.md`       | 减少 graph break、launch gap 和分配            | 01-05             |
@@ -27,8 +27,8 @@ decode-first，但 prefill 的 OOM blocker 要立即建立复现和修复门禁�
 - 模型：`/root/models/DeepSeek-V4-Flash-W4A16-BF16Attn-MTP`
 - **历史** TP=4 PIECEWISE、MTP=0、16-token 快速 gate：`11.624672 token/s`，约
   `86.0 ms/token`（仅作会话起始参考）
-- 最新 MTP=0、TP=4 PIECEWISE、100-token decode：`15.2334 tok/s`、`65.65 ms/token`；
-  四卡利用率 `16.16%--16.42%`
+- 最新 MTP=0、TP=4 PIECEWISE、100-token decode：`16.1378 tok/s`、`61.97 ms/token`；
+  四卡利用率 `15.90%--16.16%`
 - 最新 1K prefill：`1321.61 input tok/s`、`0.774812 s`
 - 最新 10K prefill：default `chunk=8192` 在
   `torch_flash_mla_sparse_prefill` 的 `torch.index_select` 尝试约 `10 GiB` 分配并

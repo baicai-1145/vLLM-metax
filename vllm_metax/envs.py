@@ -25,7 +25,6 @@ if TYPE_CHECKING:
     VLLM_FUSED_MOE_CHUNK_SIZE: int = 16 * 1024
     VLLM_METAX_USE_FP8_SPARSE_ATTN_INDEXER: bool = False
     VLLM_METAX_USE_SGL_FUSED_MOE_GROUPED_TOPK: bool = False
-    VLLM_METAX_DSV4_O_PROJ_DIRECT_BMM: bool = False
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Installation Time Env Vars ==================
@@ -114,9 +113,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # if set, enable sglang fused grouped topk ops on deepseek and kimi model
     "VLLM_METAX_USE_SGL_FUSED_MOE_GROUPED_TOPK": lambda: bool(
         int(os.getenv("VLLM_METAX_USE_SGL_FUSED_MOE_GROUPED_TOPK", "0"))
-    ),
-    "VLLM_METAX_DSV4_O_PROJ_DIRECT_BMM": lambda: bool(
-        int(os.getenv("VLLM_METAX_DSV4_O_PROJ_DIRECT_BMM", "0"))
     ),
     # =================== Debug Env Vars ==================
     # if set, use vllm's fused_moe implementation instead of maca's one for debugging and comparison

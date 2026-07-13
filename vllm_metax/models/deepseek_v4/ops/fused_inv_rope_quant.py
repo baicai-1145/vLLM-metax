@@ -91,7 +91,6 @@ def inv_rope(
     nope_dim: int = 448,
     rope_dim: int = 64,
     quant_group_size: int = 128,
-    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fused inverse RoPE without quantization.
 
@@ -114,10 +113,6 @@ def inv_rope(
         quant_group_size:
             Kept only for compatibility with original layout assumptions.
             It no longer means quantization group size here.
-        out:
-            Optional caller-owned raw output storage with shape
-            ``[n_groups, num_tokens, heads_per_group * head_dim]``.  It must
-            be contiguous; the returned tensor is its transposed view.
 
     Returns:
         out:
@@ -137,23 +132,11 @@ def inv_rope(
     d = heads_per_group * head_dim
     chunks_per_head = head_dim // quant_group_size
 
-    expected_shape = (n_groups, num_tokens, d)
-    if out is None:
-        out_buf = torch.empty(expected_shape, dtype=o.dtype, device=o.device)
-    else:
-        # The Triton stores use this raw [group, token, d] contiguous layout;
-        # accepting any other view would silently change pointer arithmetic.
-        if (
-            out.device != o.device
-            or out.dtype != o.dtype
-            or tuple(out.shape) != expected_shape
-            or tuple(out.stride()) != (num_tokens * d, d, 1)
-        ):
-            raise ValueError(
-                "caller-owned inv_rope output must be contiguous with "
-                f"shape {expected_shape} and dtype/device {o.dtype}/{o.device}"
-            )
-        out_buf = out
+    out_buf = torch.empty(
+        (n_groups, num_tokens, d),
+        dtype=o.dtype,
+        device=o.device,
+    )
 
     grid = (num_tokens, n_groups * heads_per_group)
 

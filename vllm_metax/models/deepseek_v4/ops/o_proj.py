@@ -10,10 +10,6 @@ from vllm_metax.utils.deep_gemm import bf16_einsum
 from . import inv_rope
 
 
-def _direct_bmm_enabled() -> bool:
-    return os.getenv("VLLM_METAX_DSV4_O_PROJ_DIRECT_BMM", "0") == "1"
-
-
 def deep_gemm_bf16_o_proj(
     o: torch.Tensor,
     positions: torch.Tensor,
@@ -31,32 +27,27 @@ def deep_gemm_bf16_o_proj(
     O projection: inverse RoPE + einsum + wo_b.
 
     """
-    rope_kwargs = {
-        "n_groups": n_groups,
-        "heads_per_group": heads_per_group,
-        "nope_dim": nope_dim,
-        "rope_dim": rope_dim,
-    }
+    o_bf16 = inv_rope(
+        o,
+        positions,
+        cos_sin_cache,
+        n_groups=n_groups,
+        heads_per_group=heads_per_group,
+        nope_dim=nope_dim,
+        rope_dim=rope_dim,
+    )
     wo_a_bf16 = wo_a.weight.view(n_groups, o_lora_rank, -1)
     z = torch.empty(
         (o.shape[0], n_groups, o_lora_rank),
         device=o.device,
         dtype=torch.bfloat16,
     )
-    o_bf16 = inv_rope(o, positions, cos_sin_cache, **rope_kwargs)
-    if _direct_bmm_enabled():
-        torch.bmm(
-            o_bf16.transpose(0, 1),
-            wo_a_bf16.transpose(1, 2),
-            out=z.transpose(0, 1),
-        )
-    else:
-        bf16_einsum(
-            "bhr,hdr->bhd",
-            o_bf16,
-            wo_a_bf16,
-            z,
-        )
+    bf16_einsum(
+        "bhr,hdr->bhd",
+        o_bf16,
+        wo_a_bf16,
+        z,
+    )
     output = wo_b(z.flatten(1))
 
     # The hook is inert unless explicitly enabled and runs only after the
