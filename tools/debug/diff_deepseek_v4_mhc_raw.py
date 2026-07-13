@@ -41,6 +41,14 @@ _REQUIRED_PARAMS = {
     "sinkhorn_repeat",
     "n_splits",
 }
+_RAW_NORM_REQUIRED_KEYS = _REQUIRED_KEYS | {
+    "layer_idx",
+    "stage",
+    "fn",
+    "pre_norm_output",
+    "norm_weight",
+    "normalized_output",
+}
 _FUSED_REQUIRED_KEYS = {
     "schema_version",
     "rank",
@@ -73,8 +81,10 @@ def _require(condition: bool, path: Path, message: str) -> None:
 
 
 def _validate_payload(payload: dict[str, Any], path: Path) -> None:
-    _require(set(payload) == _REQUIRED_KEYS, path, f"keys={sorted(payload)}")
-    _require(payload["schema_version"] == 1, path, "schema_version must be 1")
+    schema_version = payload.get("schema_version")
+    required_keys = _REQUIRED_KEYS if schema_version == 1 else _RAW_NORM_REQUIRED_KEYS
+    _require(set(payload) == required_keys, path, f"keys={sorted(payload)}")
+    _require(schema_version in (1, 2), path, "schema_version must be 1 or 2")
     file_rank, file_call = _file_key(path)
     _require(payload["rank"] == file_rank, path, "rank does not match filename")
     _require(payload["call"] == file_call, path, "call does not match filename")
@@ -117,6 +127,26 @@ def _validate_payload(payload: dict[str, Any], path: Path) -> None:
     _require(isinstance(hc_base, torch.Tensor), path, "hc_base is not tensor")
     _require(hc_base.dtype == torch.float32, path, "hc_base dtype")
     _require(tuple(hc_base.shape) == (24,), path, "hc_base shape")
+    if schema_version == 2:
+        _require(payload["stage"] in ("attn", "ffn"), path, "invalid stage")
+        _require(isinstance(payload["layer_idx"], int), path, "layer_idx")
+        _require(tuple(payload["fn"].shape) == (24, 16384), path, "fn shape")
+        _require(payload["fn"].dtype == torch.float32, path, "fn dtype")
+        _require(
+            tuple(payload["pre_norm_output"].shape) == (1, hidden_size),
+            path,
+            "pre_norm_output shape",
+        )
+        _require(
+            tuple(payload["norm_weight"].shape) == (hidden_size,),
+            path,
+            "norm_weight shape",
+        )
+        _require(
+            tuple(payload["normalized_output"].shape) == (1, hidden_size),
+            path,
+            "normalized_output shape",
+        )
 
 
 def load_payload(path: str | Path, device: str = "cpu") -> dict[str, Any]:
@@ -130,9 +160,47 @@ def load_payload(path: str | Path, device: str = "cpu") -> dict[str, Any]:
         "gemm_out_sqrsum",
         "hc_scale",
         "hc_base",
+        "fn",
+        "pre_norm_output",
+        "norm_weight",
+        "normalized_output",
     ):
-        out[key] = out[key].to(device)
+        if key in out:
+            out[key] = out[key].to(device)
     return out
+
+
+def _rms_norm_from_payload(payload: dict[str, Any]) -> torch.Tensor:
+    value = payload["pre_norm_output"].float()
+    weight = payload["norm_weight"].float()
+    eps = payload["params"]["rms_eps"]
+    return (
+        value * torch.rsqrt(value.square().mean(-1, keepdim=True) + eps) * weight
+    ).to(payload["normalized_output"].dtype)
+
+
+def _native_rms_norm_from_payload(payload: dict[str, Any]) -> torch.Tensor:
+    if payload["pre_norm_output"].device.type != "cuda":
+        raise ValueError("native RMSNorm replay requires --device cuda")
+    out = torch.empty_like(payload["normalized_output"])
+    torch.ops._C.rms_norm(
+        out,
+        payload["pre_norm_output"],
+        payload["norm_weight"],
+        payload["params"]["rms_eps"],
+    )
+    return out
+
+
+def _ir_rms_norm_from_payload(payload: dict[str, Any]) -> torch.Tensor:
+    from vllm import ir
+
+    return ir.ops.rms_norm(
+        payload["pre_norm_output"],
+        payload["norm_weight"],
+        payload["params"]["rms_eps"],
+        None,
+    )
 
 
 def load_fused_post_payload(path: str | Path, device: str = "cpu") -> dict[str, Any]:
@@ -301,6 +369,221 @@ def run_exact_mhc_pre_from_raw_tilelang(
     )
 
 
+def run_mhc_pre_big_fuse_native(
+    payload: dict[str, Any],
+    *,
+    debug_comb_stage: int = -1,
+) -> dict[str, torch.Tensor]:
+    from vllm_metax.models.deepseek_v4.ops.mhc.tilelang_kernels import (
+        _mhc_pre_big_fuse,
+    )
+
+    residual_cur = payload["residual_cur"]
+    params = payload["params"]
+    num_tokens, mhc_mult, hidden_size = residual_cur.shape
+    post_mix = torch.empty(
+        (num_tokens, mhc_mult), dtype=torch.float32, device=residual_cur.device
+    )
+    comb_mix = torch.empty(
+        (num_tokens, mhc_mult * mhc_mult),
+        dtype=torch.float32,
+        device=residual_cur.device,
+    )
+    layer_input = torch.empty(
+        (num_tokens, hidden_size),
+        dtype=torch.bfloat16,
+        device=residual_cur.device,
+    )
+    _mhc_pre_big_fuse(
+        hidden_size,
+        params["rms_eps"],
+        params["hc_pre_eps"],
+        params["hc_sinkhorn_eps"],
+        params["hc_post_mult_value"],
+        params["sinkhorn_repeat"],
+        n_splits=params["n_splits"],
+        mhc_mult=mhc_mult,
+        debug_comb_stage=debug_comb_stage,
+    )(
+        payload["gemm_out_mul"],
+        payload["gemm_out_sqrsum"],
+        payload["hc_scale"],
+        payload["hc_base"],
+        residual_cur,
+        post_mix,
+        comb_mix,
+        layer_input,
+    )
+    return {
+        "post_mix": post_mix.view(num_tokens, mhc_mult, 1),
+        "sinkhorn_col_19": comb_mix.view(num_tokens, mhc_mult, mhc_mult),
+        "layer_input_bf16": layer_input,
+    }
+
+
+def run_mhc_big_fuse_comb_stage_native(
+    payload: dict[str, Any], stage: int
+) -> dict[str, torch.Tensor]:
+    trace = run_mhc_pre_big_fuse_native(payload, debug_comb_stage=stage)
+    name = ("comb_logits", "sinkhorn_softmax_eps", "sinkhorn_col_0")[stage]
+    value = trace["sinkhorn_col_19"]
+    if stage < 2:
+        value = value.unsqueeze(0)
+    return {name: value}
+
+
+def run_mhc_pre_split_exact_native(
+    payload: dict[str, Any],
+) -> dict[str, torch.Tensor]:
+    from vllm_metax.kernels.sparse_mla_decode import _softmax_fp32_out_op
+
+    trace = run_mhc_pre_big_fuse_native(payload, debug_comb_stage=0)
+    comb_mix = trace["sinkhorn_col_19"]
+    _softmax_fp32_out_op()(comb_mix.view(-1, 4), comb_mix.view(-1, 4))
+    sinkhorn_op = getattr(
+        getattr(torch.ops, "_metax_sparse_C", None),
+        "mhc_sinkhorn_fp32_out",
+        None,
+    )
+    if sinkhorn_op is None:
+        raise RuntimeError("native MHC replay requires mhc_sinkhorn_fp32_out")
+    sinkhorn_op(
+        comb_mix,
+        comb_mix,
+        payload["params"]["hc_sinkhorn_eps"],
+        payload["params"]["sinkhorn_repeat"],
+    )
+    return trace
+
+
+def run_mhc_pre_rms_split_exact_native(
+    payload: dict[str, Any],
+) -> dict[str, torch.Tensor]:
+    from vllm_metax.kernels.sparse_mla_decode import _softmax_fp32_out_op
+
+    trace = run_mhc_pre_big_fuse_native(payload, debug_comb_stage=0)
+    comb_mix = trace["sinkhorn_col_19"]
+    _softmax_fp32_out_op()(comb_mix.view(-1, 4), comb_mix.view(-1, 4))
+    normalized = torch.empty_like(payload["normalized_output"])
+    sinkhorn_rms_op = getattr(
+        getattr(torch.ops, "_metax_sparse_C", None),
+        "mhc_sinkhorn_rms_norm_out",
+        None,
+    )
+    if sinkhorn_rms_op is None:
+        raise RuntimeError("native MHC replay requires mhc_sinkhorn_rms_norm_out")
+    sinkhorn_rms_op(
+        comb_mix,
+        trace["layer_input_bf16"],
+        payload["norm_weight"],
+        comb_mix,
+        normalized,
+        payload["params"]["hc_sinkhorn_eps"],
+        payload["params"]["rms_eps"],
+        payload["params"]["sinkhorn_repeat"],
+    )
+    trace["normalized_output"] = normalized
+    return trace
+
+
+def run_mhc_three_kernel_exact_native(
+    payload: dict[str, Any],
+    buffers: dict[str, torch.Tensor] | None = None,
+) -> dict[str, torch.Tensor]:
+    import vllm_metax._metax_sparse_C  # noqa: F401
+
+    params = payload["params"]
+    residual = payload["residual_cur"]
+    if buffers is None:
+        buffers = {
+            "residual_fp32": torch.empty(
+                (1, residual.numel()), dtype=torch.float32, device=residual.device
+            ),
+            "sqrsum": torch.empty_like(payload["gemm_out_sqrsum"]),
+            "gemm_out": torch.empty_like(payload["gemm_out_mul"]),
+            "post_mix": torch.empty(
+                (1, 4), dtype=torch.float32, device=residual.device
+            ),
+            "comb_mix": torch.empty(
+                (1, 4, 4), dtype=torch.float32, device=residual.device
+            ),
+            "pre_norm": torch.empty_like(payload["pre_norm_output"]),
+            "normalized": torch.empty_like(payload["normalized_output"]),
+        }
+    residual_fp32 = buffers["residual_fp32"]
+    sqrsum = buffers["sqrsum"]
+    gemm_out = buffers["gemm_out"]
+    post_mix = buffers["post_mix"]
+    comb_mix = buffers["comb_mix"]
+    pre_norm = buffers["pre_norm"]
+    normalized = buffers["normalized"]
+    ops = torch.ops._metax_sparse_C
+    ops.mhc_cast_sqrsum_out(residual, residual_fp32, sqrsum)
+    ops.mhc_gemv_fp32_out(residual_fp32, payload["fn"], gemm_out)
+    ops.mhc_downstream_rms_out(
+        residual,
+        gemm_out,
+        sqrsum,
+        payload["hc_scale"],
+        payload["hc_base"],
+        payload["norm_weight"],
+        post_mix,
+        comb_mix,
+        pre_norm,
+        normalized,
+        params["rms_eps"],
+        params["hc_pre_eps"],
+        params["hc_sinkhorn_eps"],
+        params["hc_post_mult_value"],
+        params["sinkhorn_repeat"],
+    )
+    return {
+        "post_mix": post_mix.unsqueeze(-1),
+        "sinkhorn_col_19": comb_mix,
+        "layer_input_bf16": pre_norm,
+        "normalized_output": normalized,
+    }
+
+
+def run_mhc_sinkhorn_trace_native(
+    payload: dict[str, Any],
+) -> dict[str, torch.Tensor]:
+    """Replay Sinkhorn stages with the TileLang debug kernel only."""
+    from vllm_metax.models.deepseek_v4.ops.mhc.tilelang_kernels import (
+        _mhc_pre_sinkhorn_debug_trace,
+    )
+
+
+def run_mhc_softmax_trace_native(payload: dict[str, Any]) -> dict[str, torch.Tensor]:
+    from vllm_metax.models.deepseek_v4.ops.mhc.tilelang_kernels import (
+        _mhc_pre_softmax_debug_trace,
+    )
+
+    params = payload["params"]
+    return _mhc_pre_softmax_debug_trace(
+        payload["residual_cur"], payload["gemm_out_mul"],
+        payload["gemm_out_sqrsum"], payload["hc_scale"], payload["hc_base"],
+        params["rms_eps"], params["hc_pre_eps"], params["hc_sinkhorn_eps"],
+        params["hc_post_mult_value"], params["sinkhorn_repeat"],
+        params["n_splits"],
+    )
+
+    params = payload["params"]
+    return _mhc_pre_sinkhorn_debug_trace(
+        payload["residual_cur"],
+        payload["gemm_out_mul"],
+        payload["gemm_out_sqrsum"],
+        payload["hc_scale"],
+        payload["hc_base"],
+        params["rms_eps"],
+        params["hc_pre_eps"],
+        params["hc_sinkhorn_eps"],
+        params["hc_post_mult_value"],
+        params["sinkhorn_repeat"],
+        params["n_splits"],
+    )
+
+
 def _clone_payload(payload: dict[str, Any]) -> dict[str, Any]:
     cloned = dict(payload)
     for key, value in payload.items():
@@ -318,6 +601,24 @@ def _candidate_trace(
         return _torch_trace_from_payload(_clone_payload(payload))
     if candidate == "tilelang":
         return run_exact_mhc_pre_from_raw_tilelang(payload)
+    if candidate == "native-big-fuse":
+        return run_mhc_pre_big_fuse_native(payload)
+    if candidate == "native-big-fuse-logits":
+        return run_mhc_big_fuse_comb_stage_native(payload, 0)
+    if candidate == "native-big-fuse-softmax":
+        return run_mhc_big_fuse_comb_stage_native(payload, 1)
+    if candidate == "native-big-fuse-col0":
+        return run_mhc_big_fuse_comb_stage_native(payload, 2)
+    if candidate == "native-split-exact":
+        return run_mhc_pre_split_exact_native(payload)
+    if candidate == "native-split-rms-exact":
+        return run_mhc_pre_rms_split_exact_native(payload)
+    if candidate == "native-three-kernel-exact":
+        return run_mhc_three_kernel_exact_native(payload)
+    if candidate == "native-sinkhorn-trace":
+        return run_mhc_sinkhorn_trace_native(payload)
+    if candidate == "native-softmax-trace":
+        return run_mhc_softmax_trace_native(payload)
     raise ValueError(f"unknown candidate: {candidate}")
 
 
@@ -325,12 +626,11 @@ def _first_trace_failure(
     reference: dict[str, torch.Tensor],
     candidate: dict[str, torch.Tensor],
 ) -> tuple[str | None, dict[str, Any] | None]:
-    if set(reference) != set(candidate):
+    if not set(candidate).issubset(reference):
         return "trace_keys", {
-            "missing": sorted(set(reference) - set(candidate)),
             "extra": sorted(set(candidate) - set(reference)),
         }
-    for name in reference:
+    for name in candidate:
         diff = tensor_diff(reference[name], candidate[name])
         if not diff["equal"]:
             return name, diff
@@ -346,6 +646,7 @@ def run_diff(
     check_graph_replay: bool = False,
     benchmark: bool = False,
     max_files: int | None = None,
+    rms_candidate: str = "captured",
 ) -> dict[str, Any]:
     if candidate == "post-mma":
         return run_post_diff(
@@ -365,6 +666,8 @@ def run_diff(
         "first_failure": None,
         "stage_failures": {},
         "bitwise": bool(require_bitwise),
+        "raw_norm_files": 0,
+        "raw_norm_passed": 0,
     }
     stage_failures: defaultdict[str, int] = defaultdict(int)
     elapsed_s = 0.0
@@ -372,8 +675,47 @@ def run_diff(
     for path in files:
         payload = load_payload(path, device=device)
         reference = _torch_trace_from_payload(_clone_payload(payload))
+        if payload["schema_version"] == 2:
+            summary["raw_norm_files"] += 1
+            pre_norm_diff = tensor_diff(
+                reference["layer_input_bf16"], payload["pre_norm_output"]
+            )
+            if rms_candidate == "captured":
+                normalized_diff = {"equal": True, "num_diff": 0}
+            elif rms_candidate == "torch":
+                normalized_diff = tensor_diff(
+                    _rms_norm_from_payload(payload), payload["normalized_output"]
+                )
+            elif rms_candidate == "native":
+                normalized_diff = tensor_diff(
+                    _native_rms_norm_from_payload(payload),
+                    payload["normalized_output"],
+                )
+            elif rms_candidate == "ir":
+                normalized_diff = tensor_diff(
+                    _ir_rms_norm_from_payload(payload),
+                    payload["normalized_output"],
+                )
+            else:
+                raise ValueError(f"unknown RMSNorm candidate: {rms_candidate}")
+            if not pre_norm_diff["equal"] or not normalized_diff["equal"]:
+                summary["failed"] += 1
+                stage_failures["raw_norm_replay"] += 1
+                if summary["first_failure"] is None:
+                    summary["first_failure"] = {
+                        "file": str(path),
+                        "stage": "raw_norm_replay",
+                        "diff": {
+                            "pre_norm": pre_norm_diff,
+                            "normalized": normalized_diff,
+                        },
+                    }
+                continue
+            summary["raw_norm_passed"] += 1
         start = time.perf_counter()
         candidate_trace = _candidate_trace(_clone_payload(payload), candidate)
+        if "normalized_output" in candidate_trace:
+            reference["normalized_output"] = payload["normalized_output"]
         elapsed_s += time.perf_counter() - start
         if require_bitwise:
             try:
@@ -428,6 +770,8 @@ def check_direct_graph_replay(
     candidate: str,
     device: str,
 ) -> dict[str, Any]:
+    if candidate == "native-three-kernel-exact":
+        return check_three_kernel_graph_replay(files, device=device)
     if candidate != "tilelang":
         return {"skipped": True, "reason": "graph replay is only defined for tilelang"}
     if len(files) < 2:
@@ -485,17 +829,96 @@ def check_direct_graph_replay(
     return {"passed": True, "files": [str(files[0]), str(files[1])]}
 
 
+def check_three_kernel_graph_replay(
+    files: list[Path], *, device: str
+) -> dict[str, Any]:
+    if device != "cuda":
+        return {"skipped": True, "reason": "cuda graph replay requires cuda device"}
+    if len(files) < 2:
+        raise ValueError("graph replay requires at least two corpus files")
+    first = load_payload(files[0], device=device)
+    second = load_payload(files[1], device=device)
+    input_keys = ("residual_cur", "fn", "hc_scale", "hc_base", "norm_weight")
+    inputs = {key: first[key].detach().clone() for key in input_keys}
+    payload = {**first, **inputs, "params": dict(first["params"])}
+    residual = inputs["residual_cur"]
+    buffers = {
+        "residual_fp32": torch.empty(
+            (1, residual.numel()), dtype=torch.float32, device=residual.device
+        ),
+        "sqrsum": torch.empty_like(first["gemm_out_sqrsum"]),
+        "gemm_out": torch.empty_like(first["gemm_out_mul"]),
+        "post_mix": torch.empty((1, 4), dtype=torch.float32, device=device),
+        "comb_mix": torch.empty((1, 4, 4), dtype=torch.float32, device=device),
+        "pre_norm": torch.empty_like(first["pre_norm_output"]),
+        "normalized": torch.empty_like(first["normalized_output"]),
+    }
+    for _ in range(3):
+        run_mhc_three_kernel_exact_native(payload, buffers)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = run_mhc_three_kernel_exact_native(payload, buffers)
+    torch.cuda.synchronize()
+    input_ptrs = {key: value.data_ptr() for key, value in inputs.items()}
+    buffer_ptrs = {key: value.data_ptr() for key, value in buffers.items()}
+    for source in (first, second):
+        for key in input_keys:
+            inputs[key].copy_(source[key])
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = _torch_trace_from_payload(_clone_payload(source))
+        checks = (
+            (outputs["post_mix"], expected["post_mix"]),
+            (outputs["sinkhorn_col_19"], expected["sinkhorn_col_19"]),
+            (outputs["layer_input_bf16"], source["pre_norm_output"]),
+            (outputs["normalized_output"], source["normalized_output"]),
+        )
+        for actual, reference in checks:
+            diff = tensor_diff(actual, reference)
+            if not diff["equal"]:
+                raise AssertionError(f"three-kernel graph replay mismatch: {diff}")
+        if any(inputs[key].data_ptr() != input_ptrs[key] for key in input_keys):
+            raise AssertionError("three-kernel graph input pointer changed")
+        if any(buffers[key].data_ptr() != buffer_ptrs[key] for key in buffers):
+            raise AssertionError("three-kernel graph buffer pointer changed")
+    return {
+        "passed": True,
+        "files": [str(files[0]), str(files[1])],
+        "pointers_stable": True,
+    }
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("corpus", type=Path)
     parser.add_argument(
-        "--candidate", choices=("torch", "tilelang", "post-mma"), required=True
+        "--candidate",
+        choices=(
+            "torch",
+            "tilelang",
+            "native-big-fuse",
+            "native-big-fuse-logits",
+            "native-big-fuse-softmax",
+            "native-big-fuse-col0",
+            "native-split-exact",
+            "native-split-rms-exact",
+            "native-three-kernel-exact",
+            "native-sinkhorn-trace",
+            "native-softmax-trace",
+            "post-mma",
+        ),
+        required=True,
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--require-bitwise", action="store_true")
     parser.add_argument("--check-graph-replay", action="store_true")
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--max-files", type=int)
+    parser.add_argument(
+        "--rms-candidate", choices=("captured", "torch", "native", "ir"),
+        default="captured",
+    )
     parser.add_argument("--json-out", type=Path)
     return parser.parse_args(argv)
 
@@ -510,6 +933,7 @@ def main(argv: list[str] | None = None) -> int:
         check_graph_replay=args.check_graph_replay,
         benchmark=args.benchmark,
         max_files=args.max_files,
+        rms_candidate=args.rms_candidate,
     )
     text = json.dumps(summary, indent=2, sort_keys=True)
     print(text)

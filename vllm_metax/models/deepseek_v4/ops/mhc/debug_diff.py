@@ -287,6 +287,8 @@ def maybe_capture_mhc_raw_norm(
     directory = os.getenv("VLLM_METAX_DSV4_MHC_RAW_NORM_CAPTURE_DIR")
     if not directory:
         return
+    if tuple(residual_cur.shape) != (1, 4, 4096):
+        return
     rank = _rank()
     ranks = os.getenv("VLLM_METAX_DSV4_MHC_RAW_CAPTURE_RANKS", "all")
     if ranks != "all" and rank not in {
@@ -303,18 +305,6 @@ def maybe_capture_mhc_raw_norm(
         1, residual_2d.shape[0], -1
     )
     gemm_out_sqrsum = residual_2d.square().sum(-1).view(1, -1)
-    trace = mhc_pre_from_raw_trace_torch(
-        residual_cur,
-        gemm_out_mul,
-        gemm_out_sqrsum,
-        hc_scale,
-        hc_base,
-        rms_eps,
-        hc_pre_eps,
-        hc_sinkhorn_eps,
-        hc_post_mult_value,
-        sinkhorn_repeat,
-    )
     payload = {
         "schema_version": 2,
         "rank": int(rank) if rank.isdigit() else rank,
@@ -330,7 +320,6 @@ def maybe_capture_mhc_raw_norm(
         "pre_norm_output": _clone_arg(pre_norm_output).cpu(),
         "norm_weight": _clone_arg(norm_weight).cpu(),
         "normalized_output": _clone_arg(normalized_output).cpu(),
-        "trace": {name: _clone_arg(value).cpu() for name, value in trace.items()},
         "params": {
             "rms_eps": rms_eps,
             "hc_pre_eps": hc_pre_eps,

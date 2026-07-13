@@ -115,6 +115,21 @@ def test_tensor_diff_reports_fp32_and_bf16_raw_mismatch():
     assert bf16_diff["lhs_bits"] != bf16_diff["rhs_bits"]
 
 
+def test_first_trace_failure_accepts_native_output_subset():
+    cli = _load_cli()
+    reference = {
+        "intermediate": torch.tensor([1.0]),
+        "post_mix": torch.tensor([2.0]),
+    }
+
+    stage, diff = cli["_first_trace_failure"](
+        reference, {"post_mix": torch.tensor([2.0])}
+    )
+
+    assert stage is None
+    assert diff is None
+
+
 def test_exact_post_contract_rejects_non_decode_shape():
     from vllm_metax.models.deepseek_v4.ops.mhc.tilelang_kernels import (
         _mhc_post_exact_tl,
@@ -148,6 +163,67 @@ def test_exact_post_mma_keeps_non_decode_shape_explicitly_out_of_scope(monkeypat
     sentinel = object()
     monkeypatch.setattr(tilelang, "mhc_post_fwd", lambda *args, **kwargs: sentinel)
     assert tilelang.mhc_post_tilelang(x, residual, post_mix, comb_mix) is sentinel
+
+
+def test_exact_post_pre_rms_fake_shapes():
+    from vllm_metax.models.deepseek_v4.ops.mhc.tilelang import (
+        _mhc_exact_post_pre_rms_fake,
+    )
+
+    residual = torch.empty((1, 4, 4096), dtype=torch.bfloat16)
+    outputs = _mhc_exact_post_pre_rms_fake(
+        torch.empty((1, 4096), dtype=torch.bfloat16),
+        residual,
+        torch.empty((1, 4, 1), dtype=torch.float32),
+        torch.empty((1, 4, 4), dtype=torch.float32),
+        torch.empty((24, 16384), dtype=torch.float32),
+        torch.empty(3, dtype=torch.float32),
+        torch.empty(24, dtype=torch.float32),
+        1e-6,
+        1e-6,
+        1e-6,
+        2.0,
+        20,
+        torch.empty(4096, dtype=torch.bfloat16),
+    )
+
+    assert [tuple(output.shape) for output in outputs] == [
+        (1, 4, 4096),
+        (1, 4, 1),
+        (1, 4, 4),
+        (1, 4096),
+        (1, 4096),
+    ]
+    assert [output.dtype for output in outputs] == [
+        torch.bfloat16,
+        torch.float32,
+        torch.float32,
+        torch.bfloat16,
+        torch.bfloat16,
+    ]
+
+
+def test_exact_post_pre_rms_rejects_unsupported_contract():
+    from vllm_metax.models.deepseek_v4.ops.mhc.tilelang import (
+        mhc_exact_post_pre_rms,
+    )
+
+    with pytest.raises(RuntimeError, match="exact decode contract"):
+        mhc_exact_post_pre_rms(
+            torch.empty((2, 4096), dtype=torch.bfloat16),
+            torch.empty((2, 4, 4096), dtype=torch.bfloat16),
+            torch.empty((2, 4, 1), dtype=torch.float32),
+            torch.empty((2, 4, 4), dtype=torch.float32),
+            torch.empty((24, 16384), dtype=torch.float32),
+            torch.empty(3, dtype=torch.float32),
+            torch.empty(24, dtype=torch.float32),
+            1e-6,
+            1e-6,
+            1e-6,
+            2.0,
+            20,
+            torch.empty(4096, dtype=torch.bfloat16),
+        )
 
 
 def test_assert_bitwise_trace_equal_rejects_stage_mismatch():
@@ -208,10 +284,76 @@ def test_enabled_capture_schema_and_call_filtering(monkeypatch, tmp_path):
     assert payload["params"] == {**_trace_kwargs(), "n_splits": 1}
 
 
+def test_disabled_raw_norm_capture_is_true_noop(monkeypatch):
+    monkeypatch.delenv("VLLM_METAX_DSV4_MHC_RAW_NORM_CAPTURE_DIR", raising=False)
+
+    def fail(*args, **kwargs):
+        raise AssertionError("raw norm capture should be disabled")
+
+    monkeypatch.setattr(torch.Tensor, "float", fail)
+    debug_diff.maybe_capture_mhc_raw_norm(
+        layer_idx=0,
+        stage="attn",
+        residual_cur=torch.empty(1, 4, 8, dtype=torch.bfloat16),
+        fn=torch.empty(24, 32),
+        hc_scale=torch.empty(3),
+        hc_base=torch.empty(24),
+        pre_norm_output=torch.empty(1, 8, dtype=torch.bfloat16),
+        norm_weight=torch.empty(8, dtype=torch.bfloat16),
+        normalized_output=torch.empty(1, 8, dtype=torch.bfloat16),
+        **_trace_kwargs(),
+        n_splits=1,
+    )
+
+
+def test_raw_norm_capture_schema_and_replay(monkeypatch, tmp_path):
+    monkeypatch.setenv("VLLM_METAX_DSV4_MHC_RAW_NORM_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_METAX_DSV4_MHC_RAW_CAPTURE_RANKS", "0")
+    monkeypatch.setattr(debug_diff, "_rank", lambda: "0")
+    debug_diff.reset_mhc_raw_norm_capture_state()
+    residual_cur = torch.randn(1, 4, 4096, dtype=torch.bfloat16)
+    fn = torch.randn(24, 16384, dtype=torch.float32)
+    hc_scale = torch.randn(3, dtype=torch.float32)
+    hc_base = torch.randn(24, dtype=torch.float32)
+    pre_norm = torch.randn(1, 4096, dtype=torch.bfloat16)
+    norm_weight = torch.randn(4096, dtype=torch.bfloat16)
+    eps = 1e-6
+    normalized = (
+        pre_norm.float()
+        * torch.rsqrt(pre_norm.float().square().mean(-1, keepdim=True) + eps)
+        * norm_weight.float()
+    ).bfloat16()
+
+    debug_diff.maybe_capture_mhc_raw_norm(
+        layer_idx=7,
+        stage="ffn",
+        residual_cur=residual_cur,
+        fn=fn,
+        hc_scale=hc_scale,
+        hc_base=hc_base,
+        pre_norm_output=pre_norm,
+        norm_weight=norm_weight,
+        normalized_output=normalized,
+        **_trace_kwargs(),
+        n_splits=1,
+    )
+
+    payload = torch.load(
+        tmp_path / "rank0_call0.pt", map_location="cpu", weights_only=True
+    )
+    assert payload["schema_version"] == 2
+    assert payload["layer_idx"] == 7
+    assert payload["stage"] == "ffn"
+    torch.testing.assert_close(payload["normalized_output"], normalized)
+    assert "trace" not in payload
+
+
 def test_corpus_ordering_is_numeric(tmp_path):
     cli = _load_cli()
     for call in (10, 2, 1):
-        torch.save(_make_payload(call=call, hidden_size=8), tmp_path / f"rank0_call{call}.pt")
+        torch.save(
+            _make_payload(call=call, hidden_size=8), tmp_path / f"rank0_call{call}.pt"
+        )
 
     files = cli["iter_corpus_files"](tmp_path)
     assert [path.name for path in files] == [
@@ -254,7 +396,76 @@ def test_torch_selfcheck_summary(tmp_path):
         "first_failure": None,
         "stage_failures": {},
         "bitwise": True,
+        "raw_norm_files": 0,
+        "raw_norm_passed": 0,
     }
+
+
+def test_schema_v2_raw_norm_selfcheck_and_corruption(tmp_path):
+    cli = _load_cli()
+    residual_cur = torch.randn(1, 4, 4096, dtype=torch.bfloat16)
+    fn = torch.randn(24, 16384, dtype=torch.float32)
+    residual_2d = residual_cur.view(1, -1).float()
+    gemm_out_mul = torch.nn.functional.linear(residual_2d, fn).view(1, 1, 24)
+    gemm_out_sqrsum = residual_2d.square().sum(-1).view(1, 1)
+    hc_scale = torch.randn(3, dtype=torch.float32)
+    hc_base = torch.randn(24, dtype=torch.float32)
+    trace = debug_diff.mhc_pre_from_raw_trace_torch(
+        residual_cur,
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        **_trace_kwargs(),
+    )
+    pre_norm = trace["layer_input_bf16"]
+    norm_weight = torch.randn(4096, dtype=torch.bfloat16)
+    normalized = (
+        pre_norm.float()
+        * torch.rsqrt(pre_norm.float().square().mean(-1, keepdim=True) + 1e-6)
+        * norm_weight.float()
+    ).bfloat16()
+    payload = {
+        "schema_version": 2,
+        "rank": 0,
+        "call": 0,
+        "layer_idx": 1,
+        "stage": "attn",
+        "residual_cur": residual_cur,
+        "fn": fn,
+        "gemm_out_mul": gemm_out_mul,
+        "gemm_out_sqrsum": gemm_out_sqrsum,
+        "hc_scale": hc_scale,
+        "hc_base": hc_base,
+        "pre_norm_output": pre_norm,
+        "norm_weight": norm_weight,
+        "normalized_output": normalized,
+        "params": {**_trace_kwargs(), "n_splits": 1},
+    }
+    path = tmp_path / "rank0_call0.pt"
+    torch.save(payload, path)
+    summary = cli["run_diff"](
+        tmp_path,
+        candidate="torch",
+        device="cpu",
+        require_bitwise=True,
+        rms_candidate="torch",
+    )
+    assert summary["raw_norm_passed"] == 1
+    assert summary["failed"] == 0
+
+    payload["normalized_output"] = normalized.clone()
+    payload["normalized_output"].view(torch.int16)[0] += 1
+    torch.save(payload, path)
+    summary = cli["run_diff"](
+        tmp_path,
+        candidate="torch",
+        device="cpu",
+        require_bitwise=True,
+        rms_candidate="torch",
+    )
+    assert summary["failed"] == 1
+    assert summary["first_failure"]["stage"] == "raw_norm_replay"
 
 
 def test_cli_writes_json_summary(tmp_path):

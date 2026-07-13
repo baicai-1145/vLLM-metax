@@ -189,6 +189,7 @@ def _mhc_pre_big_fuse(
     sinkhorn_repeat: int,
     n_splits: int = 16,
     mhc_mult: int = 4,
+    debug_comb_stage: int = -1,
 ):
     num_tokens = T.dynamic("num_tokens")
     mhc_mult3 = mhc_mult * (2 + mhc_mult)
@@ -249,6 +250,8 @@ def _mhc_pre_big_fuse(
                         mhc_scale[2],
                         mhc_base[j * mhc_mult + k + mhc_mult * 2],
                     )
+                    if debug_comb_stage == 0:
+                        comb_mix[pid, j * mhc_mult + k] = cm[j, k]
 
                 ##################################################################
                 # _mhc_sinkhorn_fwd
@@ -263,11 +266,15 @@ def _mhc_pre_big_fuse(
                 T.reduce_sum(cm, row_sum, dim=1)
                 for j, k in T.Parallel(mhc_mult, mhc_mult):
                     cm[j, k] = cm[j, k] / row_sum[j] + mhc_sinkhorn_eps
+                    if debug_comb_stage == 1:
+                        comb_mix[pid, j * mhc_mult + k] = cm[j, k]
 
                 # comb = comb / (comb.sum(-2) + eps)
                 T.reduce_sum(cm, col_sum, dim=0)
                 for j, k in T.Parallel(mhc_mult, mhc_mult):
                     cm[j, k] = cm[j, k] / (col_sum[k] + mhc_sinkhorn_eps)
+                    if debug_comb_stage == 2:
+                        comb_mix[pid, j * mhc_mult + k] = cm[j, k]
 
                 for _ in T.serial(sinkhorn_repeat - 1):
                     # comb = comb / (comb.sum(-1) + eps)
@@ -281,8 +288,9 @@ def _mhc_pre_big_fuse(
                         cm[j, k] = cm[j, k] / (col_sum[k] + mhc_sinkhorn_eps)
 
                 # save comb_mix to global memory
-                for j, k in T.Parallel(mhc_mult, mhc_mult):
-                    comb_mix[pid, j * mhc_mult + k] = cm[j, k]
+                if debug_comb_stage == -1:
+                    for j, k in T.Parallel(mhc_mult, mhc_mult):
+                        comb_mix[pid, j * mhc_mult + k] = cm[j, k]
             else:
                 ##################################################################
                 # _mhc_pre_split_mixes_fwd (pre)
@@ -350,6 +358,270 @@ def _mhc_pre_big_fuse(
                     T.copy(ol, layer_input[pid, i0_h * hidden_block], disable_tma=True)
 
     return mhc_pre_big_fuse
+
+
+@tilelang.jit(
+    execution_backend="cython",
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
+        tilelang.PassConfigKey.TL_DISABLE_VECTORIZE_256: True,
+    },
+)
+def _mhc_pre_sinkhorn_debug(
+    hidden_size: int,
+    rms_eps: float,
+    mhc_sinkhorn_eps: float,
+    sinkhorn_repeat: int,
+    stage_index: int,
+    n_splits: int = 1,
+    mhc_mult: int = 4,
+):
+    """Debug-only native replay of the MHC Sinkhorn stages.
+
+    The stage dimension is ordered as comb_logits, sinkhorn_softmax_eps,
+    sinkhorn_col_0, then sinkhorn_row_1/sinkhorn_col_1 through repeat 19.
+    This intentionally mirrors the arithmetic in ``_mhc_pre_big_fuse`` while
+    retaining every intermediate in global memory for differential replay.
+    """
+    num_tokens = T.dynamic("num_tokens")
+    mhc_mult3 = mhc_mult * (2 + mhc_mult)
+    @T.prim_func
+    def mhc_pre_sinkhorn_debug(
+        gemm_out_mul: T.Tensor[(n_splits, num_tokens, mhc_mult3), T.float32],
+        gemm_out_sqrsum: T.Tensor[(n_splits, num_tokens), T.float32],
+        mhc_scale: T.Tensor[(3,), T.float32],
+        mhc_base: T.Tensor[(mhc_mult3,), T.float32],
+        sinkhorn_trace: T.Tensor[(num_tokens, mhc_mult * mhc_mult), T.float32],
+    ) -> None:
+        with T.Kernel(num_tokens, threads=64) as pid:
+            rms = T.alloc_fragment(1, T.float32)
+            mixes = T.alloc_fragment(mhc_mult3, T.float32)
+            cm = T.alloc_fragment((mhc_mult, mhc_mult), T.float32)
+            row_sum = T.alloc_fragment(mhc_mult, T.float32)
+            col_sum = T.alloc_fragment(mhc_mult, T.float32)
+            row_max = T.alloc_fragment(mhc_mult, T.float32)
+
+            rms[0] = 0
+            for i_split in T.serial(n_splits):
+                rms[0] += gemm_out_sqrsum[i_split, pid]
+            rms[0] = T.rsqrt(rms[0] / (mhc_mult * hidden_size) + rms_eps)
+            for j in T.Parallel(mhc_mult3):
+                mixes[j] = 0
+                for i_split in T.serial(n_splits):
+                    mixes[j] += gemm_out_mul[i_split, pid, j]
+                mixes[j] *= rms[0]
+
+            for j, k in T.Parallel(mhc_mult, mhc_mult):
+                cm[j, k] = _torch_like_scale_add(
+                    mixes[j * mhc_mult + k + mhc_mult * 2],
+                    mhc_scale[2],
+                    mhc_base[j * mhc_mult + k + mhc_mult * 2],
+                )
+                if stage_index == 0:
+                    sinkhorn_trace[pid, j * mhc_mult + k] = cm[j, k]
+
+            # comb = comb.softmax(-1) + eps
+            T.reduce_max(cm, row_max, dim=1)
+            for j, k in T.Parallel(mhc_mult, mhc_mult):
+                cm[j, k] = T.exp(cm[j, k] - row_max[j])
+            T.reduce_sum(cm, row_sum, dim=1)
+            for j, k in T.Parallel(mhc_mult, mhc_mult):
+                cm[j, k] = cm[j, k] / row_sum[j] + mhc_sinkhorn_eps
+                if stage_index == 1:
+                    sinkhorn_trace[pid, j * mhc_mult + k] = cm[j, k]
+
+            # comb = comb / (comb.sum(-2) + eps)
+            T.reduce_sum(cm, col_sum, dim=0)
+            for j, k in T.Parallel(mhc_mult, mhc_mult):
+                cm[j, k] = cm[j, k] / (col_sum[k] + mhc_sinkhorn_eps)
+                if stage_index == 2:
+                    sinkhorn_trace[pid, j * mhc_mult + k] = cm[j, k]
+
+            for repeat_idx in T.serial(sinkhorn_repeat - 1):
+                # comb = comb / (comb.sum(-1) + eps)
+                T.reduce_sum(cm, row_sum, dim=1)
+                row_stage = 3 + 2 * repeat_idx
+                for j, k in T.Parallel(mhc_mult, mhc_mult):
+                    cm[j, k] = cm[j, k] / (row_sum[j] + mhc_sinkhorn_eps)
+                    if stage_index == row_stage:
+                        sinkhorn_trace[pid, j * mhc_mult + k] = cm[j, k]
+
+                # comb = comb / (comb.sum(-2) + eps)
+                T.reduce_sum(cm, col_sum, dim=0)
+                col_stage = row_stage + 1
+                for j, k in T.Parallel(mhc_mult, mhc_mult):
+                    cm[j, k] = cm[j, k] / (col_sum[k] + mhc_sinkhorn_eps)
+                    if stage_index == col_stage:
+                        sinkhorn_trace[pid, j * mhc_mult + k] = cm[j, k]
+
+    return mhc_pre_sinkhorn_debug
+
+
+def _mhc_pre_sinkhorn_debug_trace(
+    residual_cur: torch.Tensor,
+    gemm_out_mul: torch.Tensor,
+    gemm_out_sqrsum: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int = 1,
+) -> dict[str, torch.Tensor]:
+    """Run the debug kernel and return named native Sinkhorn intermediates."""
+    _validate_exact_raw_contract(
+        residual_cur,
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        n_splits,
+    )
+    num_tokens, mhc_mult, _ = residual_cur.shape
+    num_stages = 3 + 2 * (sinkhorn_repeat - 1)
+    stages = []
+    for stage_index in range(num_stages):
+        stage = torch.empty(
+            (num_tokens, mhc_mult * mhc_mult),
+            dtype=torch.float32,
+            device=residual_cur.device,
+        )
+        _mhc_pre_sinkhorn_debug(
+            residual_cur.shape[-1],
+            rms_eps,
+            hc_sinkhorn_eps,
+            sinkhorn_repeat,
+            stage_index,
+            n_splits=n_splits,
+            mhc_mult=mhc_mult,
+        )(
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            hc_scale,
+            hc_base,
+            stage,
+        )
+        stages.append(stage)
+    trace = {
+        "comb_logits": stages[0].view(1, num_tokens, mhc_mult, mhc_mult),
+        "sinkhorn_softmax_eps": stages[1].view(
+            1, num_tokens, mhc_mult, mhc_mult
+        ),
+        "sinkhorn_col_0": stages[2].view(
+            num_tokens, mhc_mult, mhc_mult
+        ),
+    }
+    for index in range(1, sinkhorn_repeat):
+        trace[f"sinkhorn_row_{index}"] = stages[3 + 2 * (index - 1)].view(
+            num_tokens, mhc_mult, mhc_mult
+        )
+        trace[f"sinkhorn_col_{index}"] = stages[4 + 2 * (index - 1)].view(
+            num_tokens, mhc_mult, mhc_mult
+        )
+    return trace
+
+
+@tilelang.jit(
+    execution_backend="cython",
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
+        tilelang.PassConfigKey.TL_DISABLE_VECTORIZE_256: True,
+    },
+)
+def _mhc_pre_softmax_debug(
+    hidden_size: int,
+    rms_eps: float,
+    mhc_sinkhorn_eps: float,
+    n_splits: int = 1,
+    mhc_mult: int = 4,
+):
+    num_tokens = T.dynamic("num_tokens")
+    mhc_mult3 = mhc_mult * (2 + mhc_mult)
+
+    @T.prim_func
+    def mhc_pre_softmax_debug(
+        gemm_out_mul: T.Tensor[(n_splits, num_tokens, mhc_mult3), T.float32],
+        gemm_out_sqrsum: T.Tensor[(n_splits, num_tokens), T.float32],
+        mhc_scale: T.Tensor[(3,), T.float32],
+        mhc_base: T.Tensor[(mhc_mult3,), T.float32],
+        comb_logits: T.Tensor[(num_tokens, mhc_mult, mhc_mult), T.float32],
+        softmax_eps: T.Tensor[(num_tokens, mhc_mult, mhc_mult), T.float32],
+    ) -> None:
+        with T.Kernel(num_tokens, threads=128) as pid:
+            if T.get_thread_binding() < 64:
+                rms = T.alloc_fragment(1, T.float32)
+                mixes = T.alloc_fragment(mhc_mult3, T.float32)
+                cm = T.alloc_fragment((mhc_mult, mhc_mult), T.float32)
+                row_max = T.alloc_fragment(mhc_mult, T.float32)
+                row_sum = T.alloc_fragment(mhc_mult, T.float32)
+                rms[0] = 0
+                for i_split in T.serial(n_splits):
+                    rms[0] += gemm_out_sqrsum[i_split, pid]
+                rms[0] = T.rsqrt(rms[0] / (mhc_mult * hidden_size) + rms_eps)
+                for index in T.Parallel(mhc_mult3):
+                    mixes[index] = 0
+                    for i_split in T.serial(n_splits):
+                        mixes[index] += gemm_out_mul[i_split, pid, index]
+                    mixes[index] *= rms[0]
+                for j, k in T.Parallel(mhc_mult, mhc_mult):
+                    cm[j, k] = _torch_like_scale_add(
+                        mixes[j * mhc_mult + k + mhc_mult * 2],
+                        mhc_scale[2],
+                        mhc_base[j * mhc_mult + k + mhc_mult * 2],
+                    )
+                    comb_logits[pid, j, k] = cm[j, k]
+                T.reduce_max(cm, row_max, dim=1)
+                for j, k in T.Parallel(mhc_mult, mhc_mult):
+                    cm[j, k] = T.exp(cm[j, k] - row_max[j])
+                T.reduce_sum(cm, row_sum, dim=1)
+                for j, k in T.Parallel(mhc_mult, mhc_mult):
+                    cm[j, k] = cm[j, k] / row_sum[j] + mhc_sinkhorn_eps
+                    softmax_eps[pid, j, k] = cm[j, k]
+
+    return mhc_pre_softmax_debug
+
+
+def _mhc_pre_softmax_debug_trace(
+    residual_cur: torch.Tensor,
+    gemm_out_mul: torch.Tensor,
+    gemm_out_sqrsum: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int = 1,
+) -> dict[str, torch.Tensor]:
+    _validate_exact_raw_contract(
+        residual_cur, gemm_out_mul, gemm_out_sqrsum, hc_scale, hc_base,
+        rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
+        sinkhorn_repeat, n_splits,
+    )
+    num_tokens, mhc_mult, hidden_size = residual_cur.shape
+    logits = torch.empty(
+        (num_tokens, mhc_mult, mhc_mult), dtype=torch.float32,
+        device=residual_cur.device,
+    )
+    softmax_eps = torch.empty_like(logits)
+    _mhc_pre_softmax_debug(
+        hidden_size, rms_eps, hc_sinkhorn_eps, n_splits=n_splits,
+        mhc_mult=mhc_mult,
+    )(gemm_out_mul, gemm_out_sqrsum, hc_scale, hc_base, logits, softmax_eps)
+    return {
+        "comb_logits": logits.unsqueeze(0),
+        "sinkhorn_softmax_eps": softmax_eps.unsqueeze(0),
+    }
 
 
 @tilelang.jit(

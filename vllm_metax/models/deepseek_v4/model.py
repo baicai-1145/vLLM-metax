@@ -729,7 +729,9 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[MacaDeepseekV4Attenti
         vllm_config.attention_config.backend
         == AttentionBackendEnum.FLASHINFER_MLA_SPARSE_DSV4
     ):
-        raise ValueError(f"Unsupported dsv4 backend: {vllm_config.attention_config.backend}") 
+        raise ValueError(
+            f"Unsupported dsv4 backend: {vllm_config.attention_config.backend}"
+        )
     return MacaDeepseekV4FlashMLAAttention
 
 
@@ -746,6 +748,36 @@ def _mhc_fused_post_pre_for_stage(stage: str, *args, **kwargs):
     if get_mhc_backend_name() == "tilelang" and stage not in _TILELANG_FUSED_STAGES:
         return mhc_fused_post_pre_torch(*args, **kwargs)
     return mhc_fused_post_pre(*args, **kwargs)
+
+
+def _mhc_exact_pre_rms_enabled() -> bool:
+    return os.getenv("VLLM_METAX_DSV4_MHC_EXACT_PRE_RMS", "0") == "1"
+
+
+def _mhc_exact_post_pre_rms_for_stage(
+    stage: str,
+    *args,
+    norm_weight: torch.Tensor,
+    **kwargs,
+):
+    if not _mhc_exact_pre_rms_enabled():
+        return None
+    x = args[0]
+    if x.numel() // x.shape[-1] != 1:
+        return None
+    if get_mhc_backend_name() != "tilelang" or stage not in _TILELANG_FUSED_STAGES:
+        raise RuntimeError(
+            "VLLM_METAX_DSV4_MHC_EXACT_PRE_RMS=1 requires the TileLang fused "
+            f"backend for stage {stage}"
+        )
+    from .ops.mhc.tilelang import _mhc_exact_post_pre_rms_impl
+
+    return _mhc_exact_post_pre_rms_impl(
+        *args,
+        norm_weight=norm_weight,
+        workspace=kwargs.pop("workspace", None),
+        **kwargs,
+    )
 
 
 class DeepseekV4DecoderLayer(nn.Module):
@@ -821,6 +853,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             ),
             requires_grad=False,
         )
+        self._mhc_exact_workspace: dict[tuple[int, str], dict[str, torch.Tensor]] = {}
 
     def forward(
         self,
@@ -831,6 +864,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         res_mix: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        exact_result = None
         if residual is None:
             residual = x
             post_mix, res_mix, x = mhc_pre(
@@ -847,7 +881,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         else:
             prev_x, prev_residual = x, residual
             prev_post_mix, prev_res_mix = post_mix, res_mix
-            residual, post_mix, res_mix, x = _mhc_fused_post_pre_for_stage(
+            exact_result = _mhc_exact_post_pre_rms_for_stage(
                 "attn",
                 x,
                 residual,
@@ -861,7 +895,28 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_eps,
                 self.hc_post_alpha,
                 self.hc_sinkhorn_iters,
+                norm_weight=self.attn_norm.weight,
+                workspace=self._mhc_exact_workspace,
             )
+            if exact_result is None:
+                residual, post_mix, res_mix, x = _mhc_fused_post_pre_for_stage(
+                    "attn",
+                    x,
+                    residual,
+                    post_mix,
+                    res_mix,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                    self.hc_eps,
+                    self.hc_post_alpha,
+                    self.hc_sinkhorn_iters,
+                )
+                normalized_x = None
+            else:
+                residual, post_mix, res_mix, x, normalized_x = exact_result
             if mhc_diff_enabled():
                 compare_fused_post_pre(
                     layer_idx=self.layer_idx,
@@ -879,12 +934,35 @@ class DeepseekV4DecoderLayer(nn.Module):
                     hc_post_mult_value=self.hc_post_alpha,
                     sinkhorn_repeat=self.hc_sinkhorn_iters,
                 )
-        x = self.attn_norm(x)
+        pre_attn_norm = x
+        if exact_result is None:
+            x = self.attn_norm(x)
+        else:
+            x = normalized_x
+        from .ops.mhc.debug_diff import maybe_capture_mhc_raw_norm
+
+        maybe_capture_mhc_raw_norm(
+            layer_idx=self.layer_idx,
+            stage="attn",
+            residual_cur=residual,
+            fn=self.hc_attn_fn,
+            hc_scale=self.hc_attn_scale,
+            hc_base=self.hc_attn_base,
+            pre_norm_output=pre_attn_norm,
+            norm_weight=self.attn_norm.weight,
+            normalized_output=x,
+            rms_eps=self.rms_norm_eps,
+            hc_pre_eps=self.hc_eps,
+            hc_sinkhorn_eps=self.hc_eps,
+            hc_post_mult_value=self.hc_post_alpha,
+            sinkhorn_repeat=self.hc_sinkhorn_iters,
+            n_splits=1,
+        )
         x = self.attn(positions, x, None)
 
         prev_x, prev_residual = x, residual
         prev_post_mix, prev_res_mix = post_mix, res_mix
-        residual, post_mix, res_mix, x = _mhc_fused_post_pre_for_stage(
+        exact_result = _mhc_exact_post_pre_rms_for_stage(
             "ffn",
             x,
             residual,
@@ -899,7 +977,29 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_post_alpha,
             self.hc_sinkhorn_iters,
             n_splits=1,
+            norm_weight=self.ffn_norm.weight,
+            workspace=self._mhc_exact_workspace,
         )
+        if exact_result is None:
+            residual, post_mix, res_mix, x = _mhc_fused_post_pre_for_stage(
+                "ffn",
+                prev_x,
+                prev_residual,
+                prev_post_mix,
+                prev_res_mix,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+                self.hc_eps,
+                self.hc_post_alpha,
+                self.hc_sinkhorn_iters,
+                n_splits=1,
+            )
+            normalized_x = None
+        else:
+            residual, post_mix, res_mix, x, normalized_x = exact_result
         if mhc_diff_enabled():
             compare_fused_post_pre(
                 layer_idx=self.layer_idx,
@@ -918,7 +1018,25 @@ class DeepseekV4DecoderLayer(nn.Module):
                 sinkhorn_repeat=self.hc_sinkhorn_iters,
                 n_splits=1,
             )
-        x = self.ffn_norm(x)
+        pre_ffn_norm = x
+        x = self.ffn_norm(x) if exact_result is None else normalized_x
+        maybe_capture_mhc_raw_norm(
+            layer_idx=self.layer_idx,
+            stage="ffn",
+            residual_cur=residual,
+            fn=self.hc_ffn_fn,
+            hc_scale=self.hc_ffn_scale,
+            hc_base=self.hc_ffn_base,
+            pre_norm_output=pre_ffn_norm,
+            norm_weight=self.ffn_norm.weight,
+            normalized_output=x,
+            rms_eps=self.rms_norm_eps,
+            hc_pre_eps=self.hc_eps,
+            hc_sinkhorn_eps=self.hc_eps,
+            hc_post_mult_value=self.hc_post_alpha,
+            sinkhorn_repeat=self.hc_sinkhorn_iters,
+            n_splits=1,
+        )
         x = self.ffn(x, input_ids)
         return x, residual, post_mix, res_mix
 
@@ -1078,9 +1196,7 @@ class DeepseekV4Model(nn.Module):
                 residual,
             )
         if layer is not None:
-            hidden_states = mhc_post(
-                hidden_states, residual, post_mix, res_mix
-            )
+            hidden_states = mhc_post(hidden_states, residual, post_mix, res_mix)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
