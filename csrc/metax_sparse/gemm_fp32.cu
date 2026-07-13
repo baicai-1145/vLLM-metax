@@ -517,7 +517,7 @@ void mhc_cast_sqrsum_out(torch::Tensor const& residual,
 }
 
 __device__ __forceinline__ float mhc_sigmoid(float value) {
-  return __builtin_mxc_rcpf(__fadd_rn(1.0f, expf(-value)));
+  return __fdiv_rn(1.0f, __fadd_rn(1.0f, expf(-value)));
 }
 
 __global__ void mhc_downstream_rms_kernel(

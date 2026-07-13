@@ -180,6 +180,15 @@ Corpus 必须覆盖 compression ratio 1、4、128，SWA-only、SWA+topk、边界
 当前以上 gate 已全部通过；Plan 01 完成。后续性能结果必须继续保留 frozen
 TP=4 greedy gate，不得以吞吐回退本页已建立的 exact/native/default-chunk 证据。
 
+### 累计消融复核（2026-07-13）
+
+独立 worktree 的正常 TP=4 100-token 五次测量显示，`82e4c54 -> bc0aa3c`
+median TPS 为 `15.1398 -> 15.9486`（`+5.342%`），latency 为
+`6.605096 -> 6.270132 s`。Plan 01 的输出与 Plan 02 default/current-reference
+100-token IDs 完全一致；pre-Plan01 则从 index 31 起分叉，因此该 5.342% 是历史
+累计变化而非严格同输出序列 A/B。完整方法和限制见
+[`2026-07-13-plan01-03-cumulative-ablation.md`](2026-07-13-plan01-03-cumulative-ablation.md)。
+
 ## 会话任务提示
 
 ```text

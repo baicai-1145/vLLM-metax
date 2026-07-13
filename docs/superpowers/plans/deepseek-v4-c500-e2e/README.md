@@ -9,10 +9,10 @@
 | 顺序 | 会话文档                       | 状态/目的                                      | 依赖              |
 | ---: | ------------------------------ | ---------------------------------------------- | ----------------- |
 |    0 | `00-shared-contract.md`        | 冻结 A100/C500 同口径基线和全局门禁            | 无                |
-|    1 | `01-sparse-mla.md`             | 替换 decode/prefill Torch sparse attention     | 00                |
-|    2 | `02-mhc-rmsnorm.md`            | 在已完成 exact post 基础上融合 raw/pre+RMSNorm | 00                |
+|    1 | `01-sparse-mla.md`             | 完成：累计约 +5%，含输出序列限制               | 00                |
+|    2 | `02-mhc-rmsnorm.md`            | 完成/接受 opt-in exact path；默认关闭          | 00                |
 |    3 | `03-o-proj.md`                 | 完成：精确融合 no-go，保持基线                 | 00，建议 01 后    |
-|    4 | `04-w4a16-moe.md`              | 优化 batch-one W4A16 MoE                       | 00                |
+|    4 | `04-w4a16-moe.md`              | 未开始                                         | 00                |
 |    5 | `05-tp-communication.md`       | 优化 87 次/token 小消息 TP collective          | 00，建议 01-04 后 |
 |    6 | `06-cudagraph-launch.md`       | 减少 graph break、launch gap 和分配            | 01-05             |
 |    7 | `07-integration-acceptance.md` | 汇总收益、回归和最终推广决策                   | 01-06             |
@@ -27,8 +27,9 @@ decode-first，但 prefill 的 OOM blocker 要立即建立复现和修复门禁�
 - 模型：`/root/models/DeepSeek-V4-Flash-W4A16-BF16Attn-MTP`
 - **历史** TP=4 PIECEWISE、MTP=0、16-token 快速 gate：`11.624672 token/s`，约
   `86.0 ms/token`（仅作会话起始参考）
-- 最新 MTP=0、TP=4 PIECEWISE、100-token decode：`16.1378 tok/s`、`61.97 ms/token`；
-  四卡利用率 `15.90%--16.16%`
+- 最新受控 MTP=0、TP=4 PIECEWISE、100-token decode 前后夹具为
+  `16.2325/16.0112 tok/s`，漂移 `-1.363%`；累计消融见
+  [`2026-07-13-plan01-03-cumulative-ablation.md`](2026-07-13-plan01-03-cumulative-ablation.md)
 - 最新 1K prefill：`1321.61 input tok/s`、`0.774812 s`
 - 最新 10K prefill：default `chunk=8192` 在
   `torch_flash_mla_sparse_prefill` 的 `torch.index_select` 尝试约 `10 GiB` 分配并
@@ -41,6 +42,15 @@ decode-first，但 prefill 的 OOM blocker 要立即建立复现和修复门禁�
   并以 hard fail 阻止验收。
 - exact MHC post 已完成：340/340 bitwise、graph replay、稳定指针和 16-token gate
 - exact post microbenchmark：`0.0222 ms` eager、`0.0350 ms` graph
+- Plan02 2026-07-14 opt-in exact path 已接受：`mhc_sigmoid` 的
+  `__builtin_mxc_rcpf(1+expf(-x))` 已改为 `__fdiv_rn`；1892 个 rank0 真实 late
+  payload 每个已检查 stage bitwise、max abs/rel `0`，graph `9/9` 稳定且无分配。
+  TP=4 PIECEWISE 23-token gate 及 fresh 100-token exact-off-vs-on IDs 全部一致，
+  无 fallback。正常 5-run 同 workload 为 off `15.965887` median TPS / `6.263354 s`
+  median latency，on `25.875913` / `3.864598 s`，即 `+62.07%` TPS、`-38.30%`
+  latency；默认仍关闭。详见 `.logs/plan02_sigmoid_fdiv_stage_diff_20260714/`、
+  `.logs/plan02_sigmoid_fdiv_graph_gate_20260714/`、`.logs/plan02_sigmoid_fdiv_e2e23_20260714/`、
+  `.logs/plan02_sigmoid_fdiv_e2e100_20260714/` 和 `.logs/plan02_sigmoid_fdiv_benchmark_20260714/`。
 - 当前最高风险路径是 MetaX sparse MLA decode/prefill 的显式 Torch reference
 - 最新同口径 profiler：
   `.logs/dsv4_mhc_exact_post_mma_steady_steps_profile_20260712.log`

@@ -1,5 +1,7 @@
 # MHC exact raw/pre 与 RMSNorm 融合
 
+> **状态（2026-07-14）：已完成并接受 opt-in exact path；生产默认仍关闭。Plan 04 尚未开始。**
+
 ## 会话目标
 
 保留已经完成的 exact MHC post MMA，继续把 Torch exact raw/pre、Sinkhorn、
@@ -112,7 +114,7 @@ pytest -q tests/compat/test_deepseek_v4_mhc_backend.py \
 - exact post 性能和 340/340 gate 不回退；
 - TP=4 16-token IDs 完全一致，并给出每 token MHC 总延迟变化。
 
-## Plan 02 完成证据（2026-07-13）
+## Plan 02 16-token gate 证据（2026-07-13）
 
 已实现默认关闭的 `VLLM_METAX_DSV4_MHC_EXACT_PRE_RMS=1` decode opt-in。该路径
 只在 TP=4、单 token、`hc_mult=4`、`hidden=4096`、20 次 Sinkhorn 的 exact
@@ -135,9 +137,51 @@ raw/pre/RMS 中间 buffer 在 graph replay 中保持稳定指针。
   `.logs/dsv4_mhc_fused_post_prenorm_corpus_tp4/` 与
   `.logs/dsv4_mhc_post_bench_20260712.json`。
 
-因此 Plan 02 的 raw/pre/RMSNorm correctness、graph、dispatch 和 TP=4
-correctness gates 均通过；profiler TPS 仅作 instrumented evidence，不作为
-正常吞吐基线。
+上述证据只覆盖 16-token 快速 gate；profiler TPS 仅作 instrumented evidence，
+不作为正常吞吐基线。
+
+## 100-token 累计消融复核（2026-07-13）
+
+Plan 02 默认关闭，`bc0aa3c -> 36078e9` 默认路径 median TPS 仅
+`15.9486 -> 15.9160`（`-0.204%`），低于 run spread，按零收益处理。
+
+显式启用 `MHC_BACKEND=tilelang`、`EXACT_POST_MMA=1` 和
+`EXACT_PRE_RMS=1` 后，median TPS 为 `25.3571`，相对 default 提升
+`59.318%`；但 TP=4 100-token IDs 从 0-based index 22 开始分叉。此前 16-token
+gate 没有覆盖首次错误位置。
+
+**历史状态（已由 2026-07-14 验收 superseded）：Plan 02 重新打开，correctness blocker。** 保持所有生产开关默认关闭；
+本轮只做 current-reference comparison，没有独立 100-token frozen oracle。在建立
+该 oracle 且 candidate 完全一致前，不得推广或把 59.318% 计入累计收益。
+完整证据见
+[`2026-07-13-plan01-03-cumulative-ablation.md`](2026-07-13-plan01-03-cumulative-ablation.md)
+和 `.logs/plan123_ablation_wrapper_20260713/`。
+
+## 2026-07-14 sigmoid 修复与 opt-in 最终验收
+
+2026-07-13 的 index-22 divergence 根因已定位：`mhc_sigmoid` 使用
+`__builtin_mxc_rcpf(1+expf(-x))`，其倒数近似改变了 exact 数值顺序。现已改为
+`__fdiv_rn`。修复后的证据如下：
+
+- 1892 个 rank0 真实 late payload 在每个已检查 stage 均 bitwise 一致，max abs/rel
+  均为 `0`；`.logs/plan02_sigmoid_fdiv_stage_diff_20260714/`。
+- graph gate `9/9`，指针稳定且无 allocation；`.logs/plan02_sigmoid_fdiv_graph_gate_20260714/`。
+- TP=4 PIECEWISE exact-enabled 23-token gate 通过；fresh exact-off-vs-on
+  100-token 的全部 token IDs 完全一致，first mismatch 为 none（修复前 index 22
+  的 reference ID 为 `372`）；`.logs/plan02_sigmoid_fdiv_e2e23_20260714/`、
+  `.logs/plan02_sigmoid_fdiv_e2e100_20260714/`。
+- dispatch 保持 native path，无 fallback。
+
+同一 workload 的正常、非 profiler、5-run benchmark：
+
+| Path | Median TPS | P90 TPS | Median/P90 latency | GPU avg |
+| ---- | ---------: | -------: | ------------------: | ------- |
+| exact off | 15.965887 | 15.914479 | 6.263354 / 6.283586 s | `[16.13,16.03,16.16,16.10]%` |
+| exact on | 25.875913 | 25.579406 | 3.864598 / 3.909395 s | `[24.50,24.60,24.20,24.50]%` |
+
+exact on 相比 off 为 `+62.07%` TPS、`-38.30%` median latency。原始结果位于
+`.logs/plan02_sigmoid_fdiv_benchmark_20260714/`。该结论仅适用于显式 opt-in
+exact path；不得静默改变 runtime default。
 
 ## 会话任务提示
 

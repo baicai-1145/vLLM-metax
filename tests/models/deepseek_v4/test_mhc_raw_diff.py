@@ -115,6 +115,78 @@ def test_tensor_diff_reports_fp32_and_bf16_raw_mismatch():
     assert bf16_diff["lhs_bits"] != bf16_diff["rhs_bits"]
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires a CUDA-compatible device"
+)
+def test_mhc_downstream_rms_uses_round_to_nearest_sigmoid_division():
+    import vllm_metax._metax_sparse_C  # noqa: F401
+
+    pre_logits = torch.tensor(
+        [-13.204452514648438, -13.204453468322754, 0.0, 0.0],
+        device="cuda",
+        dtype=torch.float32,
+    )
+    post_logits = torch.tensor(
+        [
+            -13.204547882080078,
+            13.822408676147461,
+            -4.442898273468018,
+            16.341108322143555,
+        ],
+        device="cuda",
+        dtype=torch.float32,
+    )
+    op = torch.ops._metax_sparse_C
+
+    pre_probe = torch.empty(16, device="cuda", dtype=torch.float32)
+    post_probe = torch.empty_like(pre_probe)
+    op.mhc_sigmoid_probe_out(pre_logits, pre_probe)
+    op.mhc_sigmoid_probe_out(post_logits, post_probe)
+
+    residual = torch.zeros((1, 4, 4096), device="cuda", dtype=torch.bfloat16)
+    residual[:, 0].fill_(1)
+    residual[:, 1].fill_(-1)
+    gemm_out = torch.zeros(24, device="cuda", dtype=torch.float32)
+    gemm_out[:4].copy_(pre_logits)
+    gemm_out[4:8].copy_(post_logits)
+    sqrsum = torch.zeros(1, device="cuda", dtype=torch.float32)
+    scale = torch.tensor([1.0, 1.0, 0.0], device="cuda", dtype=torch.float32)
+    base = torch.zeros(24, device="cuda", dtype=torch.float32)
+    norm_weight = torch.ones(4096, device="cuda", dtype=torch.bfloat16)
+    post_out = torch.empty(4, device="cuda", dtype=torch.float32)
+    comb_out = torch.empty(16, device="cuda", dtype=torch.float32)
+    pre_norm_out = torch.empty(4096, device="cuda", dtype=torch.bfloat16)
+    norm_out = torch.empty_like(pre_norm_out)
+    op.mhc_downstream_rms_out(
+        residual,
+        gemm_out,
+        sqrsum,
+        scale,
+        base,
+        norm_weight,
+        post_out,
+        comb_out,
+        pre_norm_out,
+        norm_out,
+        1.0,
+        0.0,
+        1e-6,
+        1.0,
+        20,
+    )
+    torch.cuda.synchronize()
+
+    expected_pre = (
+        torch.sigmoid(pre_logits[0]) - torch.sigmoid(pre_logits[1])
+    ).bfloat16()
+    rcpf_pre = (pre_probe[8] - pre_probe[9]).bfloat16()
+    expected_post = torch.sigmoid(post_logits)
+    assert rcpf_pre != expected_pre
+    assert torch.any(post_probe[8:12] != expected_post)
+    assert torch.equal(pre_norm_out, expected_pre.expand_as(pre_norm_out))
+    assert torch.equal(post_out, expected_post)
+
+
 def test_first_trace_failure_accepts_native_output_subset():
     cli = _load_cli()
     reference = {
