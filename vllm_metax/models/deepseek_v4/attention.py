@@ -5,12 +5,14 @@
 DeepseekV4 MLA Attention Layer
 """
 
-from typing import TYPE_CHECKING, ClassVar, cast
+import os
+from typing import TYPE_CHECKING, ClassVar, Literal, cast
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import DeepseekV2Config, DeepseekV3Config
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.forward_context import get_forward_context
 
 from vllm.model_executor.layers.linear import (
@@ -39,6 +41,7 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from .compressor import MacaDeepseekCompressor
 from vllm.utils.multi_stream_utils import (
+    execute_in_parallel,
     maybe_execute_in_parallel,
 )
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
@@ -61,6 +64,47 @@ if TYPE_CHECKING:
     )
 
 logger = init_logger(__name__)
+
+_Q_INSERT_CUDAGRAPH_LAYER_ENV = "VLLM_METAX_DSV4_Q_INSERT_CUDAGRAPH_LAYER"
+
+
+def _q_insert_cudagraph_target_layer() -> int | Literal["all"] | None:
+    value = os.environ.get(_Q_INSERT_CUDAGRAPH_LAYER_ENV)
+    if value is None:
+        return None
+    if value == "all":
+        return "all"
+    try:
+        layer_idx = int(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{_Q_INSERT_CUDAGRAPH_LAYER_ENV} must be an integer layer id, "
+            f"got {value!r}"
+        ) from exc
+    if layer_idx < 0:
+        raise ValueError(
+            f"{_Q_INSERT_CUDAGRAPH_LAYER_ENV} must be a non-negative layer id, "
+            f"got {value!r}"
+        )
+    return layer_idx
+
+
+def _q_insert_tensor_key(tensor: torch.Tensor) -> tuple:
+    return (
+        tensor.device.type,
+        tensor.device.index,
+        str(tensor.dtype),
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        tensor.data_ptr(),
+        tensor.storage_offset(),
+    )
+
+
+def _q_insert_cudagraph_pool_handle():
+    from vllm.platforms import current_platform
+
+    return current_platform.graph_pool_handle()
 
 
 class MacaDeepseekV4Attention(DeepseekV4Attention):
@@ -93,6 +137,7 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
         cache_config = vllm_config.cache_config
         tp_size = get_tensor_model_parallel_world_size()
         layer_id = extract_layer_index(prefix)
+        self.layer_idx = layer_id
 
         self.prefix = prefix  # Alias for compatibility with compressor
         self.hidden_size = config.hidden_size
@@ -249,6 +294,229 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
                 prefix=f"{prefix}.compressor",
                 k_cache_prefix=self.prefix,
             )
+
+        self._q_insert_cudagraphs: dict[tuple, tuple[object, torch.Tensor]] = {}
+        self._q_insert_cudagraph_pool = None
+
+    @eager_break_during_capture
+    def attention_impl(
+        self,
+        hidden_states: torch.Tensor,
+        qr: torch.Tensor,
+        kv: torch.Tensor,
+        kv_score: torch.Tensor,
+        indexer_kv_score: torch.Tensor,
+        indexer_weights: torch.Tensor,
+        positions: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        target_layer = _q_insert_cudagraph_target_layer()
+        target_enabled = target_layer == "all" or target_layer == self.layer_idx
+        if (
+            not target_enabled
+            or hidden_states.shape[0] != 1
+        ):
+            return super().attention_impl(
+                hidden_states,
+                qr,
+                kv,
+                kv_score,
+                indexer_kv_score,
+                indexer_weights,
+                positions,
+                out,
+            )
+
+        forward_context = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+        if not isinstance(attn_metadata, dict):
+            return super().attention_impl(
+                hidden_states,
+                qr,
+                kv,
+                kv_score,
+                indexer_kv_score,
+                indexer_weights,
+                positions,
+                out,
+            )
+        swa_metadata = attn_metadata.get(self.swa_cache_layer.prefix)
+        if (
+            swa_metadata is None
+            or getattr(swa_metadata, "num_prefills", None) != 0
+            or getattr(swa_metadata, "num_decode_tokens", None) != 1
+        ):
+            return super().attention_impl(
+                hidden_states,
+                qr,
+                kv,
+                kv_score,
+                indexer_kv_score,
+                indexer_weights,
+                positions,
+                out,
+            )
+
+        if self._q_insert_cudagraph_capture_active():
+            raise RuntimeError(
+                "DeepSeek V4 Q/KV-insert CUDA graph cannot nest outer capture"
+            )
+
+        compressor = self.compressor
+
+        def wq_b_kv_insert() -> torch.Tensor:
+            return self._q_insert_cudagraph_forward(qr, kv, positions, swa_metadata)
+
+        if self.indexer is not None:
+            aux_streams = self.aux_stream_list
+            indexer = self.indexer
+            assert compressor is not None
+            q, _ = execute_in_parallel(
+                wq_b_kv_insert,
+                [
+                    lambda: indexer(
+                        hidden_states,
+                        qr,
+                        indexer_kv_score,
+                        indexer_weights,
+                        positions,
+                        self.indexer_rotary_emb,
+                    ),
+                    lambda: compressor(kv_score, positions, self.rotary_emb),
+                ],
+                self.ln_events[0],
+                [self.ln_events[1], self.ln_events[2]],
+                [aux_streams[0], aux_streams[1]] if aux_streams is not None else None,
+                enable=aux_streams is not None,
+            )
+        elif compressor is not None:
+            aux_stream = (
+                self.aux_stream_list[0] if self.aux_stream_list is not None else None
+            )
+            q, _ = maybe_execute_in_parallel(
+                wq_b_kv_insert,
+                lambda: compressor(kv_score, positions, self.rotary_emb),
+                self.ln_events[0],
+                self.ln_events[1],
+                aux_stream,
+            )
+        else:
+            q = wq_b_kv_insert()
+        self.forward_mqa(q, kv, positions, out)
+
+    @staticmethod
+    def _q_insert_cudagraph_capture_active() -> bool:
+        probe = getattr(torch.cuda, "is_current_stream_capturing", None)
+        if probe is None:
+            raise RuntimeError(
+                "DeepSeek V4 Q/KV-insert CUDA graph capture status is unavailable"
+            )
+        try:
+            return bool(probe())
+        except Exception as exc:
+            raise RuntimeError(
+                "DeepSeek V4 Q/KV-insert CUDA graph capture status is unavailable"
+            ) from exc
+
+    def _q_insert_cudagraph_native(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        swa_metadata,
+    ) -> torch.Tensor:
+        swa_kv_cache = self.swa_cache_layer.kv_cache
+        swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
+        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_insert(
+            q,
+            kv,
+            swa_kv_cache_2d,
+            swa_metadata.slot_mapping,
+            positions.to(torch.int64),
+            self.rotary_emb.cos_sin_cache,
+            self.eps,
+            swa_metadata.block_size,
+        )
+        if self.n_local_heads < self.padded_heads:
+            return F.pad(
+                q,
+                (0, 0, 0, self.padded_heads - self.n_local_heads),
+                value=0.0,
+            )
+        return q
+
+    def _q_insert_cudagraph_compute(
+        self,
+        qr: torch.Tensor,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        swa_metadata,
+    ) -> torch.Tensor:
+        q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+        return self._q_insert_cudagraph_native(q, kv, positions, swa_metadata)
+
+    def _q_insert_cudagraph_key(
+        self,
+        qr: torch.Tensor,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        swa_metadata,
+    ) -> tuple:
+        stream = torch.cuda.current_stream(qr.device)
+        stream_key = getattr(stream, "cuda_stream", id(stream))
+        return (
+            _q_insert_tensor_key(qr),
+            _q_insert_tensor_key(kv),
+            _q_insert_tensor_key(self.wq_b.weight),
+            _q_insert_tensor_key(positions),
+            _q_insert_tensor_key(self.swa_cache_layer.kv_cache),
+            _q_insert_tensor_key(swa_metadata.slot_mapping),
+            _q_insert_tensor_key(self.rotary_emb.cos_sin_cache),
+            float(self.eps),
+            int(swa_metadata.block_size),
+            stream_key,
+        )
+
+    def _q_insert_cudagraph_forward(
+        self,
+        qr: torch.Tensor,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        swa_metadata,
+    ) -> torch.Tensor:
+        if self._q_insert_cudagraph_capture_active():
+            raise RuntimeError(
+                "DeepSeek V4 Q/KV-insert CUDA graph cannot nest outer capture"
+            )
+        key = self._q_insert_cudagraph_key(qr, kv, positions, swa_metadata)
+        graphs = self._q_insert_cudagraphs
+        cached = graphs.get(key)
+        if cached is not None:
+            cached[0].replay()
+            return cached[1]
+
+        stream = torch.cuda.current_stream(qr.device)
+        self._q_insert_cudagraph_compute(qr, kv, positions, swa_metadata)
+        stream.synchronize()
+
+        pool = self._q_insert_cudagraph_pool
+        if pool is None:
+            pool = _q_insert_cudagraph_pool_handle()
+            self._q_insert_cudagraph_pool = pool
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=pool):
+            graph_out = self._q_insert_cudagraph_compute(
+                qr, kv, positions, swa_metadata
+            )
+        graph.replay()
+        graphs[key] = (graph, graph_out)
+        return graph_out
+
+    def clear_q_insert_cudagraph_cache(self) -> None:
+        if self._q_insert_cudagraphs:
+            torch.cuda.synchronize()
+        self._q_insert_cudagraphs.clear()
+        self._q_insert_cudagraph_pool = None
 
     def _fused_qnorm_rope_kv_insert(
         self,

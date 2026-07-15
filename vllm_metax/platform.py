@@ -262,7 +262,12 @@ class MacaPlatformBase(Platform):
         model_config = vllm_config.model_config
 
         if parallel_config.worker_cls == "auto":
-            parallel_config.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
+            if os.environ.get("VLLM_METAX_TP_WORKER_CPU_AFFINITY", "").strip():
+                parallel_config.worker_cls = (
+                    "vllm_metax.patch.plugin_enhancement.worker_affinity.AffinityWorker"
+                )
+            else:
+                parallel_config.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
 
         scheduler_config = vllm_config.scheduler_config
 

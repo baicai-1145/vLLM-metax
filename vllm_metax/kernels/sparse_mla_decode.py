@@ -5,6 +5,8 @@ The kernel consumes paged SWA and compressed caches directly.  It never forms
 the ``[tokens, selected, head_dim]`` gather used by the old Torch oracle.
 """
 
+import os
+
 import torch
 from vllm.triton_utils import tl, triton
 
@@ -15,6 +17,9 @@ from vllm.triton_utils import tl, triton
 # control.
 _COMPAT_WORKSPACES: dict[tuple, tuple[torch.Tensor, ...]] = {}
 _LAST_COMPAT_WORKSPACE: tuple[torch.Tensor, ...] | None = None
+_COMPAT_CUDAGRAPHS: dict[tuple, object] = {}
+_COMPAT_CUDAGRAPH_POOL = None
+_COMPAT_CUDAGRAPH_ENV = "VLLM_METAX_SPARSE_MLA_COMPAT_CUDAGRAPH"
 
 
 def _gemm_fp32_out_op():
@@ -545,7 +550,7 @@ def _compat_workspace(
     d_v: int,
     head_dim: int,
     workspace: tuple[torch.Tensor, ...] | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, ...]:
     if workspace is None:
         key = (q.device.type, q.device.index, tokens, heads, k, d_v, head_dim)
         workspace = _COMPAT_WORKSPACES.get(key)
@@ -571,7 +576,7 @@ def _compat_workspace(
     return probs, values, transposed, gemm_out, q_fp32
 
 
-def _sparse_mla_decode_compat(
+def _sparse_mla_decode_compat_eager(
     q: torch.Tensor,
     swa_cache: torch.Tensor,
     swa_indices: torch.Tensor,
@@ -637,6 +642,157 @@ def _sparse_mla_decode_compat(
         gemm_out.stride(2), out.stride(0), out.stride(1), out.stride(2),
         BLOCK_DV=triton.next_power_of_2(d_v), num_warps=4,
     )
+
+
+def _compat_graph_pool():
+    global _COMPAT_CUDAGRAPH_POOL
+    if _COMPAT_CUDAGRAPH_POOL is not None:
+        return _COMPAT_CUDAGRAPH_POOL
+    from vllm.platforms import current_platform
+
+    _COMPAT_CUDAGRAPH_POOL = current_platform.graph_pool_handle()
+    return _COMPAT_CUDAGRAPH_POOL
+
+
+def _compat_cudagraph_enabled() -> bool:
+    return os.environ.get(_COMPAT_CUDAGRAPH_ENV) == "1"
+
+
+def _compat_tensor_key(tensor: torch.Tensor | None) -> tuple:
+    if tensor is None:
+        return (None,)
+    device = tensor.device
+    return (
+        device.type,
+        device.index,
+        str(tensor.dtype),
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        tensor.data_ptr(),
+        tensor.storage_offset(),
+    )
+
+
+def _compat_cudagraph_key(
+    q: torch.Tensor,
+    swa_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    topk_indices: torch.Tensor | None,
+    out: torch.Tensor,
+    workspace: tuple[torch.Tensor, ...],
+    sm_scale: float,
+    d_v: int,
+) -> tuple:
+    stream = torch.cuda.current_stream(q.device)
+    stream_key = getattr(stream, "cuda_stream", id(stream))
+    return (
+        _compat_tensor_key(q),
+        _compat_tensor_key(swa_cache),
+        _compat_tensor_key(swa_indices),
+        _compat_tensor_key(topk_indices),
+        _compat_tensor_key(out),
+        tuple(_compat_tensor_key(tensor) for tensor in workspace),
+        float(sm_scale),
+        int(d_v),
+        stream_key,
+    )
+
+
+def sparse_mla_decode_compat_cudagraph_clear_cache() -> None:
+    global _COMPAT_CUDAGRAPH_POOL
+    if _COMPAT_CUDAGRAPHS:
+        torch.cuda.synchronize()
+    _COMPAT_CUDAGRAPHS.clear()
+    _COMPAT_CUDAGRAPH_POOL = None
+
+
+def _sparse_mla_decode_compat(
+    q: torch.Tensor,
+    swa_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    topk_indices: torch.Tensor | None,
+    sm_scale: float,
+    d_v: int,
+    out: torch.Tensor,
+    workspace: tuple[torch.Tensor, ...] | None,
+) -> None:
+    if not _compat_cudagraph_enabled():
+        _sparse_mla_decode_compat_eager(
+            q=q,
+            swa_cache=swa_cache,
+            swa_indices=swa_indices,
+            topk_indices=topk_indices,
+            sm_scale=sm_scale,
+            d_v=d_v,
+            out=out,
+            workspace=workspace,
+        )
+        return
+
+    try:
+        probe = getattr(torch.cuda, "is_current_stream_capturing", None)
+        capture_active = bool(probe()) if probe is not None else True
+    except Exception as exc:
+        raise RuntimeError(
+            "sparse MLA compatibility CUDA graph capture status is unavailable"
+        ) from exc
+    if capture_active:
+        raise RuntimeError("sparse MLA compatibility CUDA graph capture cannot nest")
+
+    tokens, heads, head_dim = q.shape
+    swa_width = swa_indices.shape[2]
+    topk_width = topk_indices.shape[2] if topk_indices is not None else 0
+    resolved_workspace = _compat_workspace(
+        q,
+        tokens,
+        heads,
+        topk_width + swa_width,
+        d_v,
+        head_dim,
+        workspace,
+    )
+    key = _compat_cudagraph_key(
+        q,
+        swa_cache,
+        swa_indices,
+        topk_indices,
+        out,
+        resolved_workspace,
+        sm_scale,
+        d_v,
+    )
+    graph = _COMPAT_CUDAGRAPHS.get(key)
+    global _LAST_COMPAT_WORKSPACE
+    _LAST_COMPAT_WORKSPACE = resolved_workspace
+    if graph is not None:
+        graph.replay()
+        return
+
+    _sparse_mla_decode_compat_eager(
+        q=q,
+        swa_cache=swa_cache,
+        swa_indices=swa_indices,
+        topk_indices=topk_indices,
+        sm_scale=sm_scale,
+        d_v=d_v,
+        out=out,
+        workspace=resolved_workspace,
+    )
+    stream = torch.cuda.current_stream(q.device)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, pool=_compat_graph_pool()):
+        _sparse_mla_decode_compat_eager(
+            q=q,
+            swa_cache=swa_cache,
+            swa_indices=swa_indices,
+            topk_indices=topk_indices,
+            sm_scale=sm_scale,
+            d_v=d_v,
+            out=out,
+            workspace=resolved_workspace,
+        )
+    _COMPAT_CUDAGRAPHS[key] = graph
 
 
 def sparse_mla_decode_compat_workspace() -> tuple[torch.Tensor, ...] | None:
@@ -791,4 +947,5 @@ __all__ = [
     "SPARSE_MLA_DECODE_MODE",
     "sparse_mla_decode",
     "sparse_mla_decode_compat_workspace",
+    "sparse_mla_decode_compat_cudagraph_clear_cache",
 ]
