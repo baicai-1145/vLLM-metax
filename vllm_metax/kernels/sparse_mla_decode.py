@@ -271,16 +271,42 @@ def _sparse_mla_cast_q_kernel(src, dst, tokens, heads, head_dim,
 
 
 @triton.jit
-def _sparse_mla_scale_mask_kernel(logits, indices, tokens, heads, width,
-                                  scale, stride_lt, stride_lh, stride_lk,
-                                  stride_it, stride_ik,
-                                  BLOCK_K: tl.constexpr):
+def _sparse_mla_scale_mask_kernel(
+    logits,
+    topk_indices,
+    swa_indices,
+    tokens,
+    heads,
+    topk_width,
+    swa_width,
+    scale,
+    stride_lt,
+    stride_lh,
+    stride_lk,
+    stride_topk_it,
+    stride_topk_ik,
+    stride_swa_it,
+    stride_swa_ik,
+    BLOCK_K: tl.constexpr,
+):
     token = tl.program_id(0)
     head = tl.program_id(1)
     k = tl.arange(0, BLOCK_K)
-    active = (token < tokens) & (head < heads) & (k < width)
-    index = tl.load(indices + token * stride_it + k * stride_ik,
-                    mask=(token < tokens) & (k < width), other=-1)
+    topk_position = k < topk_width
+    swa_position = (k >= topk_width) & (k < topk_width + swa_width)
+    topk_index = tl.load(
+        topk_indices + token * stride_topk_it + k * stride_topk_ik,
+        mask=(token < tokens) & topk_position,
+        other=-1,
+    )
+    swa_k = tl.maximum(k - topk_width, 0)
+    swa_index = tl.load(
+        swa_indices + token * stride_swa_it + swa_k * stride_swa_ik,
+        mask=(token < tokens) & swa_position,
+        other=-1,
+    )
+    index = tl.where(topk_position, topk_index, swa_index)
+    active = (token < tokens) & (head < heads) & (k < topk_width + swa_width)
     value = tl.load(logits + token * stride_lt + head * stride_lh + k * stride_lk,
                     mask=active, other=0.0)
     value = tl.where(index >= 0, value * scale, float("-inf"))
@@ -579,6 +605,7 @@ def _compat_workspace(
 def _sparse_mla_decode_compat_eager(
     q: torch.Tensor,
     swa_cache: torch.Tensor,
+    compressed_cache: torch.Tensor | None,
     swa_indices: torch.Tensor,
     topk_indices: torch.Tensor | None,
     sm_scale: float,
@@ -589,6 +616,10 @@ def _sparse_mla_decode_compat_eager(
     global _LAST_COMPAT_WORKSPACE
     tokens, heads, head_dim = q.shape
     swa_cache, swa_blocks, swb, swt, swd = _cache_layout(swa_cache, "swa_cache")
+    comp_cache, comp_blocks, cmb, cmt, cmd = _cache_layout(
+        compressed_cache if compressed_cache is not None else swa_cache,
+        "compressed_cache",
+    )
     topk = topk_indices if topk_indices is not None else swa_indices
     swa_width = swa_indices.shape[2]
     topk_width = topk_indices.shape[2] if topk_indices is not None else 0
@@ -599,8 +630,8 @@ def _sparse_mla_decode_compat_eager(
     _LAST_COMPAT_WORKSPACE = (probs, values, transposed, gemm_out, q_fp32)
     if topk_width:
         _sparse_mla_gather_values_kernel[(tokens, topk_width)](
-            swa_cache, topk, values, tokens, topk_width, 0, d_v, swa_blocks,
-            swa_cache.shape[1], swb, swt, swd, topk.stride(0), topk.stride(2),
+            comp_cache, topk, values, tokens, topk_width, 0, d_v, comp_blocks,
+            comp_cache.shape[1], cmb, cmt, cmd, topk.stride(0), topk.stride(2),
             values.stride(0), values.stride(1), values.stride(2),
             BLOCK_DV=triton.next_power_of_2(d_v), num_warps=4, num_stages=2,
         )
@@ -628,9 +659,17 @@ def _sparse_mla_decode_compat_eager(
     for token in range(tokens):
         gemm_op(q_fp32[token].reshape(heads, head_dim), values[token], probs[token])
     _sparse_mla_scale_mask_kernel[(tokens, heads)](
-        probs, topk, tokens, heads, k, float(sm_scale),
+        probs,
+        topk,
+        swa_indices,
+        tokens,
+        heads,
+        topk_width,
+        swa_width,
+        float(sm_scale),
         probs.stride(0), probs.stride(1), probs.stride(2),
         topk.stride(0), topk.stride(2),
+        swa_indices.stride(0), swa_indices.stride(2),
         BLOCK_K=triton.next_power_of_2(k), num_warps=4, num_stages=2,
     )
     _softmax_fp32_out_op()(probs.view(tokens * heads, k),
@@ -676,6 +715,7 @@ def _compat_tensor_key(tensor: torch.Tensor | None) -> tuple:
 def _compat_cudagraph_key(
     q: torch.Tensor,
     swa_cache: torch.Tensor,
+    compressed_cache: torch.Tensor | None,
     swa_indices: torch.Tensor,
     topk_indices: torch.Tensor | None,
     out: torch.Tensor,
@@ -688,6 +728,7 @@ def _compat_cudagraph_key(
     return (
         _compat_tensor_key(q),
         _compat_tensor_key(swa_cache),
+        _compat_tensor_key(compressed_cache),
         _compat_tensor_key(swa_indices),
         _compat_tensor_key(topk_indices),
         _compat_tensor_key(out),
@@ -709,6 +750,7 @@ def sparse_mla_decode_compat_cudagraph_clear_cache() -> None:
 def _sparse_mla_decode_compat(
     q: torch.Tensor,
     swa_cache: torch.Tensor,
+    compressed_cache: torch.Tensor | None,
     swa_indices: torch.Tensor,
     topk_indices: torch.Tensor | None,
     sm_scale: float,
@@ -716,10 +758,16 @@ def _sparse_mla_decode_compat(
     out: torch.Tensor,
     workspace: tuple[torch.Tensor, ...] | None,
 ) -> None:
+    if topk_indices is not None:
+        if compressed_cache is None:
+            raise ValueError("topk_indices require compressed_cache")
+        if compressed_cache.dtype != torch.bfloat16 or compressed_cache.device != q.device:
+            raise ValueError("compressed_cache must be BF16 on q's device")
     if not _compat_cudagraph_enabled():
         _sparse_mla_decode_compat_eager(
             q=q,
             swa_cache=swa_cache,
+            compressed_cache=compressed_cache,
             swa_indices=swa_indices,
             topk_indices=topk_indices,
             sm_scale=sm_scale,
@@ -754,6 +802,7 @@ def _sparse_mla_decode_compat(
     key = _compat_cudagraph_key(
         q,
         swa_cache,
+        compressed_cache,
         swa_indices,
         topk_indices,
         out,
@@ -771,6 +820,7 @@ def _sparse_mla_decode_compat(
     _sparse_mla_decode_compat_eager(
         q=q,
         swa_cache=swa_cache,
+        compressed_cache=compressed_cache,
         swa_indices=swa_indices,
         topk_indices=topk_indices,
         sm_scale=sm_scale,
@@ -785,6 +835,7 @@ def _sparse_mla_decode_compat(
         _sparse_mla_decode_compat_eager(
             q=q,
             swa_cache=swa_cache,
+            compressed_cache=compressed_cache,
             swa_indices=swa_indices,
             topk_indices=topk_indices,
             sm_scale=sm_scale,
@@ -870,9 +921,15 @@ def sparse_mla_decode(
     elif out.shape != (tokens, heads, d_v) or out.dtype != torch.bfloat16 or out.device != q.device:
         raise ValueError("out must have shape [tokens, heads, d_v], BF16 dtype, and q's device")
     if compatibility_mode:
+        if topk_indices is not None:
+            if compressed_cache is None:
+                raise ValueError("topk_indices require compressed_cache")
+            if compressed_cache.dtype != torch.bfloat16 or compressed_cache.device != q.device:
+                raise ValueError("compressed_cache must be BF16 on q's device")
         _sparse_mla_decode_compat(
             q=q,
             swa_cache=swa_cache,
+            compressed_cache=compressed_cache,
             swa_indices=swa_indices,
             topk_indices=topk_indices,
             sm_scale=sm_scale,

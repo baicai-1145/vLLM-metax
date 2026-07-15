@@ -14,12 +14,14 @@ from vllm.logger import init_logger
 from .attention import MacaDeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import (
     combine_topk_swa_indices,
-    compute_global_topk_indices_and_lens,
 )
 from .ops.o_proj import (
     deep_gemm_bf16_o_proj,
 )
-from .ops import gather_k_cache
+from .ops import (
+    compute_global_topk_indices_and_lens_bounded,
+    gather_k_cache,
+)
 from .sparse_mla import (
     MacaDeepseekV4FlashMLABackend,
 )
@@ -184,6 +186,7 @@ def _sparse_mla_decode_diff_dump(
     call: int,
     q_raw: torch.Tensor,
     swa_cache_physical: torch.Tensor,
+    compressed_cache: torch.Tensor | None,
     swa_indices: torch.Tensor,
     topk_indices: torch.Tensor | None,
     native_output: torch.Tensor,
@@ -208,6 +211,7 @@ def _sparse_mla_decode_diff_dump(
         tensors = {
             "q_raw": q_raw,
             "swa_cache_physical": swa_cache_physical,
+            "compressed_cache": compressed_cache,
             "swa_indices": swa_indices,
             "topk_indices": topk_indices,
             "native_output": native_output,
@@ -273,6 +277,7 @@ def _maybe_diff_sparse_mla_decode(
     q_raw: torch.Tensor | None = None,
     swa_cache_physical: torch.Tensor | None = None,
     backend: str = "native",
+    compressed_cache: torch.Tensor | None = None,
 ) -> None:
     """Compare native output with Torch without changing the native result."""
     global _sparse_mla_decode_diff_call_count
@@ -289,6 +294,7 @@ def _maybe_diff_sparse_mla_decode(
     reference_probs, reference_fp32_output = attention._torch_sparse_decode(
         q=q,
         swa_cache=swa_cache,
+        compressed_cache=compressed_cache,
         swa_indices=swa_indices,
         topk_indices=topk_indices,
         output=reference_output,
@@ -313,6 +319,7 @@ def _maybe_diff_sparse_mla_decode(
             swa_cache_physical=(
                 swa_cache_physical if swa_cache_physical is not None else swa_cache
             ),
+            compressed_cache=compressed_cache,
             swa_indices=swa_indices,
             topk_indices=topk_indices,
             native_output=native_output,
@@ -399,6 +406,7 @@ class MacaDeepseekV4FlashMLAAttention(MacaDeepseekV4Attention):
         topk_indices: torch.Tensor | None,
         output: torch.Tensor,
         scale: float,
+        compressed_cache: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         q2 = q.squeeze(1).float()
         batch = q2.shape[0]
@@ -406,21 +414,34 @@ class MacaDeepseekV4FlashMLAAttention(MacaDeepseekV4Attention):
         head_dim = q2.shape[2]
         value_dim = output.shape[-1]
 
-        combined = swa_indices[:, 0, :]
-        if topk_indices is not None:
-            combined = torch.cat([topk_indices[:, 0, :], combined], dim=-1)
+        if topk_indices is not None and compressed_cache is None:
+            raise ValueError("topk_indices require compressed_cache")
 
-        invalid = combined < 0
-        gather_idx = combined.masked_fill(invalid, 0)
-        flat_idx = gather_idx.reshape(-1)
-        cache_block_size = swa_cache.shape[1]
-        # The paged cache has padded block strides. Gather selected rows before
-        # converting to FP32 instead of materializing the entire KV pool.
-        block_idx = torch.div(flat_idx, cache_block_size, rounding_mode="floor")
-        block_offset = torch.remainder(flat_idx, cache_block_size)
-        gathered = swa_cache[block_idx, block_offset, 0].view(
-            batch, -1, head_dim
-        ).float()
+        def gather(cache: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+            invalid = indices < 0
+            gather_idx = indices.masked_fill(invalid, 0)
+            flat_idx = gather_idx.reshape(-1)
+            cache_block_size = cache.shape[1]
+            # The paged cache has padded block strides. Gather selected rows
+            # before converting to FP32 instead of materializing the KV pool.
+            block_idx = torch.div(flat_idx, cache_block_size, rounding_mode="floor")
+            block_offset = torch.remainder(flat_idx, cache_block_size)
+            return cache[block_idx, block_offset, 0].view(
+                batch, -1, head_dim
+            ).float()
+
+        swa_selected = swa_indices[:, 0, :]
+        swa_invalid = swa_selected < 0
+        swa_gathered = gather(swa_cache, swa_selected)
+        if topk_indices is not None:
+            topk_selected = topk_indices[:, 0, :]
+            topk_invalid = topk_selected < 0
+            topk_gathered = gather(compressed_cache, topk_selected)
+            gathered = torch.cat([topk_gathered, swa_gathered], dim=1)
+            invalid = torch.cat([topk_invalid, swa_invalid], dim=1)
+        else:
+            gathered = swa_gathered
+            invalid = swa_invalid
 
         attn = torch.matmul(q2, gathered.transpose(1, 2))
         attn.masked_fill_(invalid.unsqueeze(1), float("-inf"))
@@ -556,12 +577,18 @@ class MacaDeepseekV4FlashMLAAttention(MacaDeepseekV4Attention):
             if self.compress_ratio == 4:
                 # C4A: local indices differ per layer (filled by Indexer).
                 assert self.topk_indices_buffer is not None
-                global_indices, topk_lens = compute_global_topk_indices_and_lens(
-                    self.topk_indices_buffer[:num_decode_tokens],
-                    swa_metadata.token_to_req_indices,
-                    attn_metadata.block_table[:num_decodes],
-                    block_size,
-                    is_valid,
+                assert swa_metadata.seq_lens is not None
+                assert swa_metadata.token_to_req_indices is not None
+                global_indices, topk_lens = (
+                    compute_global_topk_indices_and_lens_bounded(
+                        self.topk_indices_buffer[:num_decode_tokens],
+                        swa_metadata.token_to_req_indices,
+                        swa_metadata.seq_lens,
+                        attn_metadata.block_table[:num_decodes],
+                        block_size,
+                        self.compress_ratio,
+                        is_valid,
+                    )
                 )
                 topk_indices = global_indices.view(num_decode_tokens, 1, -1)
             else:
@@ -608,6 +635,7 @@ class MacaDeepseekV4FlashMLAAttention(MacaDeepseekV4Attention):
             self._torch_sparse_decode(
                 q=q,
                 swa_cache=swa_cache,
+                compressed_cache=kv_cache,
                 swa_indices=swa_indices,
                 topk_indices=topk_indices,
                 output=output,
@@ -650,6 +678,7 @@ class MacaDeepseekV4FlashMLAAttention(MacaDeepseekV4Attention):
                     attention=self,
                     q=q,
                     swa_cache=swa_cache,
+                    compressed_cache=kv_cache,
                     swa_indices=swa_indices,
                     topk_indices=topk_indices,
                     output=output,

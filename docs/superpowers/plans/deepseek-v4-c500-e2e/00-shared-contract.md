@@ -132,6 +132,75 @@ benchmark-runner 的端到端结果。
 - profiler 表的父子行和多 stream 时间不能相加；同时报告 wall time。
 - C500 的 BF16/TF32/INT4 峰值、HBM 带宽和互联规格缺少权威公开数据，禁止猜测。
 
+## 真实问答质量门禁
+
+短算术、常识、中文解释和代码生成 smoke 只能证明基础语义路径可用，不能证明
+checkpoint 达到其参数规模应有的质量。真实问答必须使用可复现数据集并保留逐题
+原始输出、token IDs、停止原因、解析答案和数据 SHA256。
+
+当前 GSM8K 数据冻结为 OpenAI `grade-school-math` 官方仓库文件：
+
+- train：7473 行，SHA256
+  `17f347dc51477c50d4efb83959dbb7c56297aba886e5544ee2aaed3024813465`；
+- test：1319 行，SHA256
+  `3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14`。
+
+永久评测器为 `tools/debug/evaluate_deepseek_v4_quality.py`。任何结果至少记录
+checkpoint、git HEAD/dirty、TP、MTP、graph、Plan02 环境、prefix cache、seed、
+shot、batch、最大输出、数据哈希和每题 raw output/token IDs。eval 期间统计的 TPS
+不是 normal serving TPS。
+
+在建立同 checkpoint 的 A100 同口径准确率前，不凭社区百分比设 C500 绝对通过线；
+首先要求 C500 与 A100 使用完全相同 prompt protocol，并满足以下稳定性条件：
+
+1. TP=4、MTP=0、PIECEWISE 下无 crash、非法访问、空输出或异常 token `0` 尾巴；
+2. batch=2 中一个请求先结束后，剩余请求的 token IDs 必须与 fresh 单请求一致；
+3. 标准 few-shot completion 只在该 checkpoint 的 A100 路径也验证兼容后计入质量分；
+4. 任何 fallback、eager 或 backend-off 对照只作诊断，不计入 acceptance。
+
+2026-07-15 的首次真实门禁为严格 RED：seed42 20 题、5-shot、batch=1（同一引擎的
+20 次连续调用）、`max_tokens=256` 得到 `0/20`、invalid `19/20`，全部以 length
+结束；该分数受运行时状态污染，不能当作 20 个独立 GSM8K 观测。0-shot 最小复现
+进一步发现 batch 内第二请求在第一个请求结束边界后连续生成 token ID `0`。完整
+决定见 `.logs/deepseek_v4_flash_quality_eval_20260715/gsm8k_quality_decision.md`。
+
+2026-07-16 已修复四个原生路径缺陷：Sparse MLA scale-mask 越界读取、C4 indexer
+未屏蔽超出有效压缩长度的 local top-k、compatibility 路径从 SWA cache 读取 top-k
+值，以及 BF16 compressor 将 512 行 stride 错用为 packed 576 stride。TP=4、MTP=0、
+PIECEWISE、Plan02 exact-on 的 250-token prompt 加 32-token decode 边界门禁为 32/32
+非零，positions 256--266 四 rank hidden/logits 均 finite，无 fallback。证据见
+`.logs/deepseek_v4_flash_quality_eval_20260716/boundary_250_final_stride_postfix/`。
+
+同 prompt 的三题 fresh-engine non-thinking QA 在冻结 `max_tokens=256` 规则下仍为
+`1/3`：事实题正确；数学和代码推理均正确推进，但在给出最终答案前触及 length，且
+三题都没有 token ID `0`。保持 prompt 不变、仅将上限扩到 512 的补充验证为 `2/2`：
+数学题完整得到 `960 liters`，代码题精确给出
+`[2, 1, 3, 2] [2, 3, 6, 8] [12, 16]`，两题均 `finish_reason=stop`。证据见
+`.logs/deepseek_v4_flash_quality_eval_20260716/real_qa_final_postfix/` 和
+`.logs/deepseek_v4_flash_quality_eval_20260716/real_qa_extended_512_postfix/`。该补充
+结果证明 fresh-engine 真实问答不再数值退化，但该三题本身不替代冻结的 256-token
+评分、完整 GSM8K 或动态 batch 一致性，因此不得据此宣称完整模型质量已验收。混合预算
+`3/3` 语义问答综合结论见
+`.logs/deepseek_v4_flash_quality_eval_20260716/real_qa_completed_postfix/`。
+
+同日将正常 native logits 的 GSM8K 扩到 seed42 100 题、5-shot、`max_tokens=512`。
+batch=1 canonical 分数为 `93/100`，batch=2 为 `94/100`；人工复核公开错误标签和
+歧义题后为 `96/100`、`97/100`。两次运行均无 invalid、length、token ID `0` 或
+runtime failure。官方 DeepSeek-V4-Flash Base 公布的 GSM8K 为 `90.8`（8-shot，
+FP4/FP8 mixed，不是本地 W4A16 checkpoint），只能作为量级参考，不能替代同 checkpoint
+A100 oracle。证据见
+`.logs/deepseek_v4_flash_quality_eval_20260716/gsm8k_seed42_100_postfix/`。
+
+动态 batch 精确门禁仍为 RED：100 题中 token IDs 仅 `17/100` 完全一致，解析答案
+`92/100` 一致，correctness state `93/100` 一致；batch=2 修复四个 batch=1 推理错误，
+同时引入三个不同错误。强制 FP32 logits 没有提高 batch=1 准确率，并使 batch=2 从
+`19/20` 降为 `18/20`，因此不得推广。Sparse MLA Torch reference 可消除 Tom 两题
+最小复现的 token 分叉，但四组 native/reference GPU 差分仅发现 layer0 C1 的可重复
+BF16 舍入差 `7.629e-6`；probabilities 与 cache gather exact、无 NaN/Inf，且未覆盖后续
+分叉 token，结论仍为 inconclusive。差分证据见
+`.logs/deepseek_v4_flash_quality_eval_20260716/sparse_batch_differential/`。在同 checkpoint
+A100 对照或确定性修复完成前，不得宣称动态 batch exact-token gate 已通过。
+
 ## 会话结束模板
 
 ```text

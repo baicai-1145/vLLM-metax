@@ -70,11 +70,13 @@ class _FakeCuda:
 def call_args():
     q = torch.empty((1, 1, 2), dtype=torch.bfloat16)
     cache = torch.empty((1, 2, 2), dtype=torch.bfloat16)
+    compressed_cache = torch.empty((1, 2, 2), dtype=torch.bfloat16)
     swa_indices = torch.zeros((1, 1, 1), dtype=torch.int32)
     out = torch.empty((1, 1, 2), dtype=torch.bfloat16)
     return dict(
         q=q,
         swa_cache=cache,
+        compressed_cache=compressed_cache,
         swa_indices=swa_indices,
         topk_indices=None,
         sm_scale=0.5,
@@ -117,6 +119,19 @@ def test_compat_cudagraph_is_disabled_by_default(monkeypatch, call_args):
     assert cuda.capture_calls == 0
 
 
+def test_compat_topk_requires_bf16_compressed_cache(monkeypatch, call_args):
+    _cuda, _calls = _install_fakes(monkeypatch)
+    call_args["topk_indices"] = torch.zeros((1, 1, 1), dtype=torch.int32)
+    call_args["compressed_cache"] = None
+
+    with pytest.raises(ValueError, match="compressed_cache"):
+        sparse._sparse_mla_decode_compat(**call_args)
+
+    call_args["compressed_cache"] = torch.empty((1, 2, 2), dtype=torch.float32)
+    with pytest.raises(ValueError, match="BF16"):
+        sparse._sparse_mla_decode_compat(**call_args)
+
+
 def test_compat_cudagraph_warmup_capture_then_replay(monkeypatch, call_args):
     cuda, calls = _install_fakes(monkeypatch)
     monkeypatch.setenv("VLLM_METAX_SPARSE_MLA_COMPAT_CUDAGRAPH", "1")
@@ -137,6 +152,20 @@ def test_compat_cudagraph_pointer_change_builds_new_entry(monkeypatch, call_args
 
     sparse._sparse_mla_decode_compat(**call_args)
     changed = dict(call_args, q=call_args["q"].clone())
+    sparse._sparse_mla_decode_compat(**changed)
+
+    assert len(calls) == 4
+    assert cuda.capture_calls == 2
+
+
+def test_compat_cudagraph_compressed_pointer_change_builds_new_entry(
+    monkeypatch, call_args
+):
+    cuda, calls = _install_fakes(monkeypatch)
+    monkeypatch.setenv("VLLM_METAX_SPARSE_MLA_COMPAT_CUDAGRAPH", "1")
+
+    sparse._sparse_mla_decode_compat(**call_args)
+    changed = dict(call_args, compressed_cache=call_args["compressed_cache"].clone())
     sparse._sparse_mla_decode_compat(**changed)
 
     assert len(calls) == 4

@@ -8,7 +8,10 @@ from types import SimpleNamespace
 from torch.utils._python_dispatch import TorchDispatchMode
 
 import vllm_metax.models.deepseek_v4.flashmla as flashmla
-from vllm_metax.kernels.sparse_mla_decode import sparse_mla_decode
+from vllm_metax.kernels.sparse_mla_decode import (
+    _sparse_mla_scale_mask_kernel,
+    sparse_mla_decode,
+)
 from vllm_metax.models.deepseek_v4.flashmla import (
     MacaDeepseekV4FlashMLAAttention,
 )
@@ -73,6 +76,102 @@ def test_torch_sparse_decode_converts_only_selected_cache_rows() -> None:
     selected_cache_numel = indices.numel() * head_dim
     assert max(recorder.input_numels) <= selected_cache_numel
     torch.testing.assert_close(output, expected, atol=0, rtol=0)
+
+
+def test_torch_sparse_decode_uses_separate_compressed_and_swa_caches() -> None:
+    q = torch.tensor([[[[1.0, 0.0]]]], dtype=torch.bfloat16)
+    swa_cache = torch.tensor(
+        [[[[10.0, 0.0]], [[20.0, 0.0]]]], dtype=torch.bfloat16
+    )
+    compressed_cache = torch.tensor(
+        [[[[30.0, 0.0]], [[40.0, 0.0]]]], dtype=torch.bfloat16
+    )
+    topk_indices = torch.tensor([[[0]]], dtype=torch.int32)
+    swa_indices = torch.tensor([[[1]]], dtype=torch.int32)
+    output = torch.empty((1, 1, 2), dtype=torch.bfloat16)
+
+    MacaDeepseekV4FlashMLAAttention._torch_sparse_decode(
+        q=q,
+        swa_cache=swa_cache,
+        compressed_cache=compressed_cache,
+        swa_indices=swa_indices,
+        topk_indices=topk_indices,
+        output=output,
+        scale=1.0,
+    )
+
+    # The first selected row is top-k and must come from compressed_cache;
+    # changing the same physical row in swa_cache must not affect it.
+    expected = torch.tensor([[[30.0, 0.0]]], dtype=torch.bfloat16)
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)
+
+    polluted_swa = swa_cache.clone()
+    polluted_swa[0, 0, 0].fill_(300.0)
+    polluted = torch.empty_like(output)
+    MacaDeepseekV4FlashMLAAttention._torch_sparse_decode(
+        q=q,
+        swa_cache=polluted_swa,
+        compressed_cache=compressed_cache,
+        swa_indices=swa_indices,
+        topk_indices=topk_indices,
+        output=polluted,
+        scale=1.0,
+    )
+    torch.testing.assert_close(polluted, output, atol=0, rtol=0)
+
+
+def test_torch_sparse_decode_requires_compressed_cache_for_topk() -> None:
+    with pytest.raises(ValueError, match="compressed_cache"):
+        MacaDeepseekV4FlashMLAAttention._torch_sparse_decode(
+            q=torch.ones((1, 1, 1, 2), dtype=torch.bfloat16),
+            swa_cache=torch.ones((1, 1, 1, 2), dtype=torch.bfloat16),
+            swa_indices=torch.zeros((1, 1, 1), dtype=torch.int32),
+            topk_indices=torch.zeros((1, 1, 1), dtype=torch.int32),
+            output=torch.empty((1, 1, 2), dtype=torch.bfloat16),
+            scale=1.0,
+        )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="native sparse MLA decode requires a MetaX CUDA-compatible device",
+)
+def test_sparse_mla_scale_mask_uses_swa_indices_after_topk_view() -> None:
+    device = torch.device("cuda")
+    # Keep positive sentinels after the narrow top-k view.  A combined-index
+    # kernel that reads past topk_indices will treat these as valid SWA rows.
+    topk_storage = torch.tensor(
+        [[[7, 1, 101, 102, 103]]], device=device, dtype=torch.int32
+    )
+    topk_indices = topk_storage[..., :2]
+    swa_indices = torch.tensor([[[0, -1, 2]]], device=device, dtype=torch.int32)
+    logits = torch.ones((1, 1, 5), device=device, dtype=torch.float32)
+
+    _sparse_mla_scale_mask_kernel[(1, 1)](
+        logits,
+        topk_indices,
+        swa_indices,
+        1,
+        1,
+        2,
+        3,
+        2.0,
+        logits.stride(0),
+        logits.stride(1),
+        logits.stride(2),
+        topk_indices.stride(0),
+        topk_indices.stride(2),
+        swa_indices.stride(0),
+        swa_indices.stride(2),
+        BLOCK_K=8,
+        num_warps=1,
+    )
+
+    expected = torch.tensor(
+        [[[2.0, 2.0, 2.0, float("-inf"), 2.0]]],
+        device=device,
+    )
+    torch.testing.assert_close(logits, expected, atol=0, rtol=0)
 
 
 def test_sparse_mla_decode_backend_defaults_to_native(monkeypatch) -> None:
@@ -413,6 +512,7 @@ def test_native_sparse_decode_compat_matches_torch_fixed_softmax() -> None:
     MacaDeepseekV4FlashMLAAttention._torch_sparse_decode(
         q=q.unsqueeze(1),
         swa_cache=swa_cache,
+        compressed_cache=compressed_cache,
         swa_indices=swa_indices,
         topk_indices=topk_indices,
         output=expected,

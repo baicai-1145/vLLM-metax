@@ -40,6 +40,25 @@ def compress_norm_rope_store_triton(
         kernel = _fused_kv_compress_norm_rope_insert_indexer_attn_int8
         num_warps = 1
 
+    constexpr_kwargs = dict(
+        HEAD_SIZE=head_dim,
+        TRITON_BLOCK_SIZE=triton.next_power_of_2(head_dim),
+        STATE_WIDTH=state_width,
+        COMPRESS_RATIO=compress_ratio,
+        OVERLAP=overlap,
+        ROPE_HEAD_DIM=rope_head_dim,
+        INT8_MAX=127.0,
+        QUANT_BLOCK=quant_block,
+        TOKEN_STRIDE=token_stride,
+        SCALE_DIM=scale_dim,
+        KV_BLOCK_STRIDE=kv_cache.stride(0),
+    )
+    if head_dim == 512:
+        # BF16 cache rows are laid out with the actual tensor stride.  The
+        # upstream TOKEN_STRIDE describes the packed indexer layout and is
+        # intentionally retained for the INT8 path below.
+        constexpr_kwargs["KV_TOKEN_STRIDE"] = kv_cache.stride(1)
+
     kernel[(num_actual,)](
         # state cache
         state_cache,
@@ -63,17 +82,7 @@ def compress_norm_rope_store_triton(
         k_cache_metadata.slot_mapping,
         kv_cache.shape[1],  # paged KV cache block size (tokens per block)
         # constexprs
-        HEAD_SIZE=head_dim,
-        TRITON_BLOCK_SIZE=triton.next_power_of_2(head_dim),
-        STATE_WIDTH=state_width,
-        COMPRESS_RATIO=compress_ratio,
-        OVERLAP=overlap,
-        ROPE_HEAD_DIM=rope_head_dim,
-        INT8_MAX=127.0,
-        QUANT_BLOCK=quant_block,
-        TOKEN_STRIDE=token_stride,
-        SCALE_DIM=scale_dim,
-        KV_BLOCK_STRIDE=kv_cache.stride(0),
+        **constexpr_kwargs,
         num_warps=num_warps,
         **pdl_kwargs,
     )
@@ -276,6 +285,7 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn_bf16(
     INT8_MAX: tl.constexpr,  # 127.0
     QUANT_BLOCK: tl.constexpr,  # 64 for DeepseekV4
     TOKEN_STRIDE: tl.constexpr,  # Physical bytes per token
+    KV_TOKEN_STRIDE: tl.constexpr,  # Actual BF16 cache row stride
     SCALE_DIM: tl.constexpr,  # Bytes per token for scales
     KV_BLOCK_STRIDE: tl.constexpr,
 ):
@@ -358,7 +368,7 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn_bf16(
 
     # Store directly as bf16 (no quantization)
     cache_block_ptr = k_cache_ptr + kv_block_idx.to(tl.int64) * KV_BLOCK_STRIDE
-    bf16_ptr = cache_block_ptr + kv_pos_in_block * TOKEN_STRIDE
+    bf16_ptr = cache_block_ptr + kv_pos_in_block * KV_TOKEN_STRIDE
     bf16_ptr = bf16_ptr.to(tl.pointer_type(tl.bfloat16))
 
     NOPE_HEAD_DIM: tl.constexpr = HEAD_SIZE - ROPE_HEAD_DIM  # 448

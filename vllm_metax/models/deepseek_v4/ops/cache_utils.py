@@ -10,6 +10,9 @@ def _gather_k_cache_kernel(
     out_stride0: tl.constexpr,
     out_stride1: tl.constexpr,
     k_cache_ptr,
+    k_cache_stride0: tl.constexpr,
+    k_cache_stride1: tl.constexpr,
+    k_cache_stride2: tl.constexpr,
     seq_lens_ptr,
     block_table_ptr,
     offset: tl.constexpr,
@@ -51,9 +54,9 @@ def _gather_k_cache_kernel(
         # [num_blocks, cache_block_size, head_size]
         k_ptr = (
             k_cache_ptr
-            + physical_block_idx.to(tl.int64) * cache_block_size * head_size
-            + pos_in_block * head_size
-            + dim_offsets
+            + physical_block_idx.to(tl.int64) * k_cache_stride0
+            + pos_in_block * k_cache_stride1
+            + dim_offsets * k_cache_stride2
         )
 
         out_ptr_cur = (
@@ -98,6 +101,9 @@ def gather_k_cache(
         out.stride(0),
         out.stride(1),
         k_cache,
+        k_cache.stride(0),
+        k_cache.stride(1),
+        k_cache.stride(2),
         seq_lens,
         block_table,
         offset,
@@ -107,3 +113,100 @@ def gather_k_cache(
         head_size=head_size,
         BLOCK_D=BLOCK_D,
     )
+
+
+def compute_global_topk_indices_and_lens_bounded(
+    topk_indices: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    compress_ratio: int,
+    is_valid_token: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map C4 local top-k indices, rejecting unmaterialized cache rows.
+
+    The indexer buffer is sized for the maximum model length, while a request
+    may have only a prefix of its compressed cache materialized.  Bounds are
+    therefore derived per token from its request sequence length rather than
+    from the block table capacity.
+    """
+    num_tokens = topk_indices.shape[0]
+    global_topk_indices = torch.empty_like(topk_indices)
+    topk_lens = torch.empty(
+        num_tokens, dtype=torch.int32, device=topk_indices.device
+    )
+    _compute_global_topk_indices_and_lens_bounded_kernel[(num_tokens,)](
+        global_topk_indices,
+        global_topk_indices.stride(0),
+        topk_lens,
+        topk_indices,
+        topk_indices.stride(0),
+        topk_indices.shape[-1],
+        token_to_req_indices,
+        seq_lens,
+        block_table,
+        block_table.stride(0),
+        block_size,
+        compress_ratio,
+        is_valid_token,
+        TRITON_BLOCK_SIZE=1024,
+    )
+    return global_topk_indices, topk_lens
+
+
+@triton.jit
+def _compute_global_topk_indices_and_lens_bounded_kernel(
+    global_topk_indices_ptr,
+    global_topk_indices_stride,
+    topk_lens_ptr,
+    topk_indices_ptr,
+    topk_indices_stride,
+    topk,
+    token_to_req_indices_ptr,
+    seq_lens_ptr,
+    block_table_ptr,
+    block_table_stride,
+    block_size,
+    compress_ratio,
+    is_valid_token_ptr,
+    TRITON_BLOCK_SIZE: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    token_is_valid = tl.load(is_valid_token_ptr + token_idx) != 0
+    req_idx = tl.load(token_to_req_indices_ptr + token_idx)
+    seq_len = tl.load(seq_lens_ptr + req_idx)
+    compressed_len = seq_len // compress_ratio
+
+    count = tl.zeros((), dtype=tl.int32)
+    for i in range(0, topk, TRITON_BLOCK_SIZE):
+        offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
+        mask = offset < topk
+        local_idx = tl.load(
+            topk_indices_ptr + token_idx * topk_indices_stride + offset,
+            mask=mask,
+            other=-1,
+        )
+        is_valid = (local_idx >= 0) & (local_idx < compressed_len)
+
+        # Keep invalid indices from forming an out-of-range block-table
+        # pointer.  The masked load guarantees no block-table read occurs for
+        # an invalid local index.
+        safe_local_idx = tl.where(is_valid, local_idx, 0)
+        block_indices = safe_local_idx // block_size
+        block_numbers = tl.load(
+            block_table_ptr + req_idx * block_table_stride + block_indices,
+            mask=mask & is_valid,
+            other=0,
+        )
+        block_offsets = safe_local_idx % block_size
+        slot_ids = block_numbers * block_size + block_offsets
+        slot_ids = tl.where(is_valid, slot_ids, -1)
+        tl.store(
+            global_topk_indices_ptr + token_idx * global_topk_indices_stride + offset,
+            slot_ids,
+            mask=mask,
+        )
+        count += tl.sum(is_valid.to(tl.int32), axis=0)
+
+    tl.store(topk_lens_ptr + token_idx, tl.where(token_is_valid, count, 0))

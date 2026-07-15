@@ -59,6 +59,49 @@ workaround 证据；1K prefill 参考为 `1321.61 input tok/s`、`0.774812 s`。
   hard fail，不得进入净吞吐比较；
 - TP=1 仅用于计算/通信归因。
 
+### 真实问答和动态 batch 正确性
+
+- 使用 `tools/debug/evaluate_deepseek_v4_quality.py` 保存逐题 JSON artifact；
+- GSM8K 数据哈希必须与 `00-shared-contract.md` 一致；
+- TP=4、MTP=0、PIECEWISE、Plan02 exact-on 下先跑固定 seed 的小样本，再扩到完整
+  数据集；eval TPS 不得作为 serving 性能；
+- 增加 batch=2 长短回答交错 gate：短请求先 stop 后，长请求必须与 fresh 单请求逐
+  token 一致，禁止出现 BOS/token ID `0` 填充尾巴；
+- 同一题分别以 fresh batch=1、连续 batch=1 和单次 batch=2 运行，任何输出分歧均为
+  correctness hard fail；
+- raw completion、官方 DeepSeek chat/non-thinking prompt 和 thinking prompt 必须分开
+  报告，不得把 prompt protocol 不兼容误记为模型准确率；
+- eager、Plan02 off、Torch reference 或其他 fallback 结果只用于定位，不得进入推广。
+
+当前状态（2026-07-16）：已修复 Sparse MLA scale-mask 越界、C4 local top-k 越界、
+compatibility top-k 读错 cache 和 BF16 compressor 行 stride 四个原生路径缺陷。
+TP=4、MTP=0、PIECEWISE、Plan02 exact-on 的 250+32 边界门禁为 32/32 非零，四 rank
+positions 256--266 hidden/logits finite，且无 fallback。证据位于
+`.logs/deepseek_v4_flash_quality_eval_20260716/boundary_250_final_stride_postfix/`。
+
+独立 fresh-engine chat/non-thinking 三题在冻结 `max_tokens=256` 评分下为 `1/3`：事实
+题通过，数学和代码题因输出上限截断而未出现最终答案，但不再出现 token ID `0` 或
+数值退化。同 prompt 的 512-token 补充运行使数学和代码均正常 stop，分别得到
+`960 liters` 和精确 stdout
+`[2, 1, 3, 2] [2, 3, 6, 8] [12, 16]`，为 `2/2`。证据位于
+`.logs/deepseek_v4_flash_quality_eval_20260716/real_qa_final_postfix/` 和
+`.logs/deepseek_v4_flash_quality_eval_20260716/real_qa_extended_512_postfix/`。补充运行
+不替代冻结的 256-token gate、完整 GSM8K 或动态 batch token 一致性。混合预算
+`3/3` 语义问答综合结论见
+`.logs/deepseek_v4_flash_quality_eval_20260716/real_qa_completed_postfix/`。
+
+正常 native logits 的 seed42 100 题 GSM8K 已重跑：batch=1 canonical/人工复核分数为
+`93%/96%`，batch=2 为 `94%/97%`，两路均无 invalid、length、token ID `0` 或 runtime
+failure。该结果达到官方公开 DeepSeek-V4-Flash Base `90.8` 的同一量级，但官方结果
+使用 8-shot FP4/FP8 mixed checkpoint，不能作为本地 W4A16 的 exact oracle。证据位于
+`.logs/deepseek_v4_flash_quality_eval_20260716/gsm8k_seed42_100_postfix/`。
+
+动态 batch token gate 仍失败：token exact `17/100`、解析答案一致 `92/100`、correctness
+一致 `93/100`。FP32 logits 使 20 题 batch=2 从 `19/20` 降至 `18/20`，已拒绝推广。
+Sparse MLA 四组 graph/eager、batch1/2 native/reference 差分只得到 layer0 C1
+`7.629e-6` BF16 舍入差，probabilities/cache gather exact 且无 NaN/Inf，尚不能归因
+后续答案分叉。集成推广继续被动态 batch 确定性和同 checkpoint A100 对照阻止。
+
 ## 性能归因表
 
 为每一阶段维护同一张表：

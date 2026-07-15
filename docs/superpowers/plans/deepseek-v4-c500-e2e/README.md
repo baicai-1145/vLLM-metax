@@ -33,6 +33,30 @@ decode-first，但 prefill 的 OOM blocker 要立即建立复现和修复门禁�
   `16.2325/16.0112 tok/s`，漂移 `-1.363%`；累计消融见
   [`2026-07-13-plan01-03-cumulative-ablation.md`](2026-07-13-plan01-03-cumulative-ablation.md)
 - 最新 1K prefill：`1321.61 input tok/s`、`0.774812 s`
+- 2026-07-16 已修复 Sparse MLA scale-mask 越界、C4 local top-k 越界、compatibility
+  top-k 读错 cache 和 BF16 compressor 行 stride 四个原生缺陷。TP=4、MTP=0、
+  PIECEWISE、Plan02 exact-on 的 250+32 边界门禁为 32/32 非零，四 rank positions
+  256--266 hidden/logits finite，无 fallback。证据见
+  `.logs/deepseek_v4_flash_quality_eval_20260716/boundary_250_final_stride_postfix/`。
+- 官方 non-thinking chat 三题在冻结 `max_tokens=256` 评分下仍为 `1/3`：事实题通过，
+  数学和代码题正确推进但被输出上限截断，三题均无 token ID `0`。相同 prompt 的
+  512-token 补充运行中，数学题完整得到 `960 liters`，代码题精确给出
+  `[2, 1, 3, 2] [2, 3, 6, 8] [12, 16]`，两题均正常 stop，结果为 `2/2`。证据见
+  `.logs/deepseek_v4_flash_quality_eval_20260716/real_qa_final_postfix/` 和
+  `.logs/deepseek_v4_flash_quality_eval_20260716/real_qa_extended_512_postfix/`。该三题
+  本身不替代完整 GSM8K 或动态 batch 一致性，不能据此宣称完整模型质量已验收。混合预算
+  `3/3` 语义问答综合结论见
+  `.logs/deepseek_v4_flash_quality_eval_20260716/real_qa_completed_postfix/`。
+- 正常 native logits 的 seed42 100 题 GSM8K 已完成：batch=1 canonical/人工复核为
+  `93%/96%`，batch=2 为 `94%/97%`，两路均无 invalid、length、token ID `0` 或
+  runtime failure，达到官方公开 DeepSeek-V4-Flash Base `90.8` 的同一量级。官方
+  使用 8-shot FP4/FP8 mixed checkpoint，不是本地 W4A16 exact oracle。证据见
+  `.logs/deepseek_v4_flash_quality_eval_20260716/gsm8k_seed42_100_postfix/`。
+- 动态 batch 确定性仍为 RED：100 题 token exact `17/100`、答案一致 `92/100`、
+  correctness 一致 `93/100`。强制 FP32 logits 会降低 batch=2 语义准确率，已拒绝
+  推广。Sparse MLA native/reference 差分只发现 layer0 C1 `7.629e-6` BF16 舍入差，
+  probabilities/cache gather exact、无 NaN/Inf，仍不足以解释后续答案分叉。证据见
+  `.logs/deepseek_v4_flash_quality_eval_20260716/sparse_batch_differential/`。
 - 最新 10K prefill：default `chunk=8192` 在
   `torch_flash_mla_sparse_prefill` 的 `torch.index_select` 尝试约 `10 GiB` 分配并
   OOM；`chunk=2048`、`GPU_MEM=0.8` 为 `1504.16 input tok/s`、median `6.648215 s`，
