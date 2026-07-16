@@ -742,6 +742,7 @@ _TILELANG_FUSED_STAGES = {
     ).split(",")
     if stage.strip()
 }
+_MHC_EXACT_PER_TOKEN_MAX_TOKENS = 16
 
 
 def _mhc_fused_post_pre_for_stage(stage: str, *args, **kwargs):
@@ -763,7 +764,8 @@ def _mhc_exact_post_pre_rms_for_stage(
     if not _mhc_exact_pre_rms_enabled():
         return None
     x = args[0]
-    if x.numel() // x.shape[-1] != 1:
+    num_tokens = x.numel() // x.shape[-1]
+    if num_tokens > _MHC_EXACT_PER_TOKEN_MAX_TOKENS:
         return None
     if get_mhc_backend_name() != "tilelang" or stage not in _TILELANG_FUSED_STAGES:
         raise RuntimeError(
@@ -853,7 +855,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             ),
             requires_grad=False,
         )
-        self._mhc_exact_workspace: dict[tuple[int, str], dict[str, torch.Tensor]] = {}
+        self._mhc_exact_workspace: dict[
+            tuple[int, str, int], dict[str, torch.Tensor]
+        ] = {}
 
     def forward(
         self,

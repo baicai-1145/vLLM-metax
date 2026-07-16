@@ -50,6 +50,39 @@ pymxsml = import_pymxsml()
 torch.backends.cuda.enable_cudnn_sdp(False)
 
 
+def _enforce_dsv4_serial_requests(vllm_config: "VllmConfig") -> bool:
+    model_config = vllm_config.model_config
+    architectures = getattr(model_config, "architectures", None)
+    if architectures is None:
+        architectures = getattr(
+            getattr(model_config, "hf_config", None), "architectures", ()
+        )
+    if "DeepseekV4ForCausalLM" not in (architectures or ()):
+        return False
+    if os.getenv("VLLM_METAX_DSV4_ALLOW_UNSAFE_BATCHING", "0") == "1":
+        return False
+
+    scheduler_config = vllm_config.scheduler_config
+    changed = scheduler_config.max_num_seqs != 1
+    scheduler_config.max_num_seqs = 1
+
+    compilation_config = vllm_config.compilation_config
+    capture_sizes = getattr(compilation_config, "cudagraph_capture_sizes", None)
+    if capture_sizes is not None:
+        serial_capture_sizes = [
+            size for size in capture_sizes if size <= 1
+        ] or [1]
+        changed |= serial_capture_sizes != capture_sizes
+        compilation_config.cudagraph_capture_sizes = serial_capture_sizes
+    max_capture_size = getattr(
+        compilation_config, "max_cudagraph_capture_size", None
+    )
+    if max_capture_size is not None:
+        changed |= max_capture_size != 1
+        compilation_config.max_cudagraph_capture_size = 1
+    return changed
+
+
 @cache
 def _get_backend_priorities(
     use_mla: bool,
@@ -270,6 +303,14 @@ class MacaPlatformBase(Platform):
                 parallel_config.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
 
         scheduler_config = vllm_config.scheduler_config
+
+        if _enforce_dsv4_serial_requests(vllm_config):
+            logger.warning(
+                "Forcing DeepSeek V4 max_num_seqs=1 because batched execution "
+                "does not yet satisfy the correctness gate. Set "
+                "VLLM_METAX_DSV4_ALLOW_UNSAFE_BATCHING=1 to opt in to the "
+                "unverified concurrent path."
+            )
 
         # Note: model_config may be None during testing
         if (

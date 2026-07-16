@@ -322,17 +322,18 @@ def test_exact_post_mma_keeps_non_decode_shape_explicitly_out_of_scope(monkeypat
     assert tilelang.mhc_post_tilelang(x, residual, post_mix, comb_mix) is sentinel
 
 
-def test_exact_post_pre_rms_fake_shapes():
+@pytest.mark.parametrize("num_tokens", [1, 2])
+def test_exact_post_pre_rms_fake_shapes(num_tokens):
     from vllm_metax.models.deepseek_v4.ops.mhc.tilelang import (
         _mhc_exact_post_pre_rms_fake,
     )
 
-    residual = torch.empty((1, 4, 4096), dtype=torch.bfloat16)
+    residual = torch.empty((num_tokens, 4, 4096), dtype=torch.bfloat16)
     outputs = _mhc_exact_post_pre_rms_fake(
-        torch.empty((1, 4096), dtype=torch.bfloat16),
+        torch.empty((num_tokens, 4096), dtype=torch.bfloat16),
         residual,
-        torch.empty((1, 4, 1), dtype=torch.float32),
-        torch.empty((1, 4, 4), dtype=torch.float32),
+        torch.empty((num_tokens, 4, 1), dtype=torch.float32),
+        torch.empty((num_tokens, 4, 4), dtype=torch.float32),
         torch.empty((24, 16384), dtype=torch.float32),
         torch.empty(3, dtype=torch.float32),
         torch.empty(24, dtype=torch.float32),
@@ -345,11 +346,11 @@ def test_exact_post_pre_rms_fake_shapes():
     )
 
     assert [tuple(output.shape) for output in outputs] == [
-        (1, 4, 4096),
-        (1, 4, 1),
-        (1, 4, 4),
-        (1, 4096),
-        (1, 4096),
+        (num_tokens, 4, 4096),
+        (num_tokens, 4, 1),
+        (num_tokens, 4, 4),
+        (num_tokens, 4096),
+        (num_tokens, 4096),
     ]
     assert [output.dtype for output in outputs] == [
         torch.bfloat16,
@@ -360,18 +361,18 @@ def test_exact_post_pre_rms_fake_shapes():
     ]
 
 
-def test_exact_post_pre_rms_rejects_unsupported_contract():
+def test_exact_post_pre_rms_rejects_unsupported_hidden_size():
     from vllm_metax.models.deepseek_v4.ops.mhc.tilelang import (
         mhc_exact_post_pre_rms,
     )
 
     with pytest.raises(RuntimeError, match="exact decode contract"):
         mhc_exact_post_pre_rms(
-            torch.empty((2, 4096), dtype=torch.bfloat16),
-            torch.empty((2, 4, 4096), dtype=torch.bfloat16),
+            torch.empty((2, 2048), dtype=torch.bfloat16),
+            torch.empty((2, 4, 2048), dtype=torch.bfloat16),
             torch.empty((2, 4, 1), dtype=torch.float32),
             torch.empty((2, 4, 4), dtype=torch.float32),
-            torch.empty((24, 16384), dtype=torch.float32),
+            torch.empty((24, 8192), dtype=torch.float32),
             torch.empty(3, dtype=torch.float32),
             torch.empty(24, dtype=torch.float32),
             1e-6,
@@ -379,8 +380,86 @@ def test_exact_post_pre_rms_rejects_unsupported_contract():
             1e-6,
             2.0,
             20,
-            torch.empty(4096, dtype=torch.bfloat16),
+            torch.empty(2048, dtype=torch.bfloat16),
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_exact_post_pre_rms_batch_matches_stacked_single_tokens():
+    from vllm_metax.models.deepseek_v4.ops.mhc.tilelang import (
+        mhc_exact_post_pre_rms,
+    )
+
+    torch.manual_seed(7)
+    device = torch.device("cuda")
+    num_tokens = 2
+    x = torch.randn(num_tokens, 4096, dtype=torch.bfloat16, device=device)
+    residual = torch.randn(
+        num_tokens, 4, 4096, dtype=torch.bfloat16, device=device
+    )
+    post_mix = torch.randn(num_tokens, 4, 1, dtype=torch.float32, device=device)
+    comb_mix = torch.randn(num_tokens, 4, 4, dtype=torch.float32, device=device)
+    fn = torch.randn(24, 16384, dtype=torch.float32, device=device)
+    hc_scale = torch.randn(3, dtype=torch.float32, device=device)
+    hc_base = torch.randn(24, dtype=torch.float32, device=device)
+    norm_weight = torch.randn(4096, dtype=torch.bfloat16, device=device)
+    args = (1e-6, 1e-6, 1e-6, 2.0, 20, norm_weight)
+
+    expected_per_token = [
+        mhc_exact_post_pre_rms(
+            x[index : index + 1],
+            residual[index : index + 1],
+            post_mix[index : index + 1],
+            comb_mix[index : index + 1],
+            fn,
+            hc_scale,
+            hc_base,
+            *args,
+        )
+        for index in range(num_tokens)
+    ]
+    expected = tuple(
+        torch.cat([outputs[field] for outputs in expected_per_token], dim=0)
+        for field in range(len(expected_per_token[0]))
+    )
+
+    actual = mhc_exact_post_pre_rms(
+        x,
+        residual,
+        post_mix,
+        comb_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        *args,
+    )
+
+    for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
+        assert torch.equal(actual_tensor, expected_tensor)
+
+
+def test_exact_pre_rms_dispatches_small_batched_graph_without_runtime_metadata(
+    monkeypatch,
+):
+    from vllm_metax.models.deepseek_v4 import model
+    from vllm_metax.models.deepseek_v4.ops.mhc import tilelang
+
+    sentinel = object()
+    monkeypatch.setenv("VLLM_METAX_DSV4_MHC_EXACT_PRE_RMS", "1")
+    monkeypatch.setattr(model, "get_mhc_backend_name", lambda: "tilelang")
+    monkeypatch.setattr(
+        tilelang,
+        "_mhc_exact_post_pre_rms_impl",
+        lambda *args, **kwargs: sentinel,
+    )
+
+    result = model._mhc_exact_post_pre_rms_for_stage(
+        "attn",
+        torch.empty(2, 4096, dtype=torch.bfloat16),
+        norm_weight=torch.empty(4096, dtype=torch.bfloat16),
+    )
+
+    assert result is sentinel
 
 
 def test_assert_bitwise_trace_equal_rejects_stage_mismatch():

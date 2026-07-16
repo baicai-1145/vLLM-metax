@@ -206,12 +206,13 @@ def _mhc_exact_post_pre_rms_impl(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     norm_weight: torch.Tensor,
-    workspace: dict[tuple[int, str], dict[str, torch.Tensor]] | None = None,
+    workspace: dict[tuple[int, str, int], dict[str, torch.Tensor]] | None = None,
     n_splits: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run the exact one-token post, pre, and RMSNorm decode path."""
+    """Run the exact per-token post, pre, and RMSNorm decode path."""
+    num_tokens = residual.numel() // (4 * 4096)
     if not _is_exact_mhc_decode_contract(
-        num_tokens=residual.numel() // (4 * 4096),
+        num_tokens=1,
         hc_mult=residual.shape[-2] if residual.ndim >= 2 else -1,
         hidden_size=residual.shape[-1] if residual.ndim >= 1 else -1,
         n_splits=n_splits,
@@ -220,21 +221,24 @@ def _mhc_exact_post_pre_rms_impl(
         hc_sinkhorn_eps=hc_sinkhorn_eps,
         hc_post_mult_value=hc_post_mult_value,
         sinkhorn_repeat=sinkhorn_repeat,
-    ):
+    ) or num_tokens < 1:
         raise RuntimeError(
             "VLLM_METAX_DSV4_MHC_EXACT_PRE_RMS requires the exact decode "
-            "contract: tokens=1, hc_mult=4, hidden=4096, n_splits=1"
+            "contract: tokens>=1, hc_mult=4, hidden=4096, n_splits=1"
         )
-    if tuple(post_layer_mix.shape) not in ((1, 4), (1, 4, 1)):
+    if tuple(post_layer_mix.shape) not in (
+        (num_tokens, 4),
+        (num_tokens, 4, 1),
+    ):
         raise RuntimeError(
             "VLLM_METAX_DSV4_MHC_EXACT_PRE_RMS requires exact decode dtypes and shapes"
         )
-    post_layer_mix_flat = post_layer_mix.view(1, 4)
+    post_layer_mix_flat = post_layer_mix.view(num_tokens, 4)
     expected = (
-        (x, torch.bfloat16, (1, 4096)),
-        (residual, torch.bfloat16, (1, 4, 4096)),
-        (post_layer_mix_flat, torch.float32, (1, 4)),
-        (comb_res_mix, torch.float32, (1, 4, 4)),
+        (x, torch.bfloat16, (num_tokens, 4096)),
+        (residual, torch.bfloat16, (num_tokens, 4, 4096)),
+        (post_layer_mix_flat, torch.float32, (num_tokens, 4)),
+        (comb_res_mix, torch.float32, (num_tokens, 4, 4)),
         (fn, torch.float32, (24, 16384)),
         (hc_scale, torch.float32, (3,)),
         (hc_base, torch.float32, (24,)),
@@ -249,26 +253,36 @@ def _mhc_exact_post_pre_rms_impl(
             "VLLM_METAX_DSV4_MHC_EXACT_PRE_RMS requires contiguous CUDA tensors"
         )
 
-    key = (norm_weight.data_ptr(), str(x.device))
+    key = (norm_weight.data_ptr(), str(x.device), num_tokens)
     buffers_cache = workspace if workspace is not None else {}
     buffers = buffers_cache.get(key)
     if buffers is None:
         buffers = {
             "residual_cur": torch.empty_like(residual),
             "residual_fp32": torch.empty(
-                (1, 16384), dtype=torch.float32, device=x.device
+                (num_tokens, 16384), dtype=torch.float32, device=x.device
             ),
-            "sqrsum": torch.empty((1, 1), dtype=torch.float32, device=x.device),
-            "gemm_out": torch.empty((1, 1, 24), dtype=torch.float32, device=x.device),
-            "post_mix": torch.empty((1, 4), dtype=torch.float32, device=x.device),
-            "comb_mix": torch.empty((1, 4, 4), dtype=torch.float32, device=x.device),
-            "pre_norm": torch.empty((1, 4096), dtype=torch.bfloat16, device=x.device),
-            "normalized": torch.empty((1, 4096), dtype=torch.bfloat16, device=x.device),
+            "sqrsum": torch.empty(
+                (num_tokens, 1), dtype=torch.float32, device=x.device
+            ),
+            "gemm_out": torch.empty(
+                (num_tokens, 1, 24), dtype=torch.float32, device=x.device
+            ),
+            "post_mix": torch.empty(
+                (num_tokens, 4), dtype=torch.float32, device=x.device
+            ),
+            "comb_mix": torch.empty(
+                (num_tokens, 4, 4), dtype=torch.float32, device=x.device
+            ),
+            "pre_norm": torch.empty(
+                (num_tokens, 4096), dtype=torch.bfloat16, device=x.device
+            ),
+            "normalized": torch.empty(
+                (num_tokens, 4096), dtype=torch.bfloat16, device=x.device
+            ),
         }
         buffers_cache[key] = buffers
-    residual_cur = _mhc_post_exact_decode(
-        x, residual, post_layer_mix_flat, comb_res_mix, out=buffers["residual_cur"]
-    )
+    residual_cur = buffers["residual_cur"]
     residual_fp32 = buffers["residual_fp32"]
     sqrsum = buffers["sqrsum"]
     gemm_out = buffers["gemm_out"]
@@ -280,25 +294,40 @@ def _mhc_exact_post_pre_rms_impl(
     import vllm_metax._metax_sparse_C  # noqa: F401
 
     ops = torch.ops._metax_sparse_C
-    ops.mhc_cast_sqrsum_out(residual_cur, residual_fp32, sqrsum)
-    ops.mhc_gemv_fp32_out(residual_fp32, fn, gemm_out)
-    ops.mhc_downstream_rms_out(
-        residual_cur,
-        gemm_out,
-        sqrsum,
-        hc_scale,
-        hc_base,
-        norm_weight,
-        post_mix,
-        comb_mix,
-        pre_norm,
-        normalized,
-        rms_eps,
-        hc_pre_eps,
-        hc_sinkhorn_eps,
-        hc_post_mult_value,
-        sinkhorn_repeat,
-    )
+    for token_index in range(num_tokens):
+        token_slice = slice(token_index, token_index + 1)
+        _mhc_post_exact_decode(
+            x[token_slice],
+            residual[token_slice],
+            post_layer_mix_flat[token_slice],
+            comb_res_mix[token_slice],
+            out=residual_cur[token_slice],
+        )
+        ops.mhc_cast_sqrsum_out(
+            residual_cur[token_slice],
+            residual_fp32[token_slice],
+            sqrsum[token_slice],
+        )
+        ops.mhc_gemv_fp32_out(
+            residual_fp32[token_slice], fn, gemm_out[token_slice]
+        )
+        ops.mhc_downstream_rms_out(
+            residual_cur[token_slice],
+            gemm_out[token_slice],
+            sqrsum[token_slice],
+            hc_scale,
+            hc_base,
+            norm_weight,
+            post_mix[token_slice],
+            comb_mix[token_slice],
+            pre_norm[token_slice],
+            normalized[token_slice],
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+        )
     _log_mhc_decode_impl("exact_pre_rms", fail_closed=True)
     return residual_cur, post_mix.unsqueeze(-1), comb_mix, pre_norm, normalized
 
@@ -357,12 +386,13 @@ def _mhc_exact_post_pre_rms_fake(
     del norm_weight, rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value
     del sinkhorn_repeat, n_splits
     device = residual.device
+    num_tokens = residual.shape[0]
     return (
         torch.empty_like(residual),
-        torch.empty((1, 4, 1), dtype=torch.float32, device=device),
-        torch.empty((1, 4, 4), dtype=torch.float32, device=device),
-        torch.empty((1, 4096), dtype=torch.bfloat16, device=device),
-        torch.empty((1, 4096), dtype=torch.bfloat16, device=device),
+        torch.empty((num_tokens, 4, 1), dtype=torch.float32, device=device),
+        torch.empty((num_tokens, 4, 4), dtype=torch.float32, device=device),
+        torch.empty((num_tokens, 4096), dtype=torch.bfloat16, device=device),
+        torch.empty((num_tokens, 4096), dtype=torch.bfloat16, device=device),
     )
 
 

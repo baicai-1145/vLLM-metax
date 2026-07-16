@@ -17,6 +17,7 @@
 |    5 | `05-tp-communication.md`       | 优化 87 次/token 小消息 TP collective    | 00，03.5 路由     |
 |    6 | `06-cudagraph-launch.md`       | 减少 graph break、launch gap 和分配      | 00，03.5 路由     |
 |    7 | `07-integration-acceptance.md` | 汇总收益、回归和最终推广决策             | 01-06             |
+|    8 | `08-mtp-k4-exact-2x.md`        | 单 MTP head k=4 无损适配与正常 2x gate   | 00，07            |
 
 Sparse MLA、MHC、O-proj、MoE 的静态调研可以在文件写集合不重叠时并行推进；
 Plan 04、05、06 的性能实现和推广必须等待 Plan 03.5 路由。执行上必须
@@ -27,6 +28,9 @@ decode-first，但 prefill 的 OOM blocker 要立即建立复现和修复门禁�
 ## 当前事实
 
 - 模型：`/root/models/DeepSeek-V4-Flash-W4A16-BF16Attn-MTP`
+- Plan 08 已定义 MTP k=4 的独立适配路径：保持 `max_num_seqs=1`，迭代复用 checkpoint
+  唯一的 MTP layer，并要求相对同 workload MTP=0 正常吞吐至少 `2.00x`；在所有
+  exact-token、质量、graph 和性能门通过前继续默认关闭。
 - **历史** TP=4 PIECEWISE、MTP=0、16-token 快速 gate：`11.624672 token/s`，约
   `86.0 ms/token`（仅作会话起始参考）
 - 最新受控 MTP=0、TP=4 PIECEWISE、100-token decode 前后夹具为
