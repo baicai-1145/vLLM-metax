@@ -322,6 +322,19 @@ def test_exact_post_mma_keeps_non_decode_shape_explicitly_out_of_scope(monkeypat
     assert tilelang.mhc_post_tilelang(x, residual, post_mix, comb_mix) is sentinel
 
 
+def test_hybrid_post_downstream_candidate_is_opt_in(monkeypatch):
+    from vllm_metax.models.deepseek_v4.ops.mhc.tilelang import (
+        _hybrid_post_downstream_enabled,
+    )
+
+    monkeypatch.delenv(
+        "VLLM_METAX_DSV4_MHC_HYBRID_POST_DOWNSTREAM", raising=False
+    )
+    assert not _hybrid_post_downstream_enabled()
+    monkeypatch.setenv("VLLM_METAX_DSV4_MHC_HYBRID_POST_DOWNSTREAM", "1")
+    assert _hybrid_post_downstream_enabled()
+
+
 @pytest.mark.parametrize("num_tokens", [1, 2])
 def test_exact_post_pre_rms_fake_shapes(num_tokens):
     from vllm_metax.models.deepseek_v4.ops.mhc.tilelang import (

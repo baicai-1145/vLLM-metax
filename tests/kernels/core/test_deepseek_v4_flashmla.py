@@ -446,9 +446,11 @@ def test_torch_reference_decode_dispatch_warns_once(monkeypatch, caplog) -> None
     )
     q = torch.zeros((1, 2, 8), dtype=torch.bfloat16)
     output = torch.empty_like(q)
+    positions = torch.tensor([0], dtype=torch.int64)
     with caplog.at_level("WARNING"):
         attention._forward_decode(
             q=q,
+            positions=positions,
             kv_cache=None,
             swa_metadata=metadata,
             attn_metadata=None,
@@ -457,6 +459,7 @@ def test_torch_reference_decode_dispatch_warns_once(monkeypatch, caplog) -> None
         )
         attention._forward_decode(
             q=q,
+            positions=positions,
             kv_cache=None,
             swa_metadata=metadata,
             attn_metadata=None,

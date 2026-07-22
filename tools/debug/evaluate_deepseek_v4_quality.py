@@ -9,6 +9,7 @@ tests can run without loading a model (or contacting a network service).
 from __future__ import annotations
 
 import argparse
+import copy
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -144,6 +145,7 @@ _RUNTIME_ENV_KEYS = (
     "VLLM_USE_BREAKABLE_CUDAGRAPH",
     "VLLM_METAX_USE_FP32_LOGITS",
     "VLLM_METAX_DSV4_SPARSE_MLA_DECODE_BACKEND",
+    "VLLM_METAX_DSV4_PREFILL_GEMM_CHUNKING",
 )
 _MODEL_METADATA_FILES = (
     "config.json",
@@ -294,6 +296,7 @@ def evaluate_quality(
     tensor_parallel_size: int = 4,
     num_speculative_tokens: int = 0,
     cudagraph_mode: str = "PIECEWISE",
+    diagnostic_enforce_eager: bool = False,
     max_model_len: int = 4096,
     gpu_memory_utilization: float = 0.9,
     enable_prefix_caching: bool = True,
@@ -315,18 +318,33 @@ def evaluate_quality(
         raise ValueError("num_logprobs must equal len(logprob_token_ids)")
     if tensor_parallel_size != 4:
         raise ValueError("quality acceptance requires tensor_parallel_size=4")
-    if num_speculative_tokens != 0:
-        raise ValueError("quality acceptance requires MTP/speculative tokens=0")
-    if cudagraph_mode != "PIECEWISE":
+    if num_speculative_tokens < 0:
+        raise ValueError("num_speculative_tokens must be non-negative")
+    if diagnostic_enforce_eager and cudagraph_mode != "NONE":
+        raise ValueError("eager diagnosis requires cudagraph_mode=NONE")
+    if not diagnostic_enforce_eager and cudagraph_mode != "PIECEWISE":
         raise ValueError("quality acceptance requires cudagraph_mode=PIECEWISE")
 
     selected = sample_questions(test_examples, num_questions, seed)
     prompts = [build_prompt(row["question"], train_examples, num_shots) for row in selected]
     expected = [parse_numeric_answer(row["answer"]) for row in selected]
-    compilation_config = {
-        "cudagraph_mode": cudagraph_mode,
-        "cudagraph_capture_sizes": sorted({1, batch_size}),
-    }
+    speculative_config = None
+    if num_speculative_tokens:
+        speculative_config = {
+            "method": "mtp",
+            "num_speculative_tokens": num_speculative_tokens,
+        }
+    capture_sizes = (
+        list(range(1, num_speculative_tokens + 2))
+        if num_speculative_tokens
+        else sorted({1, batch_size})
+    )
+    compilation_config = None
+    if not diagnostic_enforce_eager:
+        compilation_config = {
+            "cudagraph_mode": cudagraph_mode,
+            "cudagraph_capture_sizes": capture_sizes,
+        }
     sampling_config = {
         "temperature": 0.0,
         "max_tokens": max_tokens,
@@ -346,10 +364,13 @@ def evaluate_quality(
         "tensor_parallel_size": tensor_parallel_size,
         "gpu_memory_utilization": gpu_memory_utilization,
         "max_model_len": max_model_len,
-        "enforce_eager": False,
+        "enforce_eager": diagnostic_enforce_eager,
         "enable_prefix_caching": enable_prefix_caching,
-        "compilation_config": compilation_config,
     }
+    if compilation_config is not None:
+        llm_kwargs["compilation_config"] = compilation_config
+    if speculative_config is not None:
+        llm_kwargs["speculative_config"] = speculative_config
     output_path = Path(artifact_path)
     runtime_context = _runtime_context()
     started = time.perf_counter()
@@ -360,9 +381,10 @@ def evaluate_quality(
         "model_provenance": _model_provenance(model),
         "tensor_parallel_size": tensor_parallel_size,
         "num_speculative_tokens": num_speculative_tokens,
-        "mtp": 0,
+        "mtp": num_speculative_tokens,
+        "speculative_config": copy.deepcopy(speculative_config),
         "cudagraph_mode": cudagraph_mode,
-        "enforce_eager": False,
+        "enforce_eager": diagnostic_enforce_eager,
         "batch_size": batch_size,
         "num_questions": len(selected),
         "num_shots": num_shots,
@@ -374,8 +396,8 @@ def evaluate_quality(
         "prefix_caching": enable_prefix_caching,
         "prompt_format": "gsm8k_completion",
         "completion_api": "LLM.generate",
-        "sampling_params": sampling_config,
-        "compilation_config": compilation_config,
+        "sampling_params": copy.deepcopy(sampling_config),
+        "compilation_config": copy.deepcopy(compilation_config),
         "generation_calls": (len(selected) + batch_size - 1) // batch_size,
         "profiler": False,
         **runtime_context,
@@ -509,6 +531,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tensor-parallel-size", type=int, default=4)
     parser.add_argument("--num-speculative-tokens", type=int, default=0)
     parser.add_argument("--cudagraph-mode", default="PIECEWISE")
+    parser.add_argument(
+        "--diagnostic-enforce-eager",
+        action="store_true",
+        help="diagnostic only: disable graph execution and mark the artifact eager",
+    )
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument(
@@ -538,7 +565,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         logprob_token_ids=args.logprob_token_id,
         tensor_parallel_size=args.tensor_parallel_size,
         num_speculative_tokens=args.num_speculative_tokens,
-        cudagraph_mode=args.cudagraph_mode,
+        cudagraph_mode=("NONE" if args.diagnostic_enforce_eager else args.cudagraph_mode),
+        diagnostic_enforce_eager=args.diagnostic_enforce_eager,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         enable_prefix_caching=args.enable_prefix_caching,

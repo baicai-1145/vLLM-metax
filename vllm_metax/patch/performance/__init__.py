@@ -6,5 +6,6 @@
 # Affected versions: v0.21.0
 # -----------------------------------------------
 from . import grouped_topk_router  # noqa: F401
+from . import gpu_model_runner_capture  # noqa: F401
 from . import pre_outer_graph_device_sync  # noqa: F401
 from . import speculative_decode_perf  # noqa: F401

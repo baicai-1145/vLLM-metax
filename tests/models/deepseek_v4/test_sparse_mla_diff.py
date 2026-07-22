@@ -615,6 +615,103 @@ def test_sparse_mla_capture_skip_runs_before_budget_or_copy(monkeypatch, tmp_pat
     assert sparse_mla_debug._CAPTURE_SKIP_COUNTS == {}
 
 
+def test_sparse_mla_capture_exact_observed_call_filter(monkeypatch, tmp_path):
+    monkeypatch.setenv("VLLM_METAX_DSV4_SPARSE_MLA_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.setenv(
+        "VLLM_METAX_DSV4_SPARSE_MLA_CAPTURE_OBSERVED_CALLS", "1,3"
+    )
+    monkeypatch.setattr(sparse_mla_debug, "_rank", lambda: "0")
+    sparse_mla_debug.reset_sparse_mla_capture_state()
+
+    for _ in range(4):
+        sparse_mla_debug.maybe_capture_sparse_mla_prefill(**_capture_inputs())
+
+    paths = sorted(tmp_path.glob("rank0_call*.pt"))
+    assert [path.name for path in paths] == ["rank0_call0.pt", "rank0_call1.pt"]
+    assert [
+        torch.load(path, map_location="cpu", weights_only=True)["observed_call"]
+        for path in paths
+    ] == [1, 3]
+
+    sparse_mla_debug.reset_sparse_mla_capture_state()
+    assert sparse_mla_debug._CAPTURE_OBSERVED_COUNTS == {}
+
+
+@pytest.mark.parametrize("layer_filter", [None, "", "all"])
+def test_sparse_mla_capture_layer_filter_defaults_to_all(
+    monkeypatch, tmp_path, layer_filter
+):
+    monkeypatch.setenv("VLLM_METAX_DSV4_SPARSE_MLA_CAPTURE_DIR", str(tmp_path))
+    if layer_filter is None:
+        monkeypatch.delenv(
+            "VLLM_METAX_DSV4_SPARSE_MLA_CAPTURE_LAYERS", raising=False
+        )
+    else:
+        monkeypatch.setenv(
+            "VLLM_METAX_DSV4_SPARSE_MLA_CAPTURE_LAYERS", layer_filter
+        )
+    monkeypatch.setattr(sparse_mla_debug, "_rank", lambda: "0")
+    sparse_mla_debug.reset_sparse_mla_capture_state()
+
+    inputs = _decode_capture_inputs()
+    for _ in range(2):
+        sparse_mla_debug.maybe_capture_sparse_mla_decode(**inputs, layer_idx=7)
+
+    paths = sorted(tmp_path.glob("rank0_call*.pt"))
+    assert [
+        torch.load(path, map_location="cpu", weights_only=True)["observed_call"]
+        for path in paths
+    ] == [0, 1]
+    assert [
+        torch.load(path, map_location="cpu", weights_only=True)["layer_idx"]
+        for path in paths
+    ] == [7, 7]
+
+
+def test_sparse_mla_capture_layer_filter_skips_before_observed_call(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("VLLM_METAX_DSV4_SPARSE_MLA_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_METAX_DSV4_SPARSE_MLA_CAPTURE_LAYERS", "1")
+    monkeypatch.setattr(sparse_mla_debug, "_rank", lambda: "0")
+    sparse_mla_debug.reset_sparse_mla_capture_state()
+    inputs = _decode_capture_inputs()
+
+    sparse_mla_debug.maybe_capture_sparse_mla_decode(**inputs, layer_idx=0)
+    sparse_mla_debug.maybe_capture_sparse_mla_decode(**inputs, layer_idx=1)
+    sparse_mla_debug.maybe_capture_sparse_mla_decode(**inputs, layer_idx=1)
+
+    paths = sorted(tmp_path.glob("rank0_call*.pt"))
+    assert [
+        torch.load(path, map_location="cpu", weights_only=True)["observed_call"]
+        for path in paths
+    ] == [0, 1]
+    assert [
+        torch.load(path, map_location="cpu", weights_only=True)["layer_idx"]
+        for path in paths
+    ] == [1, 1]
+
+
+@pytest.mark.parametrize("layer_filter", ["foo", "1,-2"])
+def test_sparse_mla_capture_layer_filter_rejects_invalid_values(
+    monkeypatch, tmp_path, layer_filter
+):
+    monkeypatch.setenv("VLLM_METAX_DSV4_SPARSE_MLA_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.setenv(
+        "VLLM_METAX_DSV4_SPARSE_MLA_CAPTURE_LAYERS", layer_filter
+    )
+    monkeypatch.setattr(sparse_mla_debug, "_rank", lambda: "0")
+    sparse_mla_debug.reset_sparse_mla_capture_state()
+
+    with pytest.raises(
+        ValueError,
+        match="VLLM_METAX_DSV4_SPARSE_MLA_CAPTURE_LAYERS.*nonnegative integer",
+    ):
+        sparse_mla_debug.maybe_capture_sparse_mla_decode(
+            **_decode_capture_inputs(), layer_idx=1
+        )
+
+
 def test_sparse_mla_decode_mode_filter_and_classification(monkeypatch, tmp_path):
     monkeypatch.setenv("VLLM_METAX_DSV4_SPARSE_MLA_CAPTURE_DIR", str(tmp_path))
     monkeypatch.setenv("VLLM_METAX_DSV4_SPARSE_MLA_CAPTURE_RANKS", "0")

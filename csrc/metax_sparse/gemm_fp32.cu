@@ -17,6 +17,8 @@
 
 namespace metax_sparse {
 
+constexpr int kMhcMaxBatchedTokens = 5;
+
 template <int TPB>
 __launch_bounds__(TPB) __global__ void row_softmax_fp32_kernel(
     float const* input, float* out, int const cols) {
@@ -459,6 +461,10 @@ __global__ void mhc_cast_sqrsum_kernel(c10::BFloat16 const* residual,
                                        float* sqrsum_out) {
   __shared__ float reduction[512];
   int const tid = threadIdx.x;
+  int64_t const row = static_cast<int64_t>(blockIdx.x);
+  residual += row * 16384;
+  residual_fp32 += row * 16384;
+  sqrsum_out += row;
   float sum = 0.0f;
 #pragma unroll
   for (int vector = 0; vector < 8; ++vector) {
@@ -505,12 +511,27 @@ void mhc_cast_sqrsum_out(torch::Tensor const& residual,
   TORCH_CHECK(residual.is_contiguous() && residual_fp32.is_contiguous() &&
                   sqrsum_out.is_contiguous(),
               "mhc_cast_sqrsum_out: tensors must be contiguous");
-  TORCH_CHECK(residual.numel() == 16384 && residual_fp32.numel() == 16384 &&
-                  sqrsum_out.numel() == 1,
-              "mhc_cast_sqrsum_out: exact decode shape required");
+  bool const batched_shape = residual.dim() == 3 && residual.size(1) == 4 &&
+                              residual.size(2) == 4096 &&
+                              residual_fp32.dim() == 2 &&
+                              residual_fp32.size(0) == residual.size(0) &&
+                              residual_fp32.size(1) == 16384 &&
+                              sqrsum_out.dim() == 2 &&
+                              sqrsum_out.size(0) == residual.size(0) &&
+                              sqrsum_out.size(1) == 1;
+  bool const legacy_shape = residual.dim() == 3 && residual.size(0) == 1 &&
+                            residual.size(1) == 4 && residual.size(2) == 4096 &&
+                            residual_fp32.dim() == 1 &&
+                            residual_fp32.size(0) == 16384 &&
+                            sqrsum_out.dim() == 1 && sqrsum_out.size(0) == 1;
+  TORCH_CHECK((batched_shape || legacy_shape) && residual.numel() > 0 &&
+                  residual.numel() / 16384 <= kMhcMaxBatchedTokens,
+              "mhc_cast_sqrsum_out: expected contiguous BF16 [N,4,4096], "
+              "FP32 [N,16384], and FP32 [N,1] with 1 <= N <= 5");
   c10::cuda::CUDAGuard const device_guard(residual.device());
   cudaStream_t const stream = at::cuda::getCurrentCUDAStream();
-  mhc_cast_sqrsum_kernel<<<1, 512, 0, stream>>>(
+  int64_t const rows = residual.numel() / 16384;
+  mhc_cast_sqrsum_kernel<<<static_cast<int>(rows), 512, 0, stream>>>(
       residual.data_ptr<c10::BFloat16>(), residual_fp32.data_ptr<float>(),
       sqrsum_out.data_ptr<float>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -531,6 +552,14 @@ __global__ void mhc_downstream_rms_kernel(
   __shared__ float reduction[512];
   __shared__ float inverse_rms;
   int const tid = threadIdx.x;
+  int64_t const row = static_cast<int64_t>(blockIdx.x);
+  residual += row * 16384;
+  gemm_out += row * 24;
+  sqrsum += row;
+  post_out += row * 4;
+  comb_out += row * 16;
+  pre_norm_out += row * 4096;
+  norm_out += row * 4096;
 
   if (tid == 0) {
     float const raw_inverse_rms = rsqrtf(__fadd_rn(
@@ -706,17 +735,44 @@ void mhc_downstream_rms_out(
                   pre_norm_out.scalar_type() == torch::kBFloat16 &&
                   norm_out.scalar_type() == torch::kBFloat16,
               "mhc_downstream_rms_out: dtype mismatch");
-  TORCH_CHECK(residual.numel() == 16384 && gemm_out.numel() == 24 &&
-                  sqrsum.numel() == 1 && scale.numel() == 3 &&
-                  base.numel() == 24 && norm_weight.numel() == 4096 &&
-                  post_out.numel() == 4 && comb_out.numel() == 16 &&
-                  pre_norm_out.numel() == 4096 && norm_out.numel() == 4096,
-              "mhc_downstream_rms_out: exact decode shape required");
+  bool const batched_shape =
+      residual.dim() == 3 && residual.size(1) == 4 &&
+          residual.size(2) == 4096 && gemm_out.dim() == 3 &&
+          gemm_out.size(0) == residual.size(0) && gemm_out.size(1) == 1 &&
+          gemm_out.size(2) == 24 && sqrsum.dim() == 2 &&
+          sqrsum.size(0) == residual.size(0) && sqrsum.size(1) == 1 &&
+          scale.dim() == 1 && scale.size(0) == 3 && base.dim() == 1 &&
+          base.size(0) == 24 && norm_weight.dim() == 1 &&
+          norm_weight.size(0) == 4096 && post_out.dim() == 2 &&
+          post_out.size(0) == residual.size(0) && post_out.size(1) == 4 &&
+          comb_out.dim() == 3 && comb_out.size(0) == residual.size(0) &&
+          comb_out.size(1) == 4 && comb_out.size(2) == 4 &&
+          pre_norm_out.dim() == 2 &&
+          pre_norm_out.size(0) == residual.size(0) &&
+          pre_norm_out.size(1) == 4096 && norm_out.dim() == 2 &&
+          norm_out.size(0) == residual.size(0) && norm_out.size(1) == 4096 &&
+          residual.size(0) >= 1 && residual.size(0) <= kMhcMaxBatchedTokens;
+  bool const legacy_shape =
+      residual.dim() == 3 && residual.size(0) == 1 && residual.size(1) == 4 &&
+      residual.size(2) == 4096 && gemm_out.dim() == 1 && gemm_out.size(0) == 24 &&
+      sqrsum.dim() == 1 && sqrsum.size(0) == 1 && scale.dim() == 1 &&
+      scale.size(0) == 3 && base.dim() == 1 && base.size(0) == 24 &&
+      norm_weight.dim() == 1 && norm_weight.size(0) == 4096 &&
+      post_out.dim() == 1 && post_out.size(0) == 4 && comb_out.dim() == 1 &&
+      comb_out.size(0) == 16 && pre_norm_out.dim() == 1 &&
+      pre_norm_out.size(0) == 4096 && norm_out.dim() == 1 &&
+      norm_out.size(0) == 4096;
+  TORCH_CHECK(
+      (batched_shape || legacy_shape) &&
+          residual.numel() / 16384 <= kMhcMaxBatchedTokens,
+      "mhc_downstream_rms_out: expected contiguous decode tensors with "
+      "1 <= N <= 5");
   TORCH_CHECK(repeat == 20,
               "mhc_downstream_rms_out: repeat must be 20");
   c10::cuda::CUDAGuard const device_guard(residual.device());
   cudaStream_t const stream = at::cuda::getCurrentCUDAStream();
-  mhc_downstream_rms_kernel<<<1, 512, 0, stream>>>(
+  int64_t const rows = residual.numel() / 16384;
+  mhc_downstream_rms_kernel<<<static_cast<int>(rows), 512, 0, stream>>>(
       residual.data_ptr<c10::BFloat16>(), gemm_out.data_ptr<float>(),
       sqrsum.data_ptr<float>(), scale.data_ptr<float>(), base.data_ptr<float>(),
       norm_weight.data_ptr<c10::BFloat16>(), post_out.data_ptr<float>(),

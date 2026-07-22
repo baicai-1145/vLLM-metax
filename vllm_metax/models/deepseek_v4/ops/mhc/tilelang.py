@@ -35,6 +35,13 @@ def _exact_post_mma_debug_enabled() -> bool:
     return os.getenv("VLLM_METAX_DSV4_MHC_EXACT_POST_MMA_DEBUG", "0") == "1"
 
 
+def _hybrid_post_downstream_enabled() -> bool:
+    """Enable batched native post ops while preserving the exact per-row GEMV."""
+    return (
+        os.getenv("VLLM_METAX_DSV4_MHC_HYBRID_POST_DOWNSTREAM", "0") == "1"
+    )
+
+
 def _is_exact_mhc_decode_contract(
     *,
     num_tokens: int,
@@ -108,6 +115,14 @@ def _log_mhc_decode_impl(
         logger.warning(
             "DeepSeek V4 MHC decode implementation: exact_pre_rms "
             "fail_closed=%s dispatch_count=%d",
+            str(fail_closed).lower(),
+            _MHC_DECODE_DISPATCH_COUNTS[name],
+        )
+    elif name == "exact_pre_rms_hybrid":
+        logger.warning(
+            "DeepSeek V4 MHC decode implementation: exact_pre_rms_hybrid "
+            "batched_cast=true tokenwise_native_gemv=true "
+            "batched_downstream=true fail_closed=%s dispatch_count=%d",
             str(fail_closed).lower(),
             _MHC_DECODE_DISPATCH_COUNTS[name],
         )
@@ -303,31 +318,59 @@ def _mhc_exact_post_pre_rms_impl(
             comb_res_mix[token_slice],
             out=residual_cur[token_slice],
         )
-        ops.mhc_cast_sqrsum_out(
-            residual_cur[token_slice],
-            residual_fp32[token_slice],
-            sqrsum[token_slice],
-        )
-        ops.mhc_gemv_fp32_out(
-            residual_fp32[token_slice], fn, gemm_out[token_slice]
-        )
+    if _hybrid_post_downstream_enabled() and num_tokens <= 5:
+        ops.mhc_cast_sqrsum_out(residual_cur, residual_fp32, sqrsum)
+        for token_index in range(num_tokens):
+            token_slice = slice(token_index, token_index + 1)
+            ops.mhc_gemv_fp32_out(
+                residual_fp32[token_slice], fn, gemm_out[token_slice]
+            )
         ops.mhc_downstream_rms_out(
-            residual_cur[token_slice],
-            gemm_out[token_slice],
-            sqrsum[token_slice],
+            residual_cur,
+            gemm_out,
+            sqrsum,
             hc_scale,
             hc_base,
             norm_weight,
-            post_mix[token_slice],
-            comb_mix[token_slice],
-            pre_norm[token_slice],
-            normalized[token_slice],
+            post_mix,
+            comb_mix,
+            pre_norm,
+            normalized,
             rms_eps,
             hc_pre_eps,
             hc_sinkhorn_eps,
             hc_post_mult_value,
             sinkhorn_repeat,
         )
+        _log_mhc_decode_impl("exact_pre_rms_hybrid", fail_closed=True)
+    else:
+        for token_index in range(num_tokens):
+            token_slice = slice(token_index, token_index + 1)
+            ops.mhc_cast_sqrsum_out(
+                residual_cur[token_slice],
+                residual_fp32[token_slice],
+                sqrsum[token_slice],
+            )
+            ops.mhc_gemv_fp32_out(
+                residual_fp32[token_slice], fn, gemm_out[token_slice]
+            )
+            ops.mhc_downstream_rms_out(
+                residual_cur[token_slice],
+                gemm_out[token_slice],
+                sqrsum[token_slice],
+                hc_scale,
+                hc_base,
+                norm_weight,
+                post_mix[token_slice],
+                comb_mix[token_slice],
+                pre_norm[token_slice],
+                normalized[token_slice],
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+            )
     _log_mhc_decode_impl("exact_pre_rms", fail_closed=True)
     return residual_cur, post_mix.unsqueeze(-1), comb_mix, pre_norm, normalized
 

@@ -38,6 +38,7 @@ _PREFILL_REQUIRED_KEYS = {
     "max_logits",
     "lse",
 }
+_PREFILL_OPTIONAL_KEYS = {"layer_idx", "observed_call"}
 _INPUT_META_KEYS = {"q", "kv", "indices", "topk_length", "attn_sink"}
 _DECODE_REQUIRED_KEYS = {
     "schema_version",
@@ -63,6 +64,16 @@ _DECODE_REQUIRED_KEYS = {
     "caller_out",
     "output",
 }
+_DECODE_OPTIONAL_KEYS = {
+    "decode_mode",
+    "decode_backend",
+    "native_decode_mode",
+    "layer_idx",
+    "observed_call",
+    "positions",
+    "token_indices",
+    "token_to_req",
+}
 _DECODE_INPUT_META_KEYS = {
     "q",
     "swa_cache",
@@ -72,9 +83,52 @@ _DECODE_INPUT_META_KEYS = {
     "swa_lens",
     "topk_lens",
     "attn_sink",
+    "positions",
+    "token_to_req",
     "swa_block_table",
     "compressed_block_table",
 }
+_DECODE_PAIR_COMPARE_KEYS = (
+    "rank",
+    "layer_idx",
+    "observed_call",
+    "decode_mode",
+    "decode_backend",
+    "native_decode_mode",
+    "positions",
+    "token_indices",
+    "token_to_req",
+    "cache_meta",
+    "sm_scale",
+    "d_v",
+    "head_dim",
+    "q_heads",
+    "q",
+    "swa_indices",
+    "topk_indices",
+    "swa_lens",
+    "topk_lens",
+    "swa_block_table",
+    "compressed_block_table",
+    "attn_sink",
+    "swa_cache",
+    "compressed_cache",
+    "output",
+)
+_DECODE_ATTENTION_INPUT_KEYS = {
+    "q",
+    "swa_indices",
+    "topk_indices",
+    "swa_lens",
+    "topk_lens",
+    "swa_block_table",
+    "compressed_block_table",
+    "attn_sink",
+    "swa_cache",
+    "compressed_cache",
+    "output",
+}
+_DECODE_SEMANTIC_ROW_KEYS = {"gathered_swa_rows", "gathered_compressed_rows"}
 _LOG2E = math.log2(math.e)
 
 
@@ -143,7 +197,9 @@ def _validate_payload(payload: Any, path: Path) -> None:
 
 
 def _validate_prefill_payload(payload: dict[str, Any], path: Path) -> None:
-    _require(set(payload) == _PREFILL_REQUIRED_KEYS, path, f"keys={sorted(payload)}")
+    keys = set(payload)
+    _require(_PREFILL_REQUIRED_KEYS <= keys, path, f"missing keys={sorted(_PREFILL_REQUIRED_KEYS - keys)}")
+    _require(keys <= _PREFILL_REQUIRED_KEYS | _PREFILL_OPTIONAL_KEYS, path, f"unknown keys={sorted(keys - _PREFILL_REQUIRED_KEYS - _PREFILL_OPTIONAL_KEYS)}")
     _require(payload["stage"] == "prefill", path, "stage must be prefill")
     _validate_rank_call(payload, path)
 
@@ -256,7 +312,9 @@ def _validate_decode_table(
 
 
 def _validate_decode_payload(payload: dict[str, Any], path: Path) -> None:
-    _require(set(payload) == _DECODE_REQUIRED_KEYS, path, f"keys={sorted(payload)}")
+    keys = set(payload)
+    _require(_DECODE_REQUIRED_KEYS <= keys, path, f"missing keys={sorted(_DECODE_REQUIRED_KEYS - keys)}")
+    _require(keys <= _DECODE_REQUIRED_KEYS | _DECODE_OPTIONAL_KEYS, path, f"unknown keys={sorted(keys - _DECODE_REQUIRED_KEYS - _DECODE_OPTIONAL_KEYS)}")
     _require(payload["stage"] == "decode", path, "stage must be decode")
     _validate_rank_call(payload, path)
     q = _validate_decode_tensor(payload["q"], path, "q")
@@ -312,7 +370,8 @@ def _validate_decode_payload(payload: dict[str, Any], path: Path) -> None:
         _require(cache_meta["compressed_block_size"] in (None, compressed_cache.shape[1]), path,
                  "cache_meta[compressed_block_size]")
     _require(isinstance(payload["input_meta"], dict), path, "input_meta must be a mapping")
-    _require(set(payload["input_meta"]) == _DECODE_INPUT_META_KEYS, path, "input_meta keys")
+    input_meta_keys = set(payload["input_meta"])
+    _require(input_meta_keys <= _DECODE_INPUT_META_KEYS, path, "input_meta keys")
     for key, value in payload["input_meta"].items():
         if key in {"q", "swa_cache", "swa_indices", "swa_lens"}:
             _require(value is not None, path, f"input_meta[{key}] is required")
@@ -537,6 +596,198 @@ def _compare(name: str, actual: torch.Tensor, expected: torch.Tensor, atol: floa
     return _max_abs(actual, expected)
 
 
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return {
+            "shape": list(value.shape),
+            "dtype": str(value.dtype),
+            "values": value.tolist(),
+        }
+    if isinstance(value, dict):
+        return {str(key): _json_ready(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(item) for item in value]
+    return value
+
+
+def _first_tensor_difference(
+    base: torch.Tensor,
+    candidate: torch.Tensor,
+) -> dict[str, Any] | None:
+    if tuple(base.shape) != tuple(candidate.shape):
+        return None
+    if torch.is_floating_point(base) or torch.is_floating_point(candidate):
+        equal = (base == candidate) | (torch.isnan(base) & torch.isnan(candidate))
+    else:
+        equal = base == candidate
+    differing = (~equal).nonzero(as_tuple=False)
+    if differing.numel() == 0:
+        return None
+    index = differing[0].tolist()
+    return {
+        "first_diff_index": index,
+        "base_value": base[tuple(index)].item(),
+        "candidate_value": candidate[tuple(index)].item(),
+    }
+
+
+def _pair_value_diff(key: str, base: Any, candidate: Any) -> dict[str, Any]:
+    if isinstance(base, torch.Tensor) and isinstance(candidate, torch.Tensor):
+        shape_match = tuple(base.shape) == tuple(candidate.shape)
+        dtype_match = base.dtype == candidate.dtype
+        if shape_match:
+            if torch.is_floating_point(base) or torch.is_floating_point(candidate):
+                equal = (base == candidate) | (torch.isnan(base) & torch.isnan(candidate))
+            else:
+                equal = base == candidate
+            num_diff = int(torch.count_nonzero(~equal).item())
+            max_abs = _max_abs(base, candidate)
+        else:
+            num_diff = None
+            max_abs = None
+        return {
+            "key": key,
+            "kind": "tensor",
+            "exact": shape_match and dtype_match and num_diff == 0,
+            "base_shape": list(base.shape),
+            "candidate_shape": list(candidate.shape),
+            "base_dtype": str(base.dtype),
+            "candidate_dtype": str(candidate.dtype),
+            "num_diff": num_diff,
+            "max_abs": max_abs,
+            **(_first_tensor_difference(base, candidate) or {}),
+        }
+    exact = _json_ready(base) == _json_ready(candidate)
+    return {
+        "key": key,
+        "kind": "metadata",
+        "exact": exact,
+        "base": _json_ready(base),
+        "candidate": _json_ready(candidate),
+    }
+
+
+def _gather_decode_rows(
+    payload: dict[str, Any],
+    *,
+    cache_key: str,
+    indices_key: str,
+    lens_key: str,
+    block_table_key: str,
+    block_size_key: str,
+) -> torch.Tensor | None:
+    cache = payload[cache_key]
+    indices = payload[indices_key]
+    if cache is None or indices is None:
+        return None
+    block_size = int(payload["cache_meta"][block_size_key] or cache.shape[1])
+    rows, valid = _physical_rows(
+        cache,
+        indices,
+        payload[lens_key],
+        payload[block_table_key],
+        block_size,
+        name=indices_key,
+    )
+    return rows[valid]
+
+
+def _semantic_decode_row_comparisons(
+    base: dict[str, Any],
+    candidate: dict[str, Any],
+) -> list[dict[str, Any]]:
+    return [
+        _pair_value_diff(
+            "gathered_swa_rows",
+            _gather_decode_rows(
+                base,
+                cache_key="swa_cache",
+                indices_key="swa_indices",
+                lens_key="swa_lens",
+                block_table_key="swa_block_table",
+                block_size_key="swa_block_size",
+            ),
+            _gather_decode_rows(
+                candidate,
+                cache_key="swa_cache",
+                indices_key="swa_indices",
+                lens_key="swa_lens",
+                block_table_key="swa_block_table",
+                block_size_key="swa_block_size",
+            ),
+        ),
+        _pair_value_diff(
+            "gathered_compressed_rows",
+            _gather_decode_rows(
+                base,
+                cache_key="compressed_cache",
+                indices_key="topk_indices",
+                lens_key="topk_lens",
+                block_table_key="compressed_block_table",
+                block_size_key="compressed_block_size",
+            ),
+            _gather_decode_rows(
+                candidate,
+                cache_key="compressed_cache",
+                indices_key="topk_indices",
+                lens_key="topk_lens",
+                block_table_key="compressed_block_table",
+                block_size_key="compressed_block_size",
+            ),
+        ),
+    ]
+
+
+def diff_decode_pair(base_path: str | Path, candidate_path: str | Path) -> dict[str, Any]:
+    """Compare two captured sparse MLA decode payloads field-by-field."""
+    base = load_payload(base_path)
+    candidate = load_payload(candidate_path)
+    if base["stage"] != "decode" or candidate["stage"] != "decode":
+        raise ValueError("diff_decode_pair requires decode payloads")
+    compared: list[dict[str, Any]] = []
+    for key in _DECODE_PAIR_COMPARE_KEYS:
+        if key in base or key in candidate:
+            compared.append(_pair_value_diff(key, base.get(key), candidate.get(key)))
+    compared.extend(_semantic_decode_row_comparisons(base, candidate))
+    first_difference = next(
+        (item["key"] for item in compared if not item["exact"]),
+        None,
+    )
+    first_tensor_difference = next(
+        (
+            item["key"]
+            for item in compared
+            if item["kind"] == "tensor" and not item["exact"]
+        ),
+        None,
+    )
+    first_attention_input_difference = next(
+        (
+            item["key"]
+            for item in compared
+            if item["key"] in (_DECODE_ATTENTION_INPUT_KEYS | _DECODE_SEMANTIC_ROW_KEYS)
+            and not item["exact"]
+        ),
+        None,
+    )
+    return {
+        "schema_version": 1,
+        "decision": "pass" if first_difference is None else "fail",
+        "first_difference": first_difference,
+        "first_tensor_difference": first_tensor_difference,
+        "first_attention_input_difference": first_attention_input_difference,
+        "base": str(base_path),
+        "candidate": str(candidate_path),
+        "base_call": base.get("call"),
+        "candidate_call": candidate.get("call"),
+        "base_observed_call": base.get("observed_call"),
+        "candidate_observed_call": candidate.get("observed_call"),
+        "base_positions": _json_ready(base.get("positions")),
+        "candidate_positions": _json_ready(candidate.get("positions")),
+        "comparisons": compared,
+    }
+
+
 def run_diff(
     corpus: str | Path,
     *,
@@ -631,7 +882,9 @@ def run_diff(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("corpus", type=Path)
+    parser.add_argument("corpus", type=Path, nargs="?")
+    parser.add_argument("--base", type=Path, help="base decode capture for pair diff")
+    parser.add_argument("--candidate", type=Path, help="candidate decode capture for pair diff")
     parser.add_argument("--atol", type=float, default=2e-2)
     parser.add_argument("--rtol", type=float, default=2e-3)
     parser.add_argument("--max-files", type=int)
@@ -641,6 +894,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.base is not None or args.candidate is not None:
+        if args.base is None or args.candidate is None:
+            raise SystemExit("--base and --candidate must be provided together")
+        summary = diff_decode_pair(args.base, args.candidate)
+        text = json.dumps(summary, indent=2, sort_keys=True)
+        print(text)
+        if args.json_out is not None:
+            args.json_out.parent.mkdir(parents=True, exist_ok=True)
+            args.json_out.write_text(text + "\n", encoding="utf-8")
+        return 0 if summary["decision"] == "pass" else 1
+    if args.corpus is None:
+        raise SystemExit("corpus is required unless --base/--candidate are used")
     try:
         summary = run_diff(args.corpus, atol=args.atol, rtol=args.rtol, max_files=args.max_files)
     except (ValueError, RuntimeError, OSError) as exc:

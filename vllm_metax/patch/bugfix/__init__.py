@@ -15,4 +15,9 @@ from . import request_state_reset  # noqa: F401
 from . import transformers_utils
 from . import fp32_logits  # noqa: F401
 from . import dspark_greedy_punctuation_tie  # noqa: F401
+from . import plan08_mtp_debug_loop  # noqa: F401
+from . import mtp_k1_serial_target  # noqa: F401
+from . import plan08_stop_aware_output  # noqa: F401
+from . import batch_invariant_metax  # noqa: F401
 from . import input_batch_condense  # noqa: F401
+from . import mtp_target_runtime_capture  # noqa: F401

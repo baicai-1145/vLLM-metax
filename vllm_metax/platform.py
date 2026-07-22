@@ -50,6 +50,25 @@ pymxsml = import_pymxsml()
 torch.backends.cuda.enable_cudnn_sdp(False)
 
 
+def _dsv4_safe_capture_sizes(vllm_config: "VllmConfig") -> list[int]:
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    if speculative_config is None:
+        return [1]
+    if getattr(speculative_config, "method", None) != "mtp":
+        return [1]
+
+    num_speculative_tokens = getattr(
+        speculative_config, "num_speculative_tokens", None
+    )
+    if (
+        not isinstance(num_speculative_tokens, int)
+        or isinstance(num_speculative_tokens, bool)
+        or not 1 <= num_speculative_tokens <= 4
+    ):
+        return [1]
+    return list(range(1, num_speculative_tokens + 2))
+
+
 def _enforce_dsv4_serial_requests(vllm_config: "VllmConfig") -> bool:
     model_config = vllm_config.model_config
     architectures = getattr(model_config, "architectures", None)
@@ -67,19 +86,18 @@ def _enforce_dsv4_serial_requests(vllm_config: "VllmConfig") -> bool:
     scheduler_config.max_num_seqs = 1
 
     compilation_config = vllm_config.compilation_config
-    capture_sizes = getattr(compilation_config, "cudagraph_capture_sizes", None)
-    if capture_sizes is not None:
-        serial_capture_sizes = [
-            size for size in capture_sizes if size <= 1
-        ] or [1]
-        changed |= serial_capture_sizes != capture_sizes
-        compilation_config.cudagraph_capture_sizes = serial_capture_sizes
+    capture_sizes = _dsv4_safe_capture_sizes(vllm_config)
+    changed |= (
+        getattr(compilation_config, "cudagraph_capture_sizes", None) != capture_sizes
+    )
+    compilation_config.cudagraph_capture_sizes = capture_sizes
     max_capture_size = getattr(
         compilation_config, "max_cudagraph_capture_size", None
     )
     if max_capture_size is not None:
-        changed |= max_capture_size != 1
-        compilation_config.max_cudagraph_capture_size = 1
+        safe_max_capture_size = capture_sizes[-1]
+        changed |= max_capture_size != safe_max_capture_size
+        compilation_config.max_cudagraph_capture_size = safe_max_capture_size
     return changed
 
 
@@ -828,6 +846,7 @@ finally:
         pymxsml.nvmlShutdown()
 
 MacaPlatform = MxsmlMacaPlatform if mxsml_available else NonMxsmlMacaPlatform
+mx_envs.register_metax_envs_with_vllm()
 MacaPlatform.log_warnings()
 
 

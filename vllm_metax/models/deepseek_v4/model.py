@@ -3,6 +3,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import typing
 import os
+import weakref
 from collections.abc import Callable, Iterable, MutableSequence, Sequence
 from itertools import islice
 
@@ -10,7 +11,9 @@ import regex as re
 import torch
 import torch.nn as nn
 
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
@@ -64,10 +67,72 @@ from vllm.model_executor.models.utils import (
 from vllm.model_executor.utils import set_weight_attrs
 from .attention import MacaDeepseekV4Attention
 from .flashmla import MacaDeepseekV4FlashMLAAttention
+from .layer_debug import (
+    copy_graph_layer_decode_output_to_workspace,
+    copy_graph_layer_mhc_input_to_workspace,
+    graph_layer_capture_layer_enabled,
+    graph_weak_capture_stages,
+    graph_layer_workspace_outputs,
+    graph_layer_workspace_mhc_input,
+    layer_capture_enabled,
+    layer_capture_layer_enabled,
+    maybe_capture_mhc_pre_shadow_compare,
+    maybe_layer_capture_context,
+    mhc_pre_shadow_compare_enabled,
+)
+from .ffn_debug import active_ffn_capture, maybe_ffn_capture_context
+from .mtp_candidate import (
+    env_or_k1_candidate_enabled,
+    k1_correctness_candidate_enabled,
+    k1_native_ffn_candidate_enabled,
+    k1_native_mhc_pre_candidate_enabled,
+)
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.platforms import current_platform
+import vllm_metax.envs as mx_envs
+
+logger = init_logger(__name__)
+
+
+@eager_break_during_capture
+def _save_layer_capture_stage_during_capture(
+    layer_idx: int,
+    positions: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+    stage: str,
+    **tensors: torch.Tensor | None,
+) -> None:
+    layer_capture = maybe_layer_capture_context(layer_idx, positions, input_ids)
+    if layer_capture is not None:
+        layer_capture.save_stage(stage, **tensors)
+
+
+@eager_break_during_capture
+def _capture_mhc_pre_shadow_during_capture(
+    *,
+    layer_idx: int,
+    positions: torch.Tensor,
+    residual_cur: torch.Tensor,
+    actual_outputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    mhc_args: tuple,
+) -> None:
+    rowwise_results = [
+        tuple(value.clone() for value in mhc_pre(residual_cur[index : index + 1], *mhc_args))
+        for index in range(residual_cur.shape[0])
+    ]
+    rowwise_outputs = tuple(
+        torch.cat([result[field] for result in rowwise_results], dim=0)
+        for field in range(len(rowwise_results[0]))
+    )
+    maybe_capture_mhc_pre_shadow_compare(
+        layer_idx=layer_idx,
+        positions=positions,
+        residual_cur=residual_cur,
+        actual_outputs=actual_outputs,
+        rowwise_outputs=rowwise_outputs,
+    )
 
 
 class DeepseekV4MLP(nn.Module):
@@ -81,8 +146,24 @@ class DeepseekV4MLP(nn.Module):
         reduce_results: bool = True,
         is_sequence_parallel: bool = False,
         prefix: str = "",
+        layer_idx: int | None = None,
+        chunk_size: int | None = None,
     ) -> None:
         super().__init__()
+        self.layer_idx = layer_idx
+        self._capture_shared_stages = ".shared_experts" in prefix
+        self._prefill_gemm_chunking_enabled = (
+            self._capture_shared_stages
+            and not reduce_results
+            and mx_envs.VLLM_METAX_DSV4_PREFILL_GEMM_CHUNKING
+            and chunk_size is not None
+        )
+        self._prefill_gemm_chunk_size = chunk_size
+        if chunk_size is not None and chunk_size <= 0:
+            raise ValueError(
+                "DeepSeek V4 prefill GEMM chunk size must be positive, got "
+                f"{chunk_size}"
+            )
 
         # If is_sequence_parallel, the input and output tensors are sharded
         # across the ranks within the tp_group. In this case the weights are
@@ -115,9 +196,49 @@ class DeepseekV4MLP(nn.Module):
             self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        capture = (
+            active_ffn_capture(self.layer_idx)
+            if self._capture_shared_stages
+            else None
+        )
+        if capture is not None:
+            capture.record_shared("shared_input", x)
+        chunk_size = getattr(self, "_prefill_gemm_chunk_size", None)
+        if (
+            getattr(self, "_prefill_gemm_chunking_enabled", False)
+            and chunk_size is not None
+            and x.shape[0] > chunk_size
+        ):
+            outputs = []
+            gate_up_chunks = [] if capture is not None else None
+            activation_chunks = [] if capture is not None else None
+            for start in range(0, x.shape[0], chunk_size):
+                chunk = x[start : start + chunk_size]
+                gate_up, _ = self.gate_up_proj(chunk)
+                activation = self.act_fn(gate_up)
+                output, _ = self.down_proj(activation)
+                outputs.append(output)
+                if capture is not None:
+                    gate_up_chunks.append(gate_up)
+                    activation_chunks.append(activation)
+            x = torch.cat(outputs, dim=0)
+            if capture is not None:
+                capture.record_shared(
+                    "gate_up_proj_output", torch.cat(gate_up_chunks, dim=0)
+                )
+                capture.record_shared(
+                    "activation_output", torch.cat(activation_chunks, dim=0)
+                )
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+            if capture is not None:
+                capture.record_shared("gate_up_proj_output", gate_up)
+            x = self.act_fn(gate_up)
+            if capture is not None:
+                capture.record_shared("activation_output", x)
+            x, _ = self.down_proj(x)
+        if capture is not None:
+            capture.record_shared("shared_final_output", x)
         return x
 
 
@@ -489,7 +610,9 @@ class DeepseekV4MoE(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
+        cache_config = vllm_config.cache_config
         self.prefix = prefix
+        self.layer_idx = extract_layer_index(prefix)
         self.use_mega_moe = (
             vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         )
@@ -564,6 +687,10 @@ class DeepseekV4MoE(nn.Module):
                 quant_config=quant_config,
                 reduce_results=self.use_mega_moe,
                 prefix=f"{prefix}.shared_experts",
+                layer_idx=self.layer_idx,
+                chunk_size=(
+                    cache_config.block_size if cache_config is not None else None
+                ),
             )
 
         if self.use_mega_moe:
@@ -659,7 +786,11 @@ class DeepseekV4MoE(nn.Module):
             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
 
         if not self.use_mega_moe:
-            return self._forward_fused_moe(hidden_states, input_ids)
+            with maybe_ffn_capture_context(self.layer_idx, hidden_states) as capture:
+                final_hidden_states = self._forward_fused_moe(hidden_states, input_ids)
+            if capture is not None:
+                capture.finish(final_hidden_states)
+            return final_hidden_states
 
         org_shape = hidden_states.shape
         router_logits, _ = self.gate(hidden_states)
@@ -680,16 +811,19 @@ class DeepseekV4MoE(nn.Module):
         activation_clamp = (
             float(self.swiglu_limit) if self.swiglu_limit is not None else None
         )
-        final_hidden_states = self.experts(
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            activation_clamp=activation_clamp,
-        )
+        with maybe_ffn_capture_context(self.layer_idx, hidden_states) as capture:
+            final_hidden_states = self.experts(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                activation_clamp=activation_clamp,
+            )
 
-        if self.shared_experts is not None:
-            shared_output = self.shared_experts(hidden_states)
-            final_hidden_states += shared_output
+            if self.shared_experts is not None:
+                shared_output = self.shared_experts(hidden_states)
+                final_hidden_states += shared_output
+        if capture is not None:
+            capture.finish(final_hidden_states)
 
         return final_hidden_states.view(org_shape)
 
@@ -745,14 +879,226 @@ _TILELANG_FUSED_STAGES = {
 _MHC_EXACT_PER_TOKEN_MAX_TOKENS = 16
 
 
-def _mhc_fused_post_pre_for_stage(stage: str, *args, **kwargs):
-    if get_mhc_backend_name() == "tilelang" and stage not in _TILELANG_FUSED_STAGES:
-        return mhc_fused_post_pre_torch(*args, **kwargs)
-    return mhc_fused_post_pre(*args, **kwargs)
+def _tokenwise_mhc_pre_layer_selected(
+    stage: str, layer_idx: int | None
+) -> bool:
+    if stage == "ffn":
+        env_name = "VLLM_METAX_DSV4_TOKENWISE_MHC_PRE_AFTER_POST_LAYERS"
+        default_enabled = True
+    elif stage == "attn":
+        env_name = "VLLM_METAX_DSV4_TOKENWISE_MHC_PRE_AFTER_POST_ATTN_LAYERS"
+        default_enabled = False
+    else:
+        return False
+    value = os.getenv(env_name)
+    if value is None or not value.strip():
+        return default_enabled
+    if value.strip().lower() == "all":
+        return True
+    try:
+        selected = {int(item.strip()) for item in value.split(",") if item.strip()}
+    except ValueError as exc:
+        raise ValueError(
+            f"{env_name} must be 'all' or comma-separated nonnegative "
+            "integers"
+        ) from exc
+    if not selected or any(index < 0 for index in selected):
+        raise ValueError(
+            f"{env_name} must be 'all' or comma-separated nonnegative "
+            "integers"
+        )
+    return layer_idx in selected
+
+
+def _tokenwise_mhc_pre_position_mask(
+    positions: torch.Tensor | None,
+    *,
+    num_tokens: int,
+    device: torch.device,
+) -> torch.Tensor:
+    value = os.getenv("VLLM_METAX_DSV4_TOKENWISE_MHC_PRE_AFTER_POST_POSITIONS")
+    if value is None or not value.strip() or value.strip().lower() == "all":
+        return torch.ones(num_tokens, dtype=torch.bool, device=device)
+    try:
+        selected = {int(item.strip()) for item in value.split(",") if item.strip()}
+    except ValueError as exc:
+        raise ValueError(
+            "VLLM_METAX_DSV4_TOKENWISE_MHC_PRE_AFTER_POST_POSITIONS must be "
+            "'all' or comma-separated integers"
+        ) from exc
+    if not selected:
+        raise ValueError(
+            "VLLM_METAX_DSV4_TOKENWISE_MHC_PRE_AFTER_POST_POSITIONS must be "
+            "'all' or comma-separated integers"
+        )
+    if positions is None or positions.numel() != num_tokens:
+        return torch.zeros(num_tokens, dtype=torch.bool, device=device)
+    flat_positions = positions.reshape(-1)
+    mask = torch.zeros(num_tokens, dtype=torch.bool, device=device)
+    for position in selected:
+        mask |= flat_positions == position
+    return mask
+
+
+def _tokenwise_mhc_pre_positions_scoped() -> bool:
+    value = os.getenv("VLLM_METAX_DSV4_TOKENWISE_MHC_PRE_AFTER_POST_POSITIONS")
+    return value is not None and bool(value.strip()) and value.strip().lower() != "all"
+
+
+def _mhc_fused_post_pre_for_stage(
+    stage: str,
+    *args,
+    layer_idx: int | None = None,
+    positions: torch.Tensor | None = None,
+    **kwargs,
+):
+    def run(*call_args):
+        if (
+            get_mhc_backend_name() == "tilelang"
+            and stage not in _TILELANG_FUSED_STAGES
+        ):
+            return mhc_fused_post_pre_torch(*call_args, **kwargs)
+        return mhc_fused_post_pre(*call_args, **kwargs)
+
+    x = args[0]
+    if (
+        os.getenv("VLLM_METAX_DSV4_TOKENWISE_MHC_PRE_AFTER_POST", "0") != "1"
+        or not 1 < x.shape[0] <= 5
+        or not _tokenwise_mhc_pre_layer_selected(stage, layer_idx)
+    ):
+        return run(*args)
+    if get_mhc_backend_name() != "torch":
+        raise RuntimeError(
+            "VLLM_METAX_DSV4_TOKENWISE_MHC_PRE_AFTER_POST=1 requires the "
+            "Torch MHC backend"
+        )
+
+    logger.warning_once(
+        "DeepSeek V4 speculative decode uses batched MHC post and tokenwise pre"
+    )
+    residual_cur = mhc_post(*args[:4])
+    tokenwise_results = []
+    for index in range(residual_cur.shape[0]):
+        tokenwise_results.append(
+            tuple(
+                value.clone()
+                for value in mhc_pre(
+                    residual_cur[index : index + 1], *args[4:], **kwargs
+                )
+            )
+        )
+    pre_outputs = tuple(
+        torch.cat([result[field] for result in tokenwise_results], dim=0)
+        for field in range(len(tokenwise_results[0]))
+    )
+    if not _tokenwise_mhc_pre_positions_scoped():
+        return residual_cur, *pre_outputs
+    batched_outputs = mhc_pre(residual_cur, *args[4:], **kwargs)
+    selected = _tokenwise_mhc_pre_position_mask(
+        positions,
+        num_tokens=residual_cur.shape[0],
+        device=residual_cur.device,
+    )
+    merged_outputs = tuple(
+        torch.where(
+            selected.view(selected.shape[0], *([1] * (rowwise.ndim - 1))),
+            rowwise,
+            batched,
+        )
+        for batched, rowwise in zip(batched_outputs, pre_outputs, strict=True)
+    )
+    return residual_cur, *merged_outputs
 
 
 def _mhc_exact_pre_rms_enabled() -> bool:
     return os.getenv("VLLM_METAX_DSV4_MHC_EXACT_PRE_RMS", "0") == "1"
+
+
+def _mhc_pre_for_input(x: torch.Tensor, *args):
+    if (
+        (
+            not env_or_k1_candidate_enabled("VLLM_METAX_DSV4_TOKENWISE_MHC_PRE")
+            or k1_native_mhc_pre_candidate_enabled()
+        )
+        and os.getenv("VLLM_METAX_DSV4_TOKENWISE_MHC_PRE") != "1"
+        or not 1 < x.shape[0] <= 5
+    ):
+        return mhc_pre(x, *args)
+    logger.warning_once(
+        "DeepSeek V4 speculative decode uses tokenwise initial MHC pre"
+    )
+    tokenwise_results = [
+        tuple(value.clone() for value in mhc_pre(x[index : index + 1], *args))
+        for index in range(x.shape[0])
+    ]
+    return tuple(
+        torch.cat([result[field] for result in tokenwise_results], dim=0)
+        for field in range(len(tokenwise_results[0]))
+    )
+
+
+def _tokenwise_ffn_selected_indices(
+    positions: torch.Tensor | None,
+    x: torch.Tensor,
+) -> torch.Tensor:
+    if k1_correctness_candidate_enabled():
+        return torch.arange(x.shape[0], device=x.device)
+    value = os.getenv("VLLM_METAX_DSV4_TOKENWISE_FFN_POSITIONS")
+    if positions is None or value is None or not value.strip() or value.strip().lower() == "all":
+        return torch.arange(x.shape[0], device=x.device)
+    try:
+        selected = {int(item.strip()) for item in value.split(",") if item.strip()}
+    except ValueError as exc:
+        raise ValueError(
+            "VLLM_METAX_DSV4_TOKENWISE_FFN_POSITIONS must be 'all' or a "
+            "comma-separated set of integer positions"
+        ) from exc
+    if not selected:
+        return torch.arange(x.shape[0], device=x.device)
+    flat_positions = positions.detach().reshape(-1)
+    mask = torch.zeros_like(flat_positions, dtype=torch.bool)
+    for position in selected:
+        mask |= flat_positions == position
+    return torch.nonzero(mask, as_tuple=False).reshape(-1)
+
+
+def _ffn_for_input(
+    ffn: Callable,
+    x: torch.Tensor,
+    input_ids: torch.Tensor | None,
+    positions: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if (
+        (
+            not env_or_k1_candidate_enabled("VLLM_METAX_DSV4_TOKENWISE_FFN")
+            or k1_native_ffn_candidate_enabled()
+        )
+        and os.getenv("VLLM_METAX_DSV4_TOKENWISE_FFN") != "1"
+        or not 1 < x.shape[0] <= 5
+    ):
+        return ffn(x, input_ids)
+    selected_indices = _tokenwise_ffn_selected_indices(positions, x)
+    if selected_indices.numel() == 0:
+        return ffn(x, input_ids)
+    logger.warning_once("DeepSeek V4 speculative decode uses tokenwise FFN")
+    if selected_indices.numel() != x.shape[0]:
+        output = ffn(x, input_ids)
+        for index in selected_indices.tolist():
+            output[index : index + 1] = ffn(
+                x[index : index + 1],
+                None if input_ids is None else input_ids[index : index + 1],
+            ).clone()
+        return output.contiguous()
+    return torch.cat(
+        [
+            ffn(
+                x[index : index + 1],
+                None if input_ids is None else input_ids[index : index + 1],
+            ).clone()
+            for index in range(x.shape[0])
+        ],
+        dim=0,
+    )
 
 
 def _mhc_exact_post_pre_rms_for_stage(
@@ -858,6 +1204,44 @@ class DeepseekV4DecoderLayer(nn.Module):
         self._mhc_exact_workspace: dict[
             tuple[int, str, int], dict[str, torch.Tensor]
         ] = {}
+        self._layer_capture_enabled = (
+            layer_capture_enabled()
+            and layer_capture_layer_enabled(self.layer_idx)
+        )
+        self._graph_capture_output_enabled = graph_layer_capture_layer_enabled(
+            self.layer_idx
+        )
+        self._graph_weak_capture_stages = graph_weak_capture_stages(self.layer_idx)
+        self._graph_weak_refs: dict[
+            str, tuple[weakref.ReferenceType[torch.Tensor], ...]
+        ] = {}
+
+    def _store_graph_weak_refs(
+        self,
+        stage: str,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        res_mix: torch.Tensor,
+    ) -> None:
+        if stage not in self._graph_weak_capture_stages:
+            return
+        self._graph_weak_refs[stage] = tuple(
+            weakref.ref(value)
+            for value in (hidden_states, residual, post_mix, res_mix)
+        )
+
+    def get_graph_weak_stage_buffers(
+        self,
+    ) -> dict[
+        str, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    ]:
+        stages = {}
+        for stage, references in self._graph_weak_refs.items():
+            values = tuple(reference() for reference in references)
+            if all(isinstance(value, torch.Tensor) for value in values):
+                stages[stage] = values
+        return stages
 
     def forward(
         self,
@@ -871,7 +1255,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         exact_result = None
         if residual is None:
             residual = x
-            post_mix, res_mix, x = mhc_pre(
+            post_mix, res_mix, x = _mhc_pre_for_input(
                 x,
                 self.hc_attn_fn,
                 self.hc_attn_scale,
@@ -885,6 +1269,13 @@ class DeepseekV4DecoderLayer(nn.Module):
         else:
             prev_x, prev_residual = x, residual
             prev_post_mix, prev_res_mix = post_mix, res_mix
+            self._store_graph_weak_refs(
+                "before_mhc",
+                prev_x,
+                prev_residual,
+                prev_post_mix,
+                prev_res_mix,
+            )
             exact_result = _mhc_exact_post_pre_rms_for_stage(
                 "attn",
                 x,
@@ -917,10 +1308,18 @@ class DeepseekV4DecoderLayer(nn.Module):
                     self.hc_eps,
                     self.hc_post_alpha,
                     self.hc_sinkhorn_iters,
+                    layer_idx=self.layer_idx,
+                    positions=positions,
                 )
                 normalized_x = None
             else:
                 residual, post_mix, res_mix, x, normalized_x = exact_result
+            if self._graph_capture_output_enabled:
+                copy_graph_layer_mhc_input_to_workspace(
+                    self._mhc_exact_workspace,
+                    self.attn_norm.weight,
+                    prev_x,
+                )
             if mhc_diff_enabled():
                 compare_fused_post_pre(
                     layer_idx=self.layer_idx,
@@ -962,7 +1361,37 @@ class DeepseekV4DecoderLayer(nn.Module):
             sinkhorn_repeat=self.hc_sinkhorn_iters,
             n_splits=1,
         )
+        if self._layer_capture_enabled:
+            _save_layer_capture_stage_during_capture(
+                self.layer_idx,
+                positions,
+                input_ids,
+                "before_attention",
+                hidden_states=x,
+                residual=residual,
+                post_mix=post_mix,
+                res_mix=res_mix,
+                pre_norm=pre_attn_norm,
+            )
         x = self.attn(positions, x, None)
+        self._store_graph_weak_refs(
+            "after_attention", x, residual, post_mix, res_mix
+        )
+        if self._layer_capture_enabled:
+            _save_layer_capture_stage_during_capture(
+                self.layer_idx,
+                positions,
+                input_ids,
+                "after_attention",
+                hidden_states=x,
+                residual=residual,
+                post_mix=post_mix,
+                res_mix=res_mix,
+            )
+        if self._graph_capture_output_enabled:
+            copy_graph_layer_decode_output_to_workspace(
+                self._mhc_exact_workspace, self.attn_norm.weight, x
+            )
 
         prev_x, prev_residual = x, residual
         prev_post_mix, prev_res_mix = post_mix, res_mix
@@ -1000,10 +1429,34 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_post_alpha,
                 self.hc_sinkhorn_iters,
                 n_splits=1,
+                layer_idx=self.layer_idx,
+                positions=positions,
             )
             normalized_x = None
         else:
             residual, post_mix, res_mix, x, normalized_x = exact_result
+        if (
+            exact_result is None
+            and mhc_pre_shadow_compare_enabled()
+            and layer_capture_layer_enabled(self.layer_idx)
+        ):
+            _capture_mhc_pre_shadow_during_capture(
+                layer_idx=self.layer_idx,
+                positions=positions,
+                residual_cur=residual,
+                actual_outputs=(post_mix, res_mix, x),
+                mhc_args=(
+                    self.hc_ffn_fn,
+                    self.hc_ffn_scale,
+                    self.hc_ffn_base,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                    self.hc_eps,
+                    self.hc_post_alpha,
+                    self.hc_sinkhorn_iters,
+                    1,
+                ),
+            )
         if mhc_diff_enabled():
             compare_fused_post_pre(
                 layer_idx=self.layer_idx,
@@ -1024,6 +1477,18 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
         pre_ffn_norm = x
         x = self.ffn_norm(x) if exact_result is None else normalized_x
+        if self._layer_capture_enabled:
+            _save_layer_capture_stage_during_capture(
+                self.layer_idx,
+                positions,
+                input_ids,
+                "ffn_input",
+                hidden_states=x,
+                residual=residual,
+                post_mix=post_mix,
+                res_mix=res_mix,
+                pre_norm=pre_ffn_norm,
+            )
         maybe_capture_mhc_raw_norm(
             layer_idx=self.layer_idx,
             stage="ffn",
@@ -1041,8 +1506,62 @@ class DeepseekV4DecoderLayer(nn.Module):
             sinkhorn_repeat=self.hc_sinkhorn_iters,
             n_splits=1,
         )
-        x = self.ffn(x, input_ids)
+        x = _ffn_for_input(self.ffn, x, input_ids, positions)
+        self._store_graph_weak_refs("after_ffn", x, residual, post_mix, res_mix)
+        if self._layer_capture_enabled:
+            _save_layer_capture_stage_during_capture(
+                self.layer_idx,
+                positions,
+                input_ids,
+                "after_ffn",
+                hidden_states=x,
+                residual=residual,
+                post_mix=post_mix,
+                res_mix=res_mix,
+                pre_norm=pre_ffn_norm,
+            )
+        if self._graph_capture_output_enabled:
+            copy_graph_layer_decode_output_to_workspace(
+                self._mhc_exact_workspace, self.ffn_norm.weight, x
+            )
         return x, residual, post_mix, res_mix
+
+    def get_graph_capture_output_buffers(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        if not self._graph_capture_output_enabled:
+            return None
+        return graph_layer_workspace_outputs(
+            self._mhc_exact_workspace, self.ffn_norm.weight
+        )
+
+    def get_graph_capture_stage_buffers(
+        self,
+    ) -> dict[
+        str, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    ]:
+        if not self._graph_capture_output_enabled:
+            return {}
+        stages = {}
+        for stage, norm_weight in (
+            ("after_attention", self.attn_norm.weight),
+            ("after_ffn", self.ffn_norm.weight),
+        ):
+            outputs = graph_layer_workspace_outputs(
+                self._mhc_exact_workspace, norm_weight
+            )
+            if outputs is not None:
+                stages[stage] = outputs
+        return stages
+
+    def get_graph_capture_mhc_input(self) -> torch.Tensor | None:
+        if not self._graph_capture_output_enabled:
+            return None
+        return graph_layer_workspace_mhc_input(
+            self._mhc_exact_workspace,
+            self.attn_norm.weight,
+            self.hidden_size,
+        )
 
 
 class DeepseekV4Model(nn.Module):

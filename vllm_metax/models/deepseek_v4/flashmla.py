@@ -25,6 +25,11 @@ from .ops import (
 from .sparse_mla import (
     MacaDeepseekV4FlashMLABackend,
 )
+from .mtp_candidate import (
+    env_or_k1_candidate_enabled,
+    k1_correctness_candidate_enabled,
+    k1_native_o_proj_candidate_enabled,
+)
 from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLAMetadata,
 )
@@ -42,6 +47,40 @@ if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 logger = init_logger(__name__)
+_TOKENWISE_O_PROJ_POSITIONS_ENV = "VLLM_METAX_DSV4_TOKENWISE_O_PROJ_POSITIONS"
+
+
+def _tokenwise_o_proj_selected_indices(positions: torch.Tensor) -> torch.Tensor:
+    flat_positions = positions.detach().reshape(-1)
+    if k1_correctness_candidate_enabled():
+        return torch.arange(flat_positions.numel(), device=positions.device)
+    value = os.getenv(_TOKENWISE_O_PROJ_POSITIONS_ENV)
+    if value is None or not value.strip() or value.strip().lower() == "all":
+        return torch.arange(flat_positions.numel(), device=positions.device)
+    try:
+        selected = {int(item.strip()) for item in value.split(",") if item.strip()}
+    except ValueError as exc:
+        raise ValueError(
+            f"{_TOKENWISE_O_PROJ_POSITIONS_ENV} must be 'all' or a "
+            "comma-separated set of integer positions"
+        ) from exc
+    if not selected:
+        return torch.arange(flat_positions.numel(), device=positions.device)
+    mask = torch.zeros_like(flat_positions, dtype=torch.bool)
+    for position in selected:
+        mask |= flat_positions == position
+    return torch.nonzero(mask, as_tuple=False).reshape(-1)
+
+
+def _tokenwise_o_proj_enabled() -> bool:
+    if os.getenv("VLLM_METAX_DSV4_TOKENWISE_O_PROJ") == "1":
+        return True
+    if (
+        k1_correctness_candidate_enabled()
+        and not k1_native_o_proj_candidate_enabled()
+    ):
+        return True
+    return False
 
 _SPARSE_MLA_DECODE_BACKEND_ENV = "VLLM_METAX_DSV4_SPARSE_MLA_DECODE_BACKEND"
 _SPARSE_MLA_DECODE_BACKENDS = {"native", "torch_reference"}
@@ -383,6 +422,35 @@ def _maybe_sync_sparse_mla_decode(q: torch.Tensor) -> None:
         _synchronize_sparse_mla_decode(q)
 
 
+def _run_sparse_mla_decode(**kwargs) -> None:
+    q = kwargs["q"]
+    if (
+        os.getenv("VLLM_METAX_DSV4_TOKENWISE_SPARSE_MLA_DECODE") != "1"
+        or not 1 < q.shape[0] <= 5
+    ):
+        sparse_mla_decode(**kwargs)
+        return
+    logger.warning_once(
+        "DeepSeek V4 speculative attention uses tokenwise sparse MLA decode"
+    )
+    token_aligned = (
+        "q",
+        "swa_indices",
+        "topk_indices",
+        "swa_lens",
+        "topk_lens",
+        "token_to_req",
+        "out",
+    )
+    for index in range(q.shape[0]):
+        row_kwargs = kwargs.copy()
+        for name in token_aligned:
+            value = row_kwargs[name]
+            if value is not None:
+                row_kwargs[name] = value[index : index + 1]
+        sparse_mla_decode(**row_kwargs)
+
+
 def _warn_torch_reference_decode() -> None:
     global _torch_reference_warning_emitted
     if _torch_reference_warning_emitted:
@@ -451,18 +519,72 @@ class MacaDeepseekV4FlashMLAAttention(MacaDeepseekV4Attention):
         return probs, out
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        return deep_gemm_bf16_o_proj(
-            o,
-            positions,
-            self.rotary_emb.cos_sin_cache,
-            self.wo_a,
-            self.wo_b,
-            n_groups=self.n_local_groups,
-            heads_per_group=self.n_local_heads // self.n_local_groups,
-            nope_dim=self.nope_head_dim,
-            rope_dim=self.rope_head_dim,
-            o_lora_rank=self.o_lora_rank,
-        )
+        def project(
+            o_chunk: torch.Tensor,
+            positions_chunk: torch.Tensor,
+            chunk_index: int,
+        ):
+            return deep_gemm_bf16_o_proj(
+                o_chunk,
+                positions_chunk,
+                self.rotary_emb.cos_sin_cache,
+                self.wo_a,
+                self.wo_b,
+                n_groups=self.n_local_groups,
+                heads_per_group=self.n_local_heads // self.n_local_groups,
+                nope_dim=self.nope_head_dim,
+                rope_dim=self.rope_head_dim,
+                o_lora_rank=self.o_lora_rank,
+                layer_idx=self.layer_idx,
+                chunk_index=chunk_index,
+            )
+
+        if (
+            _tokenwise_o_proj_enabled()
+            and 1 < o.shape[0] <= 5
+        ):
+            selected_indices = _tokenwise_o_proj_selected_indices(positions)
+            if selected_indices.numel() == 0:
+                return project(o, positions, 0)
+            logger.warning_once(
+                "DeepSeek V4 speculative attention uses tokenwise output "
+                "projection"
+            )
+            if selected_indices.numel() == o.shape[0]:
+                return torch.cat(
+                    [
+                        project(
+                            o[index : index + 1],
+                            positions[index : index + 1],
+                            index,
+                        ).clone()
+                        for index in range(o.shape[0])
+                    ],
+                    dim=0,
+                )
+            output = project(o, positions, 0)
+            for index in selected_indices.tolist():
+                output[index : index + 1] = project(
+                    o[index : index + 1],
+                    positions[index : index + 1],
+                    index,
+                ).clone()
+            return output.contiguous()
+
+        if (
+            not self._prefill_gemm_chunking_enabled
+            or o.shape[0] <= self._prefill_gemm_chunk_size
+        ):
+            return project(o, positions, 0)
+
+        outputs = []
+        chunk_size = self._prefill_gemm_chunk_size
+        for chunk_index, start in enumerate(range(0, o.shape[0], chunk_size)):
+            end = start + chunk_size
+            outputs.append(
+                project(o[start:end], positions[start:end], chunk_index)
+            )
+        return torch.cat(outputs, dim=0)
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
@@ -548,6 +670,7 @@ class MacaDeepseekV4FlashMLAAttention(MacaDeepseekV4Attention):
         if num_decodes > 0:
             self._forward_decode(
                 q=q[:num_decode_tokens],
+                positions=positions[:num_decode_tokens],
                 kv_cache=self_kv_cache,
                 swa_metadata=swa_metadata,
                 attn_metadata=flashmla_metadata,
@@ -558,6 +681,7 @@ class MacaDeepseekV4FlashMLAAttention(MacaDeepseekV4Attention):
     def _forward_decode(
         self,
         q: torch.Tensor,
+        positions: torch.Tensor,
         kv_cache: torch.Tensor | None,  # Only used when compress_ratio > 1
         swa_metadata: "DeepseekSparseSWAMetadata",
         attn_metadata: DeepseekV4FlashMLAMetadata | None,
@@ -642,7 +766,7 @@ class MacaDeepseekV4FlashMLAAttention(MacaDeepseekV4Attention):
                 scale=self.scale,
             )
         else:
-            sparse_mla_decode(
+            _run_sparse_mla_decode(
                 q=capture_q,
                 swa_cache=capture_swa_cache,
                 compressed_cache=capture_compressed_cache,
@@ -708,6 +832,12 @@ class MacaDeepseekV4FlashMLAAttention(MacaDeepseekV4Attention):
                 d_v=output.shape[-1],
                 attn_sink=self.attn_sink,
                 output=output,
+                positions=positions,
+                token_to_req=(
+                    swa_metadata.token_to_req_indices[:num_decode_tokens]
+                    if swa_metadata.token_to_req_indices is not None
+                    else None
+                ),
                 swa_block_table=swa_metadata.block_table,
                 compressed_block_table=(
                     attn_metadata.block_table
@@ -724,6 +854,7 @@ class MacaDeepseekV4FlashMLAAttention(MacaDeepseekV4Attention):
                 window_size=self.window_size,
                 decode_backend=decode_backend,
                 native_decode_mode=SPARSE_MLA_DECODE_MODE,
+                layer_idx=self.layer_idx,
             )
 
     def _forward_prefill(
@@ -845,4 +976,5 @@ class MacaDeepseekV4FlashMLAAttention(MacaDeepseekV4Attention):
                 topk_length=combined_lens,
                 out=output[query_start:query_end],
                 compress_ratio=self.compress_ratio,
+                layer_idx=self.layer_idx,
             )

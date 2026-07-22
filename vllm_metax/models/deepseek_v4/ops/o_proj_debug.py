@@ -16,6 +16,63 @@ SCHEMA_VERSION = 1
 _CAPTURE_CALL_COUNT = 0
 _CAPTURE_SKIP_COUNTS: dict[str, int] = {}
 _CAPTURE_LOCK = threading.Lock()
+_CAPTURE_LAYERS_ENV = "VLLM_METAX_DSV4_O_PROJ_CAPTURE_LAYERS"
+_CAPTURE_TOKEN_COUNTS_ENV = "VLLM_METAX_DSV4_O_PROJ_CAPTURE_TOKEN_COUNTS"
+_CAPTURE_POSITION_RANGES_ENV = (
+    "VLLM_METAX_DSV4_O_PROJ_CAPTURE_POSITION_RANGES"
+)
+_CAPTURE_WO_B_STAGES_ENV = "VLLM_METAX_DSV4_O_PROJ_CAPTURE_WO_B_STAGES"
+
+
+def wo_b_stage_capture_enabled() -> bool:
+    """Return whether the opt-in RowParallelLinear stage split is enabled."""
+    return os.getenv(_CAPTURE_WO_B_STAGES_ENV, "").strip() == "1"
+
+
+def apply_wo_b_with_stages(
+    wo_b: nn.Module, input_: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply the production ``wo_b`` contract while retaining both stages."""
+    expected = {
+        "input_is_parallel": True,
+        "reduce_results": True,
+        "return_bias": False,
+        "skip_bias_add": False,
+        "tp_size": 4,
+    }
+    mismatches = []
+    for name, value in expected.items():
+        actual = getattr(wo_b, name, None)
+        if actual != value:
+            mismatches.append(f"{name}={actual!r} (expected {value!r})")
+    if getattr(wo_b, "bias", None) is not None:
+        mismatches.append("bias must be None")
+    quant_method = getattr(wo_b, "quant_method", None)
+    apply = getattr(quant_method, "apply", None)
+    if not callable(apply):
+        mismatches.append("quant_method.apply must be callable")
+    if mismatches:
+        raise RuntimeError(
+            "VLLM_METAX_DSV4_O_PROJ_CAPTURE_WO_B_STAGES requires the "
+            "DeepSeek-V4 wo_b RowParallelLinear contract; "
+            + "; ".join(mismatches)
+        )
+
+    local = apply(wo_b, input_, None)
+    if not isinstance(local, torch.Tensor):
+        raise RuntimeError(
+            "VLLM_METAX_DSV4_O_PROJ_CAPTURE_WO_B_STAGES requires "
+            "quant_method.apply to return a tensor"
+        )
+    from vllm.distributed import tensor_model_parallel_all_reduce
+
+    reduced = tensor_model_parallel_all_reduce(local)
+    if not isinstance(reduced, torch.Tensor):
+        raise RuntimeError(
+            "VLLM_METAX_DSV4_O_PROJ_CAPTURE_WO_B_STAGES requires "
+            "tensor_model_parallel_all_reduce to return a tensor"
+        )
+    return local, reduced
 
 
 def _rank() -> str:
@@ -52,6 +109,122 @@ def _rank_enabled(rank: str) -> bool:
     if not value or value.strip().lower() == "all":
         return True
     return rank in {item.strip() for item in value.split(",") if item.strip()}
+
+
+def _capture_layers() -> set[int] | None:
+    value = os.getenv(_CAPTURE_LAYERS_ENV, "").strip()
+    if not value or value.lower() == "all":
+        return None
+
+    layers: set[int] = set()
+    for item in value.split(","):
+        item = item.strip()
+        try:
+            layer_idx = int(item)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid {_CAPTURE_LAYERS_ENV}={value!r}; expected 'all' or "
+                "comma-separated non-negative integers"
+            ) from exc
+        if layer_idx < 0:
+            raise ValueError(
+                f"Invalid {_CAPTURE_LAYERS_ENV}={value!r}; expected 'all' or "
+                "comma-separated non-negative integers"
+            )
+        layers.add(layer_idx)
+    return layers
+
+
+def _layer_enabled(layer_idx: int | None) -> bool:
+    layers = _capture_layers()
+    return layers is None or layer_idx in layers
+
+
+def _capture_token_counts() -> set[int] | None:
+    value = os.getenv(_CAPTURE_TOKEN_COUNTS_ENV, "").strip()
+    if not value or value.lower() == "all":
+        return None
+
+    counts: set[int] = set()
+    for item in value.split(","):
+        item = item.strip()
+        try:
+            count = int(item)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid {_CAPTURE_TOKEN_COUNTS_ENV}={value!r}; expected "
+                "'all' or comma-separated positive integers"
+            ) from exc
+        if count <= 0:
+            raise ValueError(
+                f"Invalid {_CAPTURE_TOKEN_COUNTS_ENV}={value!r}; expected "
+                "'all' or comma-separated positive integers"
+            )
+        counts.add(count)
+    return counts
+
+
+def _token_count_enabled(token_count: int) -> bool:
+    counts = _capture_token_counts()
+    return counts is None or token_count in counts
+
+
+def _capture_position_ranges() -> tuple[tuple[int, int], ...] | None:
+    value = os.getenv(_CAPTURE_POSITION_RANGES_ENV, "").strip()
+    if not value or value.lower() == "all":
+        return None
+
+    ranges = []
+    for item in value.split(","):
+        item = item.strip()
+        parts = item.split(":")
+        try:
+            if len(parts) != 2:
+                raise ValueError
+            start, end = (int(part.strip()) for part in parts)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid {_CAPTURE_POSITION_RANGES_ENV}={value!r}; expected "
+                "'all' or comma-separated inclusive start:end ranges"
+            ) from exc
+        if start < 0 or end < start:
+            raise ValueError(
+                f"Invalid {_CAPTURE_POSITION_RANGES_ENV}={value!r}; expected "
+                "ranges with 0 <= start <= end"
+            )
+        ranges.append((start, end))
+    return tuple(ranges)
+
+
+def _positions_enabled(positions: torch.Tensor) -> bool:
+    ranges = _capture_position_ranges()
+    if ranges is None:
+        return True
+    if (
+        positions.ndim != 1
+        or positions.dtype == torch.bool
+        or positions.dtype.is_floating_point
+        or positions.dtype.is_complex
+    ):
+        return False
+    matching_ranges = tuple(
+        (start, end)
+        for start, end in ranges
+        if positions.numel() == end - start + 1
+    )
+    if not matching_ranges:
+        return False
+
+    positions_cpu = positions.detach().contiguous().cpu()
+    for start, end in matching_ranges:
+        expected = torch.arange(
+            start,
+            end + 1,
+            dtype=positions_cpu.dtype,
+        )
+        if torch.equal(positions_cpu, expected):
+            return True
+    return False
 
 
 def _max_calls() -> int:
@@ -145,6 +318,9 @@ def maybe_capture_o_proj(
     nope_dim: int,
     rope_dim: int,
     o_lora_rank: int,
+    wo_b_local: torch.Tensor | None = None,
+    layer_idx: int | None = None,
+    chunk_index: int | None = None,
 ) -> None:
     """Capture one completed native call when the explicit env hook is enabled."""
     # Keep this preflight before metadata/weight inspection or tensor copies.
@@ -153,6 +329,13 @@ def maybe_capture_o_proj(
         return
     rank = _rank()
     if not _rank_enabled(rank):
+        return
+    layer_enabled = _layer_enabled(layer_idx)
+    token_count_enabled = _token_count_enabled(positions.numel())
+    if not token_count_enabled:
+        return
+    positions_enabled = _positions_enabled(positions)
+    if not layer_enabled or not positions_enabled:
         return
 
     global _CAPTURE_CALL_COUNT
@@ -188,11 +371,15 @@ def maybe_capture_o_proj(
         "z": _clone_to_cpu(z),
         "output": _clone_to_cpu(output),
     }
+    if wo_b_local is not None:
+        tensors["wo_b_local"] = _clone_to_cpu(wo_b_local)
     payload: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "op": "deepseek_v4_o_proj",
         "rank": int(rank) if rank.isdigit() else rank,
         "call": call,
+        "layer_idx": layer_idx,
+        "chunk_index": chunk_index,
         **tensors,
         "params": {
             "n_groups": int(n_groups),
@@ -213,7 +400,12 @@ def maybe_capture_o_proj(
         },
         "intermediate_meta": {
             key: _tensor_meta(value)
-            for key, value in {"o_bf16": o_bf16, "z": z, "output": output}.items()
+            for key, value in {
+                "o_bf16": o_bf16,
+                "z": z,
+                "output": output,
+                **({"wo_b_local": wo_b_local} if wo_b_local is not None else {}),
+            }.items()
         },
     }
     _atomic_torch_save(payload, path)
@@ -237,6 +429,11 @@ def load_capture(path: str | Path) -> dict[str, Any]:
     for key in required - {"schema_version", "op", "rank", "call", "params", "input_meta", "intermediate_meta"}:
         if not isinstance(payload[key], torch.Tensor) or payload[key].device.type != "cpu":
             raise ValueError(f"{payload_path}: {key} must be a CPU tensor")
+    if "wo_b_local" in payload and (
+        not isinstance(payload["wo_b_local"], torch.Tensor)
+        or payload["wo_b_local"].device.type != "cpu"
+    ):
+        raise ValueError(f"{payload_path}: wo_b_local must be a CPU tensor")
     return payload
 
 
@@ -302,7 +499,7 @@ def torch_o_proj_trace(
     wo_a_bf16 = wo_a.to(o.device).view(n_groups, o_lora_rank, -1)
     z = torch.einsum("bhr,hdr->bhd", o_bf16, wo_a_bf16)
     output = torch.nn.functional.linear(z.flatten(1), wo_b.to(o.device))
-    return {"o_bf16": o_bf16, "z": z, "output": output}
+    return {"o_bf16": o_bf16, "z": z, "wo_b_local": output, "output": output}
 
 
 def replay_torch(payload: dict[str, Any]) -> dict[str, torch.Tensor]:
@@ -390,7 +587,7 @@ def tensor_diff(lhs: torch.Tensor, rhs: torch.Tensor) -> dict[str, Any]:
 
 def compare_trace(reference: dict[str, torch.Tensor], candidate: dict[str, torch.Tensor]) -> dict[str, Any]:
     stages = {}
-    for name in ("o_bf16", "z", "output"):
+    for name in ("o_bf16", "z", "wo_b_local", "output"):
         if name in reference and name in candidate:
             stages[name] = tensor_diff(reference[name], candidate[name])
     return {"passed": all(item["equal"] for item in stages.values()), "stages": stages}
@@ -399,7 +596,11 @@ def compare_trace(reference: dict[str, torch.Tensor], candidate: dict[str, torch
 def replay_capture(path: str | Path, backend: str = "torch") -> dict[str, Any]:
     payload = load_capture(path)
     candidate = replay_torch(payload) if backend == "torch" else replay_native(payload)
-    reference = {name: payload[name] for name in ("o_bf16", "z", "output") if name in payload}
+    reference = {
+        name: payload[name]
+        for name in ("o_bf16", "z", "wo_b_local", "output")
+        if name in payload
+    }
     return {"path": str(path), "backend": backend, **compare_trace(reference, candidate)}
 
 
@@ -417,6 +618,7 @@ def assert_bitwise_trace_equal(
 
 __all__ = [
     "assert_bitwise_trace_equal",
+    "apply_wo_b_with_stages",
     "compare_trace",
     "load_capture",
     "maybe_capture_o_proj",
@@ -426,4 +628,5 @@ __all__ = [
     "reset_o_proj_capture_state",
     "tensor_diff",
     "torch_o_proj_trace",
+    "wo_b_stage_capture_enabled",
 ]

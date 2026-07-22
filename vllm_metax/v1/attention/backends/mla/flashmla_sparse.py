@@ -605,7 +605,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             kernel_meta = FlashMLASparseMetadata.FP8KernelMetadata(
                 scheduler_metadata=scheduler_metadata,
                 dummy_block_table=self.dummy_block_table[:num_decodes],
-                cache_lens=self.max_model_len_tensor[:num_decodes],
+                cache_lens=common_attn_metadata.seq_lens[:num_decodes],
             )
             fp8_metadata.decode = FP8Meta.Decode(
                 seq_lens=common_attn_metadata.seq_lens[:num_decodes],
@@ -649,7 +649,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             kernel_meta = FlashMLASparseMetadata.BF16KernelMetadata(
                 scheduler_metadata=scheduler_metadata,
                 dummy_block_table=self.dummy_block_table[:num_decodes],
-                cache_lens=self.max_model_len_tensor[:num_decodes],
+                cache_lens=common_attn_metadata.seq_lens[:num_decodes],
             )
             bf16_metadata.decode = BF16Meta.Decode(
                 seq_lens=common_attn_metadata.seq_lens[:num_decodes],
@@ -1150,6 +1150,7 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             is_fp8_kvcache=True,
             indices=topk_indices,
             softmax_scale=self.softmax_scale,
+            causal=True,
         )
 
         # Slice output back to actual head count if we padded
@@ -1221,6 +1222,7 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             tile_scheduler_metadata=kernel_metadata.scheduler_metadata,
             softmax_scale=self.softmax_scale,
             indices=topk_indices,
+            causal=True,
         )
 
         if actual_num_heads < padded_num_heads:

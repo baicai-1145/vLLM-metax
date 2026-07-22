@@ -120,6 +120,7 @@ def flash_mla_sparse_fwd_wrapper(
     topk_length: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     compress_ratio: int | None = None,
+    layer_idx: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Sparse attention prefill kernel
@@ -174,6 +175,7 @@ def flash_mla_sparse_fwd_wrapper(
         max_logits=max_logits,
         lse=lse,
         compress_ratio=compress_ratio,
+        layer_idx=layer_idx,
     )
     return output, max_logits, lse
 

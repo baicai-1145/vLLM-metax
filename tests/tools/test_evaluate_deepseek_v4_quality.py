@@ -319,6 +319,110 @@ def test_cli_has_fixed_acceptance_defaults_and_explicit_data_artifact_options():
     assert disabled_args.enable_prefix_caching is False
 
 
+def test_evaluate_quality_records_mtp_speculative_config_and_capture_sizes(tmp_path):
+    class FakeLLM:
+        def generate(self, prompts, params, use_tqdm=False):
+            return [
+                SimpleNamespace(
+                    outputs=[
+                        SimpleNamespace(text="#### 1", token_ids=[7], finish_reason="stop")
+                    ]
+                )
+                for _ in prompts
+            ]
+
+    kwargs = {}
+    result = evaluate_quality(
+        train_examples=[{"question": "example", "answer": "#### 1"}],
+        test_examples=[{"question": "q0", "answer": "#### 1"}],
+        model="fake",
+        artifact_path=tmp_path / "mtp.json",
+        num_speculative_tokens=4,
+        llm_factory=lambda **values: (kwargs.update(values) or FakeLLM()),
+        sampling_params_factory=lambda **values: values,
+    )
+
+    assert kwargs["speculative_config"] == {
+        "method": "mtp",
+        "num_speculative_tokens": 4,
+    }
+    assert result["manifest"]["mtp"] == 4
+    assert result["manifest"]["speculative_config"] == kwargs["speculative_config"]
+    assert result["manifest"]["compilation_config"]["cudagraph_capture_sizes"] == [
+        1,
+        2,
+        3,
+        4,
+        5,
+    ]
+
+
+def test_evaluate_quality_snapshots_speculative_manifest_before_llm_mutation(tmp_path):
+    class FakeLLM:
+        def generate(self, prompts, params, use_tqdm=False):
+            return [
+                SimpleNamespace(
+                    outputs=[
+                        SimpleNamespace(
+                            text="#### 1", token_ids=[7], finish_reason="stop"
+                        )
+                    ]
+                )
+                for _ in prompts
+            ]
+
+    def mutating_factory(**values):
+        values["speculative_config"]["draft_model_config"] = object()
+        return FakeLLM()
+
+    result = evaluate_quality(
+        train_examples=[{"question": "example", "answer": "#### 1"}],
+        test_examples=[{"question": "q0", "answer": "#### 1"}],
+        model="fake",
+        artifact_path=tmp_path / "mtp-mutated.json",
+        num_speculative_tokens=1,
+        llm_factory=mutating_factory,
+        sampling_params_factory=lambda **values: values,
+    )
+
+    assert result["manifest"]["speculative_config"] == {
+        "method": "mtp",
+        "num_speculative_tokens": 1,
+    }
+    json.dumps(result, allow_nan=False)
+
+
+def test_evaluate_quality_allows_explicit_eager_diagnosis(tmp_path):
+    class FakeLLM:
+        def generate(self, prompts, params, use_tqdm=False):
+            return [
+                SimpleNamespace(
+                    outputs=[
+                        SimpleNamespace(text="#### 1", token_ids=[7], finish_reason="stop")
+                    ]
+                )
+                for _ in prompts
+            ]
+
+    kwargs = {}
+    result = evaluate_quality(
+        train_examples=[{"question": "example", "answer": "#### 1"}],
+        test_examples=[{"question": "q0", "answer": "#### 1"}],
+        model="fake",
+        artifact_path=tmp_path / "eager.json",
+        cudagraph_mode="NONE",
+        diagnostic_enforce_eager=True,
+        llm_factory=lambda **values: (kwargs.update(values) or FakeLLM()),
+        sampling_params_factory=lambda **values: values,
+    )
+
+    assert kwargs["enforce_eager"] is True
+    assert "compilation_config" not in kwargs
+    assert result["manifest"]["enforce_eager"] is True
+    assert result["manifest"]["cudagraph_mode"] == "NONE"
+    assert result["manifest"]["compilation_config"] is None
+
+
 def test_checkpoint_artifact_records_runtime_context_and_failed_batch(monkeypatch, tmp_path):
     for name, value in {
         "VLLM_METAX_DSV4_MHC_BACKEND": "fused",
@@ -327,6 +431,7 @@ def test_checkpoint_artifact_records_runtime_context_and_failed_batch(monkeypatc
         "VLLM_USE_BREAKABLE_CUDAGRAPH": "1",
         "VLLM_METAX_USE_FP32_LOGITS": "1",
         "VLLM_METAX_DSV4_SPARSE_MLA_DECODE_BACKEND": "torch_reference",
+        "VLLM_METAX_DSV4_PREFILL_GEMM_CHUNKING": "1",
     }.items():
         monkeypatch.setenv(name, value)
 
@@ -372,6 +477,7 @@ def test_checkpoint_artifact_records_runtime_context_and_failed_batch(monkeypatc
         manifest["environment"]["VLLM_METAX_DSV4_SPARSE_MLA_DECODE_BACKEND"]
         == "torch_reference"
     )
+    assert manifest["environment"]["VLLM_METAX_DSV4_PREFILL_GEMM_CHUNKING"] == "1"
     assert "git_head" in manifest and "git_dirty" in manifest
 
 

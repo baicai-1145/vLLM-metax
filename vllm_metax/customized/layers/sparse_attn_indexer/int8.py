@@ -10,7 +10,6 @@ from pathlib import Path
 import torch
 
 import vllm.envs as envs
-from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -26,6 +25,10 @@ from vllm.utils.torch_utils import (
 )
 from vllm_metax.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
+)
+from vllm_metax.customized.layers.sparse_attn_indexer.indexer_debug import (
+    begin_capture,
+    capture_path,
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
@@ -130,12 +133,27 @@ def _reset_indexer_cache_layout_log_state() -> None:
         _INDEXER_CACHE_LAYOUT_LOGGED = False
 
 
-def _fill_topk_indices_torch(logits: torch.Tensor, topk_indices: torch.Tensor) -> None:
+def _fill_topk_indices_torch(
+    logits: torch.Tensor,
+    topk_indices: torch.Tensor,
+    valid_counts: torch.Tensor | None = None,
+) -> None:
     k = min(topk_indices.shape[-1], logits.shape[-1])
     topk_indices.fill_(-1)
     if k == 0:
         return
-    topk = torch.topk(logits, k=k, dim=-1).indices.to(torch.int32)
+    topk = torch.topk(logits, k=k, dim=-1).indices
+    if valid_counts is not None:
+        counts = valid_counts.reshape(-1)
+        topk_rows = topk.reshape(-1, k)
+        if counts.numel() != topk_rows.shape[0]:
+            raise ValueError(
+                "valid_counts must contain one entry per top-k row, got "
+                f"{counts.numel()} counts for {topk_rows.shape[0]} rows"
+            )
+        positions = torch.arange(k, device=topk.device).unsqueeze(0)
+        topk_rows.masked_fill_(positions >= counts.unsqueeze(1), -1)
+    topk = topk.to(torch.int32)
     topk_indices_view = topk_indices.reshape(-1, topk_indices.shape[-1])
     topk_view = topk.reshape(-1, k)
     topk_indices_view[:, :k].copy_(topk_view)
@@ -151,6 +169,45 @@ def _gather_workspace_shapes_int8(
     return (
         ((total_seq_lens, head_dim), int8_dtype),
         ((total_seq_lens, 4), torch.uint8),
+    )
+
+
+def _int8_paged_decode_logits(
+    q_quant: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    schedule_metadata: torch.Tensor,
+    *,
+    max_model_len: int,
+) -> torch.Tensor:
+    return int8_paged_mqa_logits(
+        q_quant,
+        kv_cache,
+        weights,
+        seq_lens,
+        block_table,
+        schedule_metadata,
+        max_model_len=max_model_len,
+        clean_logits=True,
+    )
+
+
+def _int8_prefill_logits(
+    q_quant: torch.Tensor,
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+) -> torch.Tensor:
+    return int8_mqa_logits(
+        q_quant,
+        kv,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        clean_logits=True,
     )
 
 
@@ -223,6 +280,7 @@ def sparse_attn_indexer_int8(
     has_decode = attn_metadata_narrowed.num_decodes > 0
     has_prefill = attn_metadata_narrowed.num_prefills > 0
     num_decode_tokens = attn_metadata_narrowed.num_decode_tokens
+    num_prefill_tokens = getattr(attn_metadata_narrowed, "num_prefill_tokens", None)
 
     # q_scale is required iff the FP4 cache path is enabled; the FP8 path
     # folds the Q scale into `weights` inside fused_indexer_q_rope_quant.
@@ -235,6 +293,24 @@ def sparse_attn_indexer_int8(
     num_tokens = slot_mapping.shape[0]
     if k is not None:
         k = k[:num_tokens]
+
+    capture_context = begin_capture(
+        layer=str(k_cache_prefix),
+        has_prefill=has_prefill,
+        has_decode=has_decode,
+        num_tokens=num_tokens,
+        num_decode_tokens=num_decode_tokens,
+        num_prefill_tokens=(
+            int(num_prefill_tokens)
+            if num_prefill_tokens is not None
+            else max(0, num_tokens - num_decode_tokens)
+        ),
+        hidden_states=hidden_states,
+        q_quant=q_quant,
+        weights=weights,
+        topk_tokens=topk_tokens,
+        slot_mapping=slot_mapping,
+    )
 
     if not skip_k_cache_insert:
         assert k is not None, "must set skip_k_cache_insert=True for k is None"
@@ -256,7 +332,7 @@ def sparse_attn_indexer_int8(
             values_spec,
             scales_spec,
         )
-        for chunk in prefill_metadata.chunks:
+        for chunk_index, chunk in enumerate(prefill_metadata.chunks):
             k_quant = k_quant_full[: chunk.total_seq_lens]
             k_scale = k_scale_full[: chunk.total_seq_lens]
 
@@ -273,21 +349,41 @@ def sparse_attn_indexer_int8(
             q_slice_cast = q_slice
             k_quant_cast = k_quant
             k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
-            logits = int8_mqa_logits(
+            logits = _int8_prefill_logits(
                 q_slice_cast,
                 (k_quant_cast, k_scale_cast),
                 weights[chunk.token_start : chunk.token_end],
                 chunk.cu_seqlen_ks,
                 chunk.cu_seqlen_ke,
-                clean_logits=False,
             )
-            num_rows = logits.shape[0]
-
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
 
-            _fill_topk_indices_torch(logits, topk_indices)
+            _fill_topk_indices_torch(
+                logits,
+                topk_indices,
+                valid_counts=chunk.cu_seqlen_ke - chunk.cu_seqlen_ks,
+            )
+            if capture_context is not None:
+                try:
+                    capture_context.save_prefill(
+                        path=capture_path(capture_context, f"prefill{chunk_index}"),
+                        q_slice=q_slice,
+                        k_quant=k_quant,
+                        k_scale=k_scale,
+                        weights_slice=weights[chunk.token_start : chunk.token_end],
+                        cu_seqlen_ks=chunk.cu_seqlen_ks,
+                        cu_seqlen_ke=chunk.cu_seqlen_ke,
+                        block_table=chunk.block_table,
+                        native_logits=logits,
+                        native_topk=topk_indices,
+                        chunk_index=chunk_index,
+                        token_start=chunk.token_start,
+                        token_end=chunk.token_end,
+                    )
+                except Exception:
+                    logger.exception("Failed to capture INT8 indexer prefill call")
 
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
@@ -323,7 +419,7 @@ def sparse_attn_indexer_int8(
         # otherwise. deep_gemm fp8_fp4_paged_mqa_logits requires 2D context_lens;
         # the downstream topk kernels accept both 1D and 2D.
         padded_q_quant_cast = padded_q_quant_decode_tokens
-        logits = int8_paged_mqa_logits(
+        logits = _int8_paged_decode_logits(
             padded_q_quant_cast,
             kv_cache,
             weights[:num_padded_tokens],
@@ -331,12 +427,11 @@ def sparse_attn_indexer_int8(
             decode_metadata.block_table,
             decode_metadata.schedule_metadata,
             max_model_len=max_model_len,
-            clean_logits=False,
         )
-        num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
-        _fill_topk_indices_torch(logits, topk_indices)
+        _fill_topk_indices_torch(logits, topk_indices, valid_counts=seq_lens)
+        native_topk_indices = topk_indices
 
         if decode_metadata.requires_padding:
             # if padded, we need to unpack
@@ -348,6 +443,25 @@ def sparse_attn_indexer_int8(
             topk_indices_buffer[: topk_indices.shape[0], : topk_indices.shape[-1]] = (
                 topk_indices
             )
+
+        if capture_context is not None:
+            try:
+                capture_context.save_decode(
+                    path=capture_path(capture_context, "decode"),
+                    padded_q=padded_q_quant_decode_tokens,
+                    kv_cache=kv_cache,
+                    weights_slice=weights[:num_padded_tokens],
+                    seq_lens=seq_lens,
+                    block_table=decode_metadata.block_table,
+                    schedule_metadata=decode_metadata.schedule_metadata,
+                    decode_lens=decode_lens,
+                    native_logits=logits,
+                    native_topk=native_topk_indices,
+                    requires_padding=decode_metadata.requires_padding,
+                    final_topk=topk_indices,
+                )
+            except Exception:
+                logger.exception("Failed to capture INT8 indexer decode call")
 
     return topk_indices_buffer
 

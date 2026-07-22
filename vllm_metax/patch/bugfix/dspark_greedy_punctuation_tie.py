@@ -12,13 +12,16 @@ import torch
 
 from vllm.v1 import sample as _sample_pkg
 from vllm.v1.sample import rejection_sampler as _v1_rejection_sampler
+from vllm.v1.worker import gpu_model_runner as _gpu_model_runner
 from vllm.v1.worker.gpu.spec_decode import (
     rejection_sampler_utils as _v2_rejection_sampler_utils,
 )
 
 
 _ORIGINAL_V1_REJECTION_SAMPLE = _v1_rejection_sampler.rejection_sample
+_ORIGINAL_V1_REJECTION_SAMPLER_FORWARD = _v1_rejection_sampler.RejectionSampler.forward
 _ORIGINAL_V2_REJECTION_SAMPLE = _v2_rejection_sampler_utils.rejection_sample
+_ORIGINAL_GPU_MODEL_RUNNER_SAMPLE = _gpu_model_runner.GPUModelRunner._sample
 _CACHE_PREFILL_TIE_MARGIN = 0.125
 _LOGIT_BUMP = 1.0e-3
 _PUNCTUATION_TOKEN_IDS = (0, 11, 13, 25, 26, 30)
@@ -33,6 +36,34 @@ _STRUCTURAL_PUNCTUATION_TIE_PAIRS = (
 
 def _is_dspark_greedy_tie_patch_enabled() -> bool:
     return os.environ.get("VLLM_METAX_DSPARK_GREEDY_TIE_PATCH") == "1"
+
+
+def _force_reject_drafts_enabled() -> bool:
+    return os.environ.get("VLLM_METAX_MTP_FORCE_REJECT_DRAFTS") == "1"
+
+
+def _force_reject_v1_greedy_result(
+    result: torch.Tensor,
+    target_logits: torch.Tensor,
+    cu_num_draft_tokens: torch.Tensor,
+) -> torch.Tensor:
+    if target_logits.shape[0] == 0 or result.shape[0] == 0:
+        return result
+    forced = torch.full_like(result, -1)
+    counts_or_prefix = cu_num_draft_tokens.to(torch.long)
+    if counts_or_prefix.numel() == result.shape[0] + 1:
+        row_indices = counts_or_prefix[:-1]
+    elif counts_or_prefix.numel() == result.shape[0]:
+        row_indices = torch.zeros_like(counts_or_prefix)
+        if counts_or_prefix.numel() > 1:
+            row_indices[1:] = torch.cumsum(counts_or_prefix[:-1], dim=0)
+    else:
+        return result
+    if int(row_indices.max().item()) >= target_logits.shape[0]:
+        return result
+    correction_ids = torch.argmax(target_logits[row_indices].float(), dim=-1)
+    forced[:, 0] = correction_ids.to(forced.dtype)
+    return forced
 
 
 def _punctuation_mask(token_ids: torch.Tensor) -> torch.Tensor:
@@ -172,7 +203,7 @@ def _v1_rejection_sample(
             draft_token_ids,
             row_mask,
         )
-    return _ORIGINAL_V1_REJECTION_SAMPLE(
+    result = _ORIGINAL_V1_REJECTION_SAMPLE(
         draft_token_ids,
         num_draft_tokens,
         max_spec_len,
@@ -185,6 +216,66 @@ def _v1_rejection_sample(
         synthetic_conditional_rates=synthetic_conditional_rates,
         use_fp64_gumbel=use_fp64_gumbel,
     )
+    if (
+        _force_reject_drafts_enabled()
+        and sampling_metadata.all_greedy
+        and num_draft_tokens
+    ):
+        result = _force_reject_v1_greedy_result(
+            result,
+            target_logits,
+            cu_num_draft_tokens,
+        )
+    if os.getenv("VLLM_METAX_DSV4_MTP_CAPTURE_DIR") and sampling_metadata.all_greedy:
+        from vllm_metax.models.deepseek_v4.mtp_debug import (
+            maybe_capture_v1_greedy_verifier_batch,
+        )
+
+        maybe_capture_v1_greedy_verifier_batch(
+            target_logits, draft_token_ids, cu_num_draft_tokens, result
+        )
+    return result
+
+
+def _v1_rejection_sampler_forward(
+    self,
+    metadata,
+    draft_probs,
+    logits,
+    sampling_metadata,
+):
+    if os.getenv("VLLM_METAX_DSV4_MTP_CAPTURE_DIR") and sampling_metadata.all_greedy:
+        from vllm_metax.models.deepseek_v4.mtp_debug import (
+            maybe_capture_v1_sampler_metadata,
+        )
+
+        maybe_capture_v1_sampler_metadata(metadata, logits)
+    return _ORIGINAL_V1_REJECTION_SAMPLER_FORWARD(
+        self,
+        metadata,
+        draft_probs,
+        logits,
+        sampling_metadata,
+    )
+
+
+def _gpu_model_runner_sample(self, logits, spec_decode_metadata):
+    if (
+        os.getenv("VLLM_METAX_DSV4_MTP_CAPTURE_DIR")
+        and spec_decode_metadata is not None
+        and logits is not None
+    ):
+        from vllm_metax.models.deepseek_v4.mtp_debug import (
+            maybe_capture_v1_model_runner_metadata,
+        )
+
+        maybe_capture_v1_model_runner_metadata(
+            spec_decode_metadata,
+            self.input_ids.gpu,
+            self.positions,
+            logits,
+        )
+    return _ORIGINAL_GPU_MODEL_RUNNER_SAMPLE(self, logits, spec_decode_metadata)
 
 
 def _v2_rejection_sample(
@@ -212,7 +303,7 @@ def _v2_rejection_sample(
             current_draft_ids,
             row_mask,
         )
-    return _ORIGINAL_V2_REJECTION_SAMPLE(
+    result = _ORIGINAL_V2_REJECTION_SAMPLE(
         target_logits,
         draft_logits,
         draft_sampled,
@@ -228,10 +319,28 @@ def _v2_rejection_sample(
         use_fp64=use_fp64,
         use_block_verification=use_block_verification,
     )
+    if os.getenv("VLLM_METAX_DSV4_MTP_CAPTURE_DIR"):
+        from vllm_metax.models.deepseek_v4.mtp_debug import (
+            maybe_capture_greedy_verifier_batch,
+        )
+
+        maybe_capture_greedy_verifier_batch(
+            target_logits,
+            draft_sampled,
+            cu_num_logits,
+            result[0],
+            result[1],
+            positions=pos,
+            expanded_local_pos=expanded_local_pos,
+            expanded_idx_mapping=expanded_idx_mapping,
+        )
+    return result
 
 
 _v1_rejection_sampler.rejection_sample = _v1_rejection_sample
+_v1_rejection_sampler.RejectionSampler.forward = _v1_rejection_sampler_forward
 _v2_rejection_sampler_utils.rejection_sample = _v2_rejection_sample
+_gpu_model_runner.GPUModelRunner._sample = _gpu_model_runner_sample
 
 # The V2 RejectionSampler imports rejection_sample directly at module import
 # time, so update that module-level binding as well.

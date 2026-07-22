@@ -27,6 +27,7 @@ from vllm_metax.customized.layers.sparse_attn_indexer.sparse_attn_indexer import
 from .ops import (
     fused_indexer_q_rope_int8_quant,
 )
+from vllm.models.deepseek_v4.common.ops import fused_q_kv_rmsnorm
 
 
 from vllm.config import (
@@ -37,8 +38,8 @@ from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.models.utils import extract_layer_index
-from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from .compressor import MacaDeepseekCompressor
 from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
@@ -51,11 +52,34 @@ from vllm_metax.v1.attention.backends.mla.indexer import (
 )
 from vllm_metax.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
+import vllm_metax.envs as mx_envs
 
 from vllm.models.deepseek_v4.attention import (
     DeepseekV4Attention,
     DeepseekV4IndexerCache,
-    _resolve_dsv4_kv_cache_dtype
+    _resolve_dsv4_kv_cache_dtype,
+)
+from .layer_debug import (
+    layer_capture_enabled,
+    layer_capture_layer_enabled,
+    maybe_capture_attention_inputs,
+    maybe_capture_attention_output,
+    maybe_capture_qkv_prenorm_shadow_compare,
+    maybe_capture_qkv_producer,
+    maybe_capture_wq_b_shadow_compare,
+    maybe_prepare_qkv_insert_capture,
+    maybe_prepare_q_stage_capture,
+    qkv_prenorm_shadow_compare_enabled,
+    qkv_prenorm_shadow_compare_selected,
+    wq_b_shadow_compare_selected,
+)
+from .mtp_candidate import (
+    env_or_k1_candidate_enabled,
+    k1_correctness_candidate_enabled,
+    k1_native_kv_prenorm_candidate_enabled,
+    k1_native_wq_b_candidate_enabled,
+    k1_native_wq_b_candidate_layer_enabled,
+    k1_native_wq_b_candidate_layer_scoped,
 )
 
 if TYPE_CHECKING:
@@ -66,6 +90,366 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _Q_INSERT_CUDAGRAPH_LAYER_ENV = "VLLM_METAX_DSV4_Q_INSERT_CUDAGRAPH_LAYER"
+_TOKENWISE_WQ_B_ENV = "VLLM_METAX_DSV4_TOKENWISE_WQ_B"
+_TOKENWISE_TARGET_WQ_B_ENV = "VLLM_METAX_DSV4_TOKENWISE_TARGET_WQ_B"
+_TOKENWISE_INDEXER_WQ_B_ENV = "VLLM_METAX_DSV4_TOKENWISE_INDEXER_WQ_B"
+_TOKENWISE_TARGET_WQ_B_LAYERS_ENV = "VLLM_METAX_DSV4_TOKENWISE_TARGET_WQ_B_LAYERS"
+_TOKENWISE_TARGET_WQ_B_POSITIONS_ENV = (
+    "VLLM_METAX_DSV4_TOKENWISE_TARGET_WQ_B_POSITIONS"
+)
+_TOKENWISE_TARGET_QKV_ENV = "VLLM_METAX_DSV4_TOKENWISE_TARGET_QKV"
+_TOKENWISE_TARGET_QKV_PRENORM_ENV = "VLLM_METAX_DSV4_TOKENWISE_TARGET_QKV_PRENORM"
+_TOKENWISE_TARGET_KV_PRENORM_ENV = "VLLM_METAX_DSV4_TOKENWISE_TARGET_KV_PRENORM"
+_TOKENWISE_TARGET_QKV_LAYERS_ENV = "VLLM_METAX_DSV4_TOKENWISE_TARGET_QKV_LAYERS"
+_TOKENWISE_TARGET_QKV_POSITIONS_ENV = (
+    "VLLM_METAX_DSV4_TOKENWISE_TARGET_QKV_POSITIONS"
+)
+_TOKENWISE_TARGET_QKV_CALLS_ENV = "VLLM_METAX_DSV4_TOKENWISE_TARGET_QKV_CALLS"
+_K1_RESPECT_TARGET_QKV_SCOPE_ENV = (
+    "VLLM_METAX_DSV4_MTP_K1_RESPECT_TARGET_QKV_SCOPE"
+)
+
+
+def resolve_layer_compress_ratio(config, layer_id: int) -> tuple[int, bool]:
+    """Resolve operational compress ratio and draft-layer RoPE mode.
+
+    Some DeepSeek V4 checkpoints include the MTP draft layer in
+    ``compress_ratios`` with a raw value of 0. KV cache users still need an
+    operational ratio of 1, but that raw 0 selects plain, unscaled RoPE for the
+    draft layer.
+    """
+    compress_ratios = getattr(config, "compress_ratios", None)
+    if not compress_ratios:
+        return 1, False
+    if layer_id < config.num_hidden_layers:
+        return max(1, compress_ratios[layer_id]), False
+    if layer_id < len(compress_ratios):
+        raw_compress_ratio = compress_ratios[layer_id]
+        return max(1, raw_compress_ratio), raw_compress_ratio == 0
+    return 1, False
+
+
+def build_deepseek_v4_rope(
+    config,
+    *,
+    head_dim: int,
+    rope_head_dim: int,
+    max_position_embeddings: int,
+    compress_ratio: int,
+    use_unscaled_rope: bool = False,
+):
+    rope_parameters = config.rope_parameters
+    if "rope_type" not in rope_parameters:
+        rope_parameters = (
+            rope_parameters["main"]
+            if use_unscaled_rope or compress_ratio <= 1
+            else rope_parameters["compress"]
+        )
+    rope_parameters = dict(rope_parameters)
+    rope_parameters["rope_theta"] = (
+        config.compress_rope_theta if compress_ratio > 1 else config.rope_theta
+    )
+    if use_unscaled_rope:
+        rope_parameters["rope_type"] = "default"
+    if rope_parameters["rope_type"] != "default":
+        rope_parameters["rope_type"] = (
+            "deepseek_yarn"
+            if rope_parameters.get("apply_yarn_scaling", True)
+            else "deepseek_llama_scaling"
+        )
+    rope_parameters["mscale"] = 0
+    rope_parameters["mscale_all_dim"] = 0
+    rope_parameters["is_deepseek_v4"] = True
+    rope_parameters["rope_dim"] = rope_head_dim
+    return get_rope(
+        head_dim,
+        max_position=max_position_embeddings,
+        rope_parameters=rope_parameters,
+        is_neox_style=False,
+        dtype=torch.float32,
+    )
+
+
+def _target_tokenwise_wq_b_enabled() -> bool:
+    if (
+        os.getenv(_TOKENWISE_WQ_B_ENV) == "1"
+        or os.getenv(_TOKENWISE_TARGET_WQ_B_ENV) == "1"
+    ):
+        return True
+    return (
+        k1_correctness_candidate_enabled()
+        and (
+            not k1_native_wq_b_candidate_enabled()
+            or k1_native_wq_b_candidate_layer_scoped()
+        )
+    )
+
+
+def _target_tokenwise_wq_b_layer_enabled(layer_idx: int) -> bool:
+    if (
+        os.getenv(_TOKENWISE_WQ_B_ENV) == "1"
+        or os.getenv(_TOKENWISE_TARGET_WQ_B_ENV) == "1"
+    ):
+        return True
+    if (
+        k1_correctness_candidate_enabled()
+        and k1_native_wq_b_candidate_layer_enabled(layer_idx)
+    ):
+        return False
+    if k1_correctness_candidate_enabled():
+        return True
+    value = os.getenv(_TOKENWISE_TARGET_WQ_B_LAYERS_ENV)
+    if value is None or not value.strip() or value.strip().lower() == "all":
+        return True
+    try:
+        selected = {int(item.strip()) for item in value.split(",") if item.strip()}
+    except ValueError as exc:
+        raise ValueError(
+            f"{_TOKENWISE_TARGET_WQ_B_LAYERS_ENV} must be 'all' or a "
+            "comma-separated set of nonnegative integer layer indices"
+        ) from exc
+    if any(index < 0 for index in selected):
+        raise ValueError(
+            f"{_TOKENWISE_TARGET_WQ_B_LAYERS_ENV} must be 'all' or a "
+            "comma-separated set of nonnegative integer layer indices"
+        )
+    return layer_idx in selected
+
+
+def _target_tokenwise_wq_b_position_enabled(positions: torch.Tensor) -> bool:
+    if k1_correctness_candidate_enabled():
+        return True
+    value = os.getenv(_TOKENWISE_TARGET_WQ_B_POSITIONS_ENV)
+    if value is None or not value.strip() or value.strip().lower() == "all":
+        return True
+    try:
+        selected = {int(item.strip()) for item in value.split(",") if item.strip()}
+    except ValueError as exc:
+        raise ValueError(
+            f"{_TOKENWISE_TARGET_WQ_B_POSITIONS_ENV} must be 'all' or a "
+            "comma-separated set of integer positions"
+        ) from exc
+    if not selected:
+        return True
+    position_values = positions.detach().reshape(-1)
+    return any(bool(torch.any(position_values == position).item()) for position in selected)
+def _target_tokenwise_wq_b_selected_indices(positions: torch.Tensor) -> torch.Tensor:
+    flat_positions = positions.detach().reshape(-1)
+    if k1_correctness_candidate_enabled():
+        return torch.arange(flat_positions.numel(), device=positions.device)
+    value = os.getenv(_TOKENWISE_TARGET_WQ_B_POSITIONS_ENV)
+    if value is None or not value.strip() or value.strip().lower() == "all":
+        return torch.arange(flat_positions.numel(), device=positions.device)
+    try:
+        selected = {int(item.strip()) for item in value.split(",") if item.strip()}
+    except ValueError as exc:
+        raise ValueError(
+            f"{_TOKENWISE_TARGET_WQ_B_POSITIONS_ENV} must be 'all' or a "
+            "comma-separated set of integer positions"
+        ) from exc
+    if not selected:
+        return torch.arange(flat_positions.numel(), device=positions.device)
+    mask = torch.zeros_like(flat_positions, dtype=torch.bool)
+    for position in selected:
+        mask |= flat_positions == position
+    return torch.nonzero(mask, as_tuple=False).reshape(-1)
+def _target_tokenwise_qkv_enabled() -> bool:
+    return os.getenv(_TOKENWISE_TARGET_QKV_ENV) == "1"
+
+
+def _k1_target_qkv_scope_unrestricted() -> bool:
+    return (
+        k1_correctness_candidate_enabled()
+        and os.getenv(_K1_RESPECT_TARGET_QKV_SCOPE_ENV, "0") != "1"
+    )
+
+
+def _target_tokenwise_qkv_prenorm_enabled() -> bool:
+    return os.getenv(_TOKENWISE_TARGET_QKV_PRENORM_ENV) == "1"
+def _target_tokenwise_kv_prenorm_enabled() -> bool:
+    if os.getenv(_TOKENWISE_TARGET_KV_PRENORM_ENV) == "1":
+        return True
+    return (
+        k1_correctness_candidate_enabled()
+        and not k1_native_kv_prenorm_candidate_enabled()
+    )
+def _target_tokenwise_qkv_layer_enabled(layer_idx: int) -> bool:
+    if _k1_target_qkv_scope_unrestricted():
+        return True
+    value = os.getenv(_TOKENWISE_TARGET_QKV_LAYERS_ENV)
+    if value is None or not value.strip() or value.strip().lower() == "all":
+        return True
+    try:
+        selected = {int(item.strip()) for item in value.split(",") if item.strip()}
+    except ValueError as exc:
+        raise ValueError(
+            f"{_TOKENWISE_TARGET_QKV_LAYERS_ENV} must be 'all' or a "
+            "comma-separated set of nonnegative integer layer indices"
+        ) from exc
+    if any(index < 0 for index in selected):
+        raise ValueError(
+            f"{_TOKENWISE_TARGET_QKV_LAYERS_ENV} must be 'all' or a "
+            "comma-separated set of nonnegative integer layer indices"
+        )
+    return layer_idx in selected
+def _target_tokenwise_qkv_position_enabled(positions: torch.Tensor) -> bool:
+    if _k1_target_qkv_scope_unrestricted():
+        return True
+    value = os.getenv(_TOKENWISE_TARGET_QKV_POSITIONS_ENV)
+    if value is None or not value.strip() or value.strip().lower() == "all":
+        return True
+    try:
+        selected = {int(item.strip()) for item in value.split(",") if item.strip()}
+    except ValueError as exc:
+        raise ValueError(
+            f"{_TOKENWISE_TARGET_QKV_POSITIONS_ENV} must be 'all' or a "
+            "comma-separated set of integer positions"
+        ) from exc
+    if not selected:
+        return True
+    position_values = positions.detach().reshape(-1)
+    return any(bool(torch.any(position_values == position).item()) for position in selected)
+
+
+def _target_tokenwise_qkv_call_enabled(call_index: int) -> bool:
+    if _k1_target_qkv_scope_unrestricted():
+        return True
+    value = os.getenv(_TOKENWISE_TARGET_QKV_CALLS_ENV)
+    if value is None or not value.strip() or value.strip().lower() == "all":
+        return True
+    try:
+        selected = {int(item.strip()) for item in value.split(",") if item.strip()}
+    except ValueError as exc:
+        raise ValueError(
+            f"{_TOKENWISE_TARGET_QKV_CALLS_ENV} must be 'all' or a "
+            "comma-separated set of nonnegative integer call indices"
+        ) from exc
+    if any(index < 0 for index in selected):
+        raise ValueError(
+            f"{_TOKENWISE_TARGET_QKV_CALLS_ENV} must be 'all' or a "
+            "comma-separated set of nonnegative integer call indices"
+        )
+    if not selected:
+        return True
+    return call_index in selected
+
+
+def _next_target_tokenwise_qkv_call_index(layer: object) -> int:
+    value = getattr(layer, "_target_tokenwise_qkv_call_index", 0)
+    setattr(layer, "_target_tokenwise_qkv_call_index", value + 1)
+    return value
+
+
+def _target_tokenwise_qkv_selected_indices(positions: torch.Tensor) -> torch.Tensor:
+    flat_positions = positions.detach().reshape(-1)
+    if _k1_target_qkv_scope_unrestricted():
+        return torch.arange(flat_positions.numel(), device=positions.device)
+    value = os.getenv(_TOKENWISE_TARGET_QKV_POSITIONS_ENV)
+    if value is None or not value.strip() or value.strip().lower() == "all":
+        return torch.arange(flat_positions.numel(), device=positions.device)
+    try:
+        selected = {int(item.strip()) for item in value.split(",") if item.strip()}
+    except ValueError as exc:
+        raise ValueError(
+            f"{_TOKENWISE_TARGET_QKV_POSITIONS_ENV} must be 'all' or a "
+            "comma-separated set of integer positions"
+        ) from exc
+    if not selected:
+        return torch.arange(flat_positions.numel(), device=positions.device)
+    mask = torch.zeros_like(flat_positions, dtype=torch.bool)
+    for position in selected:
+        mask |= flat_positions == position
+    return torch.nonzero(mask, as_tuple=False).reshape(-1)
+
+
+def _target_tokenwise_qkv_position_mask(positions: torch.Tensor) -> torch.Tensor:
+    flat_positions = positions.reshape(-1)
+    value = os.getenv(_TOKENWISE_TARGET_QKV_POSITIONS_ENV)
+    if value is None or not value.strip() or value.strip().lower() == "all":
+        return torch.ones_like(flat_positions, dtype=torch.bool)
+    try:
+        selected = {int(item.strip()) for item in value.split(",") if item.strip()}
+    except ValueError as exc:
+        raise ValueError(
+            f"{_TOKENWISE_TARGET_QKV_POSITIONS_ENV} must be 'all' or a "
+            "comma-separated set of integer positions"
+        ) from exc
+    if not selected:
+        return torch.ones_like(flat_positions, dtype=torch.bool)
+    mask = torch.zeros_like(flat_positions, dtype=torch.bool)
+    for position in selected:
+        mask |= flat_positions == position
+    return mask
+
+
+def _indexer_tokenwise_wq_b_enabled() -> bool:
+    return (
+        os.getenv(_TOKENWISE_WQ_B_ENV) == "1"
+        or os.getenv(_TOKENWISE_INDEXER_WQ_B_ENV) == "1"
+    )
+
+
+def _qnorm_rope_kv_insert_native(
+    q,
+    kv,
+    cache,
+    slot_mapping,
+    positions,
+    cos_sin_cache,
+    eps,
+    block_size,
+):
+    torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_insert(
+        q,
+        kv,
+        cache,
+        slot_mapping,
+        positions,
+        cos_sin_cache,
+        eps,
+        block_size,
+    )
+
+
+def _run_qnorm_rope_kv_insert(
+    q,
+    kv,
+    cache,
+    slot_mapping,
+    positions,
+    cos_sin_cache,
+    eps,
+    block_size,
+) -> None:
+    if (
+        os.getenv("VLLM_METAX_DSV4_TOKENWISE_QKV_INSERT") != "1"
+        or not 1 < q.shape[0] <= 5
+    ):
+        _qnorm_rope_kv_insert_native(
+            q,
+            kv,
+            cache,
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+            eps,
+            block_size,
+        )
+        return
+    logger.warning_once(
+        "DeepSeek V4 speculative attention uses tokenwise Q/KV cache insert"
+    )
+    for index in range(q.shape[0]):
+        _qnorm_rope_kv_insert_native(
+            q[index : index + 1],
+            kv[index : index + 1],
+            cache,
+            slot_mapping[index : index + 1],
+            positions[index : index + 1],
+            cos_sin_cache,
+            eps,
+            block_size,
+        )
 
 
 def _q_insert_cudagraph_target_layer() -> int | Literal["all"] | None:
@@ -138,6 +522,10 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
         tp_size = get_tensor_model_parallel_world_size()
         layer_id = extract_layer_index(prefix)
         self.layer_idx = layer_id
+        self._attention_input_capture_enabled = (
+            layer_capture_enabled()
+            and layer_capture_layer_enabled(self.layer_idx)
+        )
 
         self.prefix = prefix  # Alias for compatibility with compressor
         self.hidden_size = config.hidden_size
@@ -152,13 +540,9 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
         self.n_groups = config.o_groups
         self.n_local_groups = self.n_groups // tp_size
         self.window_size = config.sliding_window
-        # NOTE(zyongye) Compress ratio can't be 0
-        # we do this for because MTP layer is not included
-        # in the compress ratio list
-        if layer_id < config.num_hidden_layers:
-            self.compress_ratio = max(1, config.compress_ratios[layer_id])
-        else:
-            self.compress_ratio = 1
+        self.compress_ratio, use_unscaled_rope = resolve_layer_compress_ratio(
+            config, layer_id
+        )
         self.eps = config.rms_norm_eps
         self.scale = self.head_dim**-0.5
 
@@ -188,7 +572,6 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
             return_bias=False,
             prefix=f"{prefix}.wq_b",
         )
-
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
         self.wo_a = ColumnParallelLinear(
             self.n_heads * self.head_dim // self.n_groups,
@@ -216,6 +599,7 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
             rope_head_dim=self.rope_head_dim,
             max_position_embeddings=config.max_position_embeddings,
             compress_ratio=self.compress_ratio,
+            use_unscaled_rope=use_unscaled_rope,
         )
         self.indexer_rotary_emb = self.rotary_emb
         self.topk_indices_buffer = topk_indices_buffer
@@ -250,6 +634,15 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
         self.ln_events = [torch.cuda.Event() for _ in range(4)]
 
         assert cache_config is not None, "DeepseekV4 attention requires cache_config"
+        self._prefill_gemm_chunking_enabled = (
+            mx_envs.VLLM_METAX_DSV4_PREFILL_GEMM_CHUNKING
+        )
+        self._prefill_gemm_chunk_size = cache_config.block_size
+        if self._prefill_gemm_chunk_size <= 0:
+            raise ValueError(
+                "DeepSeek V4 prefill GEMM chunk size must be positive, got "
+                f"{self._prefill_gemm_chunk_size}"
+            )
         # ---- Attention / KV-cache setup ----
         self.max_num_batched_tokens = (
             vllm_config.scheduler_config.max_num_batched_tokens
@@ -298,6 +691,432 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
         self._q_insert_cudagraphs: dict[tuple, tuple[object, torch.Tensor]] = {}
         self._q_insert_cudagraph_pool = None
 
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        llama_4_scaling: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        num_tokens = hidden_states.shape[0]
+        o_padded = torch.empty(
+            (num_tokens, self.padded_heads, self.head_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        single_hidden_states = hidden_states
+        if hidden_states.dim() == 3:
+            single_hidden_states = hidden_states[:, 0, :]
+        qr_kv, kv_score, indexer_kv_score, indexer_weights = (
+            self.attn_gemm_parallel_execute(single_hidden_states)
+        )
+        if (
+            qkv_prenorm_shadow_compare_enabled()
+            and 1 < single_hidden_states.shape[0] <= 5
+        ):
+            self._capture_qkv_prenorm_shadow_compare(
+                positions, single_hidden_states, qr_kv
+            )
+        qr_kv = self._replace_target_fused_qkv_prenorm(
+            single_hidden_states, positions, qr_kv
+        )
+        qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
+        qr, kv = fused_q_kv_rmsnorm(
+            qr,
+            kv,
+            self.q_norm.weight.data,
+            self.kv_norm.weight.data,
+            self.eps,
+        )
+        if layer_capture_enabled():
+            self._capture_qkv_producer(
+                positions,
+                single_hidden_states,
+                qr_kv,
+                qr,
+                kv,
+            )
+        self.attention_impl(
+            single_hidden_states,
+            qr,
+            kv,
+            kv_score,
+            indexer_kv_score,
+            indexer_weights,
+            positions,
+            o_padded,
+        )
+        o = o_padded[:, : self.n_local_heads, :]
+        return self._o_proj(o, positions)
+
+    def attn_gemm_parallel_execute(self, hidden_states):
+        if (
+            not self._prefill_gemm_chunking_enabled
+            or hidden_states.shape[0] <= self._prefill_gemm_chunk_size
+        ):
+            result = super().attn_gemm_parallel_execute(hidden_states)
+            return self._replace_fused_q_tokenwise(hidden_states, result)
+
+        chunk_results = []
+        chunk_size = self._prefill_gemm_chunk_size
+        for start in range(0, hidden_states.shape[0], chunk_size):
+            chunk_results.append(
+                super().attn_gemm_parallel_execute(
+                    hidden_states[start : start + chunk_size]
+                )
+            )
+
+        first_result = chunk_results[0]
+        expected_none = tuple(component is None for component in first_result)
+        for result in chunk_results[1:]:
+            if len(result) != len(first_result) or tuple(
+                component is None for component in result
+            ) != expected_none:
+                raise RuntimeError(
+                    "DeepSeek V4 prefill GEMM chunks returned inconsistent "
+                    "None/non-None components"
+                )
+
+        result = tuple(
+            None
+            if is_none
+            else torch.cat([result[index] for result in chunk_results], dim=0)
+            for index, is_none in enumerate(expected_none)
+        )
+        return self._replace_fused_q_tokenwise(hidden_states, result)
+
+    def _replace_fused_q_tokenwise(self, hidden_states, result):
+        tokenwise_qkv = os.getenv("VLLM_METAX_DSV4_TOKENWISE_QKV") == "1"
+        tokenwise_q_only = os.getenv("VLLM_METAX_DSV4_TOKENWISE_Q_ONLY") == "1"
+        if (
+            not (tokenwise_qkv or tokenwise_q_only)
+            or not 1 < hidden_states.shape[0] <= 5
+        ):
+            return result
+        logger.warning_once(
+            "DeepSeek V4 speculative attention uses tokenwise %s projection",
+            "QKV" if tokenwise_qkv else "Q-only",
+        )
+        tokenwise_qr_kv = torch.cat(
+            [
+                self.fused_wqa_wkv(hidden_states[index : index + 1])[0].clone()
+                for index in range(hidden_states.shape[0])
+            ],
+            dim=0,
+        )
+        if tokenwise_qkv:
+            return (tokenwise_qr_kv, *result[1:])
+        qr_kv = result[0]
+        return (
+            torch.cat(
+                [
+                    tokenwise_qr_kv[:, : self.q_lora_rank],
+                    qr_kv[:, self.q_lora_rank :],
+                ],
+                dim=-1,
+            ),
+            *result[1:],
+        )
+
+    def _replace_target_fused_qkv_prenorm(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        qr_kv: torch.Tensor,
+    ) -> torch.Tensor:
+        tokenwise_qkv = _target_tokenwise_qkv_prenorm_enabled()
+        tokenwise_kv = _target_tokenwise_kv_prenorm_enabled()
+        if (
+            not (tokenwise_qkv or tokenwise_kv)
+            or not _target_tokenwise_qkv_layer_enabled(self.layer_idx)
+            or not 1 < hidden_states.shape[0] <= 5
+        ):
+            return qr_kv
+        call_index = _next_target_tokenwise_qkv_call_index(self)
+        if not _target_tokenwise_qkv_call_enabled(call_index):
+            return qr_kv
+        logger.warning_once(
+            "DeepSeek V4 speculative target attention uses prenorm tokenwise %s "
+            "projection",
+            "QKV" if tokenwise_qkv else "KV",
+        )
+        if not _k1_target_qkv_scope_unrestricted() and k1_correctness_candidate_enabled():
+            selected_mask = _target_tokenwise_qkv_position_mask(positions)
+            tokenwise_qr_kv = torch.cat(
+                [
+                    self.fused_wqa_wkv(hidden_states[index : index + 1])[0].clone()
+                    for index in range(hidden_states.shape[0])
+                ],
+                dim=0,
+            )
+            selected_qr_kv = torch.where(
+                selected_mask[:, None], tokenwise_qr_kv, qr_kv
+            )
+            if tokenwise_qkv:
+                return selected_qr_kv.contiguous()
+            return torch.cat(
+                [
+                    qr_kv[:, : self.q_lora_rank],
+                    selected_qr_kv[:, self.q_lora_rank :],
+                ],
+                dim=-1,
+            ).contiguous()
+        selected_indices = _target_tokenwise_qkv_selected_indices(positions)
+        if selected_indices.numel() == 0:
+            return qr_kv
+        if selected_indices.numel() == hidden_states.shape[0]:
+            selected_range = range(hidden_states.shape[0])
+        else:
+            selected_range = selected_indices.tolist()
+        tokenwise_qr_kv = torch.cat(
+            [
+                self.fused_wqa_wkv(hidden_states[index : index + 1])[0].clone()
+                for index in selected_range
+            ],
+            dim=0,
+        )
+        if selected_indices.numel() == hidden_states.shape[0]:
+            selected_qr_kv = tokenwise_qr_kv
+        else:
+            selected_qr_kv = qr_kv.clone()
+            selected_qr_kv[selected_indices] = tokenwise_qr_kv
+        if tokenwise_qkv:
+            return selected_qr_kv.contiguous()
+        return torch.cat(
+            [
+                qr_kv[:, : self.q_lora_rank],
+                selected_qr_kv[:, self.q_lora_rank :],
+            ],
+            dim=-1,
+        ).contiguous()
+
+    @eager_break_during_capture
+    def _capture_qkv_prenorm_shadow_compare(
+        self,
+        positions: torch.Tensor,
+        single_hidden_states: torch.Tensor,
+        qr_kv: torch.Tensor,
+    ) -> None:
+        if not qkv_prenorm_shadow_compare_selected(self.layer_idx, positions):
+            return
+        rowwise_qr_kv = torch.cat(
+            [
+                self.fused_wqa_wkv(single_hidden_states[index : index + 1])[
+                    0
+                ].clone()
+                for index in range(single_hidden_states.shape[0])
+            ],
+            dim=0,
+        )
+        maybe_capture_qkv_prenorm_shadow_compare(
+            self.layer_idx,
+            positions,
+            qr_kv,
+            rowwise_qr_kv,
+            self.q_lora_rank,
+        )
+
+    @eager_break_during_capture
+    def _capture_qkv_producer(
+        self,
+        positions: torch.Tensor,
+        single_hidden_states: torch.Tensor,
+        qr_kv: torch.Tensor,
+        qr: torch.Tensor,
+        kv: torch.Tensor,
+    ) -> None:
+        maybe_capture_qkv_producer(
+            self.layer_idx,
+            positions,
+            single_hidden_states,
+            qr_kv,
+            self.q_lora_rank,
+            qr,
+            kv,
+        )
+
+    def _project_target_qkv_tokenwise(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        qkv = torch.cat(
+            [
+                self.fused_wqa_wkv(hidden_states[index : index + 1])[0].clone()
+                for index in range(hidden_states.shape[0])
+            ],
+            dim=0,
+        )
+        qr, kv = qkv.split([self.q_lora_rank, self.head_dim], dim=-1)
+        return (
+            self.q_norm(qr).contiguous(),
+            self.kv_norm(kv).contiguous(),
+        )
+
+    def _project_wq_b_prefill(self, qr: torch.Tensor) -> torch.Tensor:
+        """Project Q in cache-block-sized GEMMs for long SWA-only prefills."""
+        if (
+            not self._prefill_gemm_chunking_enabled
+            or qr.shape[0] <= self._prefill_gemm_chunk_size
+        ):
+            return self.wq_b(qr)
+
+        chunk_size = self._prefill_gemm_chunk_size
+        return torch.cat(
+            [
+                self.wq_b(qr[start : start + chunk_size])
+                for start in range(0, qr.shape[0], chunk_size)
+            ],
+            dim=0,
+        )
+
+    def _project_wq_b_tokenwise(self, qr: torch.Tensor) -> torch.Tensor:
+        return torch.cat(
+            [
+                self.wq_b(qr[index : index + 1]).clone()
+                for index in range(qr.shape[0])
+            ],
+            dim=0,
+        )
+
+    def _project_wq_b_selected_rows(
+        self,
+        qr: torch.Tensor,
+        selected_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        if selected_indices.numel() == qr.shape[0]:
+            return self._project_wq_b_tokenwise(qr)
+        q = self.wq_b(qr)
+        for index in selected_indices.tolist():
+            q[index : index + 1] = self.wq_b(qr[index : index + 1]).clone()
+        return q.contiguous()
+
+    def _attention_impl_tokenwise_wq_b(
+        self,
+        hidden_states: torch.Tensor,
+        qr: torch.Tensor,
+        kv: torch.Tensor,
+        kv_score: torch.Tensor,
+        indexer_kv_score: torch.Tensor,
+        indexer_weights: torch.Tensor,
+        positions: torch.Tensor,
+        out: torch.Tensor,
+        selected_indices: torch.Tensor | None = None,
+    ) -> None:
+        attn_metadata = get_forward_context().attn_metadata
+
+        def wq_b_kv_insert() -> torch.Tensor:
+            if selected_indices is None:
+                q = self._project_wq_b_tokenwise(qr)
+            else:
+                q = self._project_wq_b_selected_rows(qr, selected_indices)
+            q = q.view(
+                -1, self.n_local_heads, self.head_dim
+            )
+            return self._fused_qnorm_rope_kv_insert(
+                q, kv, positions, attn_metadata
+            )
+
+        if self.indexer is not None:
+            aux_streams = self.aux_stream_list
+            indexer = self.indexer
+            assert self.compressor is not None
+            compressor = self.compressor
+            q, _ = execute_in_parallel(
+                wq_b_kv_insert,
+                [
+                    lambda: indexer(
+                        hidden_states,
+                        qr,
+                        indexer_kv_score,
+                        indexer_weights,
+                        positions,
+                        self.indexer_rotary_emb,
+                    ),
+                    lambda: compressor(kv_score, positions, self.rotary_emb),
+                ],
+                self.ln_events[0],
+                [self.ln_events[1], self.ln_events[2]],
+                [aux_streams[0], aux_streams[1]] if aux_streams is not None else None,
+                enable=aux_streams is not None,
+            )
+        elif self.compressor is not None:
+            aux_stream = (
+                self.aux_stream_list[0] if self.aux_stream_list is not None else None
+            )
+            compressor = self.compressor
+            q, _ = maybe_execute_in_parallel(
+                wq_b_kv_insert,
+                lambda: compressor(kv_score, positions, self.rotary_emb),
+                self.ln_events[0],
+                self.ln_events[1],
+                aux_stream,
+            )
+        else:
+            q = wq_b_kv_insert()
+        self.forward_mqa(q, kv, positions, out)
+
+    def _attention_impl_wq_b_shadow_compare(
+        self,
+        hidden_states: torch.Tensor,
+        qr: torch.Tensor,
+        kv: torch.Tensor,
+        kv_score: torch.Tensor,
+        indexer_kv_score: torch.Tensor,
+        indexer_weights: torch.Tensor,
+        positions: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        attn_metadata = get_forward_context().attn_metadata
+
+        def wq_b_kv_insert() -> torch.Tensor:
+            rowwise_q = self._project_wq_b_tokenwise(qr)
+            batched_q = self.wq_b(qr)
+            maybe_capture_wq_b_shadow_compare(
+                self.layer_idx, positions, qr, batched_q, rowwise_q
+            )
+            q = batched_q.view(-1, self.n_local_heads, self.head_dim)
+            return self._fused_qnorm_rope_kv_insert(
+                q, kv, positions, attn_metadata
+            )
+
+        if self.indexer is not None:
+            aux_streams = self.aux_stream_list
+            indexer = self.indexer
+            assert self.compressor is not None
+            compressor = self.compressor
+            q, _ = execute_in_parallel(
+                wq_b_kv_insert,
+                [
+                    lambda: indexer(
+                        hidden_states,
+                        qr,
+                        indexer_kv_score,
+                        indexer_weights,
+                        positions,
+                        self.indexer_rotary_emb,
+                    ),
+                    lambda: compressor(kv_score, positions, self.rotary_emb),
+                ],
+                self.ln_events[0],
+                [self.ln_events[1], self.ln_events[2]],
+                [aux_streams[0], aux_streams[1]] if aux_streams is not None else None,
+                enable=aux_streams is not None,
+            )
+        elif self.compressor is not None:
+            aux_stream = (
+                self.aux_stream_list[0] if self.aux_stream_list is not None else None
+            )
+            compressor = self.compressor
+            q, _ = maybe_execute_in_parallel(
+                wq_b_kv_insert,
+                lambda: compressor(kv_score, positions, self.rotary_emb),
+                self.ln_events[0],
+                self.ln_events[1],
+                aux_stream,
+            )
+        else:
+            q = wq_b_kv_insert()
+        self.forward_mqa(q, kv, positions, out)
+
     @eager_break_during_capture
     def attention_impl(
         self,
@@ -310,13 +1129,90 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
         positions: torch.Tensor,
         out: torch.Tensor,
     ) -> None:
+        if (
+            _target_tokenwise_qkv_enabled()
+            and _target_tokenwise_qkv_layer_enabled(self.layer_idx)
+            and _target_tokenwise_qkv_position_enabled(positions)
+            and 1 < hidden_states.shape[0] <= 5
+        ):
+            logger.warning_once(
+                "DeepSeek V4 speculative target attention uses tokenwise QKV "
+                "projection"
+            )
+            qr, kv = self._project_target_qkv_tokenwise(hidden_states)
+        if getattr(self, "_attention_input_capture_enabled", False):
+            maybe_capture_attention_inputs(self.layer_idx, positions, qr, kv)
+        if (
+            _target_tokenwise_wq_b_enabled()
+            and _target_tokenwise_wq_b_layer_enabled(self.layer_idx)
+            and 1 < hidden_states.shape[0] <= 5
+        ):
+            target_wq_b_indices = _target_tokenwise_wq_b_selected_indices(positions)
+            if target_wq_b_indices.numel() > 0:
+                logger.warning_once(
+                    "DeepSeek V4 speculative attention uses tokenwise wq_b projection"
+                )
+                self._attention_impl_tokenwise_wq_b(
+                    hidden_states,
+                    qr,
+                    kv,
+                    kv_score,
+                    indexer_kv_score,
+                    indexer_weights,
+                    positions,
+                    out,
+                    target_wq_b_indices,
+                )
+                if getattr(self, "_attention_input_capture_enabled", False):
+                    maybe_capture_attention_output(self.layer_idx, positions, out)
+                return
+        if (
+            1 < hidden_states.shape[0] <= 5
+            and wq_b_shadow_compare_selected(self.layer_idx, positions)
+        ):
+            logger.warning_once(
+                "DeepSeek V4 speculative attention compares batched and "
+                "tokenwise wq_b projection"
+            )
+            self._attention_impl_wq_b_shadow_compare(
+                hidden_states,
+                qr,
+                kv,
+                kv_score,
+                indexer_kv_score,
+                indexer_weights,
+                positions,
+                out,
+            )
+            if getattr(self, "_attention_input_capture_enabled", False):
+                maybe_capture_attention_output(self.layer_idx, positions, out)
+            return
+        if (
+            getattr(self, "_prefill_gemm_chunking_enabled", False)
+            and hidden_states.shape[0]
+            > getattr(self, "_prefill_gemm_chunk_size", 0)
+            and self.indexer is None
+            and self.compressor is None
+        ):
+            # Keep SWA-only prefill wq_b shapes aligned with cache-block
+            # boundaries; this preserves native GEMM numerics for prefix hits.
+            q = self._project_wq_b_prefill(qr).view(
+                -1, self.n_local_heads, self.head_dim
+            )
+            q = self._fused_qnorm_rope_kv_insert(
+                q, kv, positions, get_forward_context().attn_metadata
+            )
+            self.forward_mqa(q, kv, positions, out)
+            if getattr(self, "_attention_input_capture_enabled", False):
+                maybe_capture_attention_output(self.layer_idx, positions, out)
+            return
         target_layer = _q_insert_cudagraph_target_layer()
         target_enabled = target_layer == "all" or target_layer == self.layer_idx
         if (
             not target_enabled
             or hidden_states.shape[0] != 1
         ):
-            return super().attention_impl(
+            super().attention_impl(
                 hidden_states,
                 qr,
                 kv,
@@ -326,11 +1222,14 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
                 positions,
                 out,
             )
+            if getattr(self, "_attention_input_capture_enabled", False):
+                maybe_capture_attention_output(self.layer_idx, positions, out)
+            return
 
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
         if not isinstance(attn_metadata, dict):
-            return super().attention_impl(
+            super().attention_impl(
                 hidden_states,
                 qr,
                 kv,
@@ -340,13 +1239,16 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
                 positions,
                 out,
             )
+            if getattr(self, "_attention_input_capture_enabled", False):
+                maybe_capture_attention_output(self.layer_idx, positions, out)
+            return
         swa_metadata = attn_metadata.get(self.swa_cache_layer.prefix)
         if (
             swa_metadata is None
             or getattr(swa_metadata, "num_prefills", None) != 0
             or getattr(swa_metadata, "num_decode_tokens", None) != 1
         ):
-            return super().attention_impl(
+            super().attention_impl(
                 hidden_states,
                 qr,
                 kv,
@@ -356,6 +1258,9 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
                 positions,
                 out,
             )
+            if getattr(self, "_attention_input_capture_enabled", False):
+                maybe_capture_attention_output(self.layer_idx, positions, out)
+            return
 
         if self._q_insert_cudagraph_capture_active():
             raise RuntimeError(
@@ -403,6 +1308,9 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
         else:
             q = wq_b_kv_insert()
         self.forward_mqa(q, kv, positions, out)
+        if getattr(self, "_attention_input_capture_enabled", False):
+            maybe_capture_attention_output(self.layer_idx, positions, out)
+
 
     @staticmethod
     def _q_insert_cudagraph_capture_active() -> bool:
@@ -427,7 +1335,16 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
     ) -> torch.Tensor:
         swa_kv_cache = self.swa_cache_layer.kv_cache
         swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
-        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_insert(
+        qkv_insert_capture = maybe_prepare_qkv_insert_capture(
+            self.layer_idx,
+            positions,
+            q,
+            kv,
+            swa_kv_cache_2d,
+            swa_metadata.slot_mapping,
+            swa_metadata.block_size,
+        )
+        _run_qnorm_rope_kv_insert(
             q,
             kv,
             swa_kv_cache_2d,
@@ -437,6 +1354,8 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
             self.eps,
             swa_metadata.block_size,
         )
+        if qkv_insert_capture is not None:
+            qkv_insert_capture.finish(swa_kv_cache_2d)
         if self.n_local_heads < self.padded_heads:
             return F.pad(
                 q,
@@ -453,7 +1372,15 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
         swa_metadata,
     ) -> torch.Tensor:
         q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
-        return self._q_insert_cudagraph_native(q, kv, positions, swa_metadata)
+        q_capture = (
+            maybe_prepare_q_stage_capture(self.layer_idx, positions, q)
+            if getattr(self, "_attention_input_capture_enabled", False)
+            else None
+        )
+        output = self._q_insert_cudagraph_native(q, kv, positions, swa_metadata)
+        if q_capture is not None:
+            q_capture.finish(q)
+        return output
 
     def _q_insert_cudagraph_key(
         self,
@@ -547,11 +1474,26 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
         swa_kv_cache = self.swa_cache_layer.kv_cache
         swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
 
+        q_capture = (
+            maybe_prepare_q_stage_capture(self.layer_idx, positions, q)
+            if getattr(self, "_attention_input_capture_enabled", False)
+            else None
+        )
+
         # Horizontally fused:
         #   Q side:  q_head_norm (per-head RMSNorm, no weight) + GPT-J RoPE
         #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert
         # kv is unchanged; mla_attn reads kv solely via swa_kv_cache.
-        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_insert(
+        qkv_insert_capture = maybe_prepare_qkv_insert_capture(
+            self.layer_idx,
+            positions,
+            q,
+            kv,
+            swa_kv_cache_2d,
+            swa_metadata.slot_mapping,
+            swa_metadata.block_size,
+        )
+        _run_qnorm_rope_kv_insert(
             q,
             kv,
             swa_kv_cache_2d,
@@ -561,6 +1503,10 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
             self.eps,
             swa_metadata.block_size,
         )
+        if qkv_insert_capture is not None:
+            qkv_insert_capture.finish(swa_kv_cache_2d)
+        if q_capture is not None:
+            q_capture.finish(q)
         if self.n_local_heads < self.padded_heads:
             return F.pad(
                 q,
@@ -677,6 +1623,11 @@ class MacaDeepseekV4Indexer(nn.Module):
             k_cache_prefix=self.k_cache.prefix,
             use_fp4_cache=self.use_fp4_kv,
         )
+        self._short_context_pending = False
+        self.compressor._clear_initial_overlap = False
+        self.compressor._initial_overlap_start = (
+            self.config.sliding_window - self.compress_ratio
+        )
 
         self.indexer_op = MacaSparseAttnIndexer(
             self.k_cache,
@@ -716,26 +1667,59 @@ class MacaDeepseekV4Indexer(nn.Module):
                 swa_metadata is not None
                 and swa_metadata.is_short_context(self.config.sliding_window)
             ):
+                self._short_context_pending = True
                 assert self.topk_indices_buffer is not None
                 self.topk_indices_buffer[: hidden_states.shape[0]].fill_(-1)
                 return self.topk_indices_buffer
 
         compressor = self.compressor
+        compressor._clear_initial_overlap = getattr(
+            self, "_short_context_pending", False
+        )
+        self._short_context_pending = False
 
         def wq_b_and_q_quant():
-            # ReplicatedLinear returns (output, bias); bias is None.
-            q, _ = self.wq_b(qr)
-            q = q.view(-1, self.n_head, self.head_dim)
-            # ----------------------------------------
-            # Note: Metax use int8 quant in indexer 
-            return fused_indexer_q_rope_int8_quant(
-                positions,
-                q,
-                rotary_emb.cos_sin_cache,
-                indexer_weights,
-                self.softmax_scale,
-                self.n_head**-0.5,
-            )
+            def project_quantize(
+                qr_chunk: torch.Tensor,
+                positions_chunk: torch.Tensor,
+                chunk_index: int | None,
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                if chunk_index is not None:
+                    logger.warning_once(
+                        "DeepSeek V4 speculative indexer uses tokenwise Q "
+                        "projection and quantization"
+                    )
+                # ReplicatedLinear returns (output, bias); bias is None.
+                q, _ = self.wq_b(qr_chunk)
+                q = q.view(-1, self.n_head, self.head_dim)
+                # ----------------------------------------
+                # Note: Metax use int8 quant in indexer
+                return fused_indexer_q_rope_int8_quant(
+                    positions_chunk,
+                    q,
+                    rotary_emb.cos_sin_cache,
+                    indexer_weights,
+                    self.softmax_scale,
+                    self.n_head**-0.5,
+                )
+
+            if (
+                _indexer_tokenwise_wq_b_enabled()
+                and 1 < qr.shape[0] <= 5
+            ):
+                q_parts = []
+                weight_parts = []
+                for index in range(qr.shape[0]):
+                    q_quant, weights = project_quantize(
+                        qr[index : index + 1],
+                        positions[index : index + 1],
+                        index,
+                    )
+                    q_parts.append(q_quant.clone())
+                    weight_parts.append(weights.clone())
+                return torch.cat(q_parts, dim=0), torch.cat(weight_parts, dim=0)
+
+            return project_quantize(qr, positions, None)
 
         # compressor returns None and writes K to the indexer KV cache; the
         # join orders that write before indexer_op (skip_k_cache_insert=True).

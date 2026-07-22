@@ -19,6 +19,7 @@ import torch
 _CAPTURE_CALL_COUNT = 0
 _CAPTURE_BUCKET_COUNTS: dict[tuple[str, str, str, int | None], int] = {}
 _CAPTURE_SKIP_COUNTS: dict[tuple[str, str], int] = {}
+_CAPTURE_OBSERVED_COUNTS: dict[tuple[str, str], int] = {}
 _CAPTURE_LOCK = threading.Lock()
 
 
@@ -69,6 +70,30 @@ def _capture_list(name: str, default: set[str]) -> set[str]:
     return {item.strip().lower() for item in value.split(",") if item.strip()}
 
 
+def _capture_layer_enabled(layer_idx: int | None) -> bool:
+    value = os.getenv("VLLM_METAX_DSV4_SPARSE_MLA_CAPTURE_LAYERS")
+    if value is None or not value.strip() or value.strip().lower() == "all":
+        return True
+
+    selected: set[int] = set()
+    for item in value.split(","):
+        token = item.strip()
+        try:
+            index = int(token)
+        except ValueError as exc:
+            raise ValueError(
+                "VLLM_METAX_DSV4_SPARSE_MLA_CAPTURE_LAYERS must be a "
+                "comma-separated set of nonnegative integer layer indices"
+            ) from exc
+        if index < 0:
+            raise ValueError(
+                "VLLM_METAX_DSV4_SPARSE_MLA_CAPTURE_LAYERS must be a "
+                "comma-separated set of nonnegative integer layer indices"
+            )
+        selected.add(index)
+    return layer_idx is not None and layer_idx in selected
+
+
 def _stage_enabled(stage: str) -> bool:
     return stage in _capture_list(
         "VLLM_METAX_DSV4_SPARSE_MLA_CAPTURE_STAGES", {"prefill", "decode"}
@@ -108,6 +133,48 @@ def _max_calls() -> int:
         return 0
 
 
+def _observed_calls() -> set[int] | None:
+    value = os.getenv("VLLM_METAX_DSV4_SPARSE_MLA_CAPTURE_OBSERVED_CALLS")
+    if value is None or not value.strip():
+        return None
+    calls: set[int] = set()
+    for item in value.split(","):
+        try:
+            calls.add(int(item.strip()))
+        except ValueError:
+            continue
+    return calls
+
+
+def _capture_positions() -> set[int] | None:
+    value = os.getenv("VLLM_METAX_DSV4_SPARSE_MLA_CAPTURE_POSITIONS")
+    if value is None or not value.strip():
+        return None
+    selected: set[int] = set()
+    for item in value.split(","):
+        token = item.strip()
+        try:
+            selected.add(int(token))
+        except ValueError as exc:
+            raise ValueError(
+                "VLLM_METAX_DSV4_SPARSE_MLA_CAPTURE_POSITIONS must be a "
+                "comma-separated set of integer logical positions"
+            ) from exc
+    return selected
+
+
+def _selected_position_indices(positions: torch.Tensor | None) -> torch.Tensor | None:
+    selected = _capture_positions()
+    if selected is None:
+        return None
+    if positions is None or positions.numel() == 0:
+        return torch.empty(0, dtype=torch.long)
+    mask = torch.zeros_like(positions, dtype=torch.bool)
+    for position in selected:
+        mask |= positions == position
+    return torch.nonzero(mask, as_tuple=False).flatten()
+
+
 def reset_sparse_mla_capture_state() -> None:
     """Reset the process-local call budget, primarily for tests."""
     global _CAPTURE_CALL_COUNT
@@ -115,6 +182,7 @@ def reset_sparse_mla_capture_state() -> None:
         _CAPTURE_CALL_COUNT = 0
         _CAPTURE_BUCKET_COUNTS.clear()
         _CAPTURE_SKIP_COUNTS.clear()
+        _CAPTURE_OBSERVED_COUNTS.clear()
 
 
 def _tensor_meta(value: torch.Tensor | None) -> dict[str, Any] | None:
@@ -131,6 +199,15 @@ def _clone_to_cpu(value: torch.Tensor | None) -> torch.Tensor | None:
     if value is None:
         return None
     return value.detach().contiguous().cpu()
+
+
+def _index_rows(
+    value: torch.Tensor | None,
+    indices: torch.Tensor | None,
+) -> torch.Tensor | None:
+    if value is None or indices is None:
+        return value
+    return value.index_select(0, indices.to(device=value.device, dtype=torch.long))
 
 
 def _synchronize_capture_stream(q: torch.Tensor) -> None:
@@ -194,7 +271,7 @@ def _prepare_capture(
     stage: str,
     mode: str,
     compress_ratio: int | None,
-) -> tuple[Path, str, int] | None:
+) -> tuple[Path, str, int, int] | None:
     """Run the shared opt-in checks and reserve one capture call/path."""
     # Keep this first check before metadata inspection or any tensor operation:
     # the normal serving path must not incur CPU copies when capture is off.
@@ -205,6 +282,12 @@ def _prepare_capture(
 
     global _CAPTURE_CALL_COUNT
     with _CAPTURE_LOCK:
+        observed_bucket = (rank, stage)
+        observed_call = _CAPTURE_OBSERVED_COUNTS.get(observed_bucket, 0)
+        _CAPTURE_OBSERVED_COUNTS[observed_bucket] = observed_call + 1
+        selected_calls = _observed_calls()
+        if selected_calls is not None and observed_call not in selected_calls:
+            return None
         skip_calls = _skip_calls()
         skip_bucket = (rank, stage)
         skipped = _CAPTURE_SKIP_COUNTS.get(skip_bucket, 0)
@@ -224,7 +307,7 @@ def _prepare_capture(
 
     capture_dir.mkdir(parents=True, exist_ok=True)
     path, call = _reserve_capture_path(capture_dir, rank, call)
-    return path, rank, call
+    return path, rank, call, observed_call
 
 
 def _has_positive_lens(lens: torch.Tensor | None) -> bool:
@@ -281,20 +364,25 @@ def maybe_capture_sparse_mla_prefill(
     max_logits: torch.Tensor,
     lse: torch.Tensor,
     compress_ratio: int | None = None,
+    layer_idx: int | None = None,
 ) -> None:
     """Capture one completed native sparse MLA prefill call when enabled."""
     if _capture_preflight("prefill") is None:
         return
+    if not _capture_layer_enabled(layer_idx):
+        return
     prepared = _prepare_capture("prefill", "prefill", compress_ratio)
     if prepared is None:
         return
-    path, rank, call = prepared
+    path, rank, call, observed_call = prepared
     _synchronize_capture_stream(q)
     payload: dict[str, Any] = {
         "schema_version": 1,
         "stage": "prefill",
         "rank": int(rank) if rank.isdigit() else rank,
+        "layer_idx": layer_idx,
         "call": call,
+        "observed_call": observed_call,
         "q": _clone_to_cpu(q),
         "kv": _clone_to_cpu(kv),
         "indices": _clone_to_cpu(indices),
@@ -333,6 +421,8 @@ def maybe_capture_sparse_mla_decode(
     d_v: int,
     attn_sink: torch.Tensor | None,
     output: torch.Tensor,
+    positions: torch.Tensor | None = None,
+    token_to_req: torch.Tensor | None = None,
     swa_block_table: torch.Tensor | None = None,
     compressed_block_table: torch.Tensor | None = None,
     swa_block_size: int | None = None,
@@ -341,6 +431,7 @@ def maybe_capture_sparse_mla_decode(
     window_size: int | None = None,
     decode_backend: str = "native",
     native_decode_mode: str = "torch_compat",
+    layer_idx: int | None = None,
 ) -> None:
     """Capture one completed Torch sparse MLA decode oracle call.
 
@@ -349,6 +440,8 @@ def maybe_capture_sparse_mla_decode(
     values are made contiguous for portable replay.
     """
     if _capture_preflight("decode") is None:
+        return
+    if not _capture_layer_enabled(layer_idx):
         return
     mode = _classify_decode_mode(
         swa_cache=swa_cache,
@@ -360,11 +453,22 @@ def maybe_capture_sparse_mla_decode(
     )
     if mode is None or not _decode_mode_enabled(mode):
         return
+    token_indices = _selected_position_indices(positions)
+    if token_indices is not None and token_indices.numel() == 0:
+        return
     prepared = _prepare_capture("decode", mode, compress_ratio)
     if prepared is None:
         return
-    path, rank, call = prepared
+    path, rank, call, observed_call = prepared
     _synchronize_capture_stream(q)
+    q_selected = _index_rows(q, token_indices)
+    swa_indices_selected = _index_rows(swa_indices, token_indices)
+    topk_indices_selected = _index_rows(topk_indices, token_indices)
+    swa_lens_selected = _index_rows(swa_lens, token_indices)
+    topk_lens_selected = _index_rows(topk_lens, token_indices)
+    output_selected = _index_rows(output, token_indices)
+    positions_selected = _index_rows(positions, token_indices)
+    token_to_req_selected = _index_rows(token_to_req, token_indices)
 
     tensors = {
         "q": q,
@@ -375,6 +479,8 @@ def maybe_capture_sparse_mla_decode(
         "swa_lens": swa_lens,
         "topk_lens": topk_lens,
         "attn_sink": attn_sink,
+        "positions": positions,
+        "token_to_req": token_to_req,
         "swa_block_table": swa_block_table,
         "compressed_block_table": compressed_block_table,
     }
@@ -385,14 +491,19 @@ def maybe_capture_sparse_mla_decode(
         "decode_backend": decode_backend,
         "native_decode_mode": native_decode_mode,
         "rank": int(rank) if rank.isdigit() else rank,
+        "layer_idx": layer_idx,
         "call": call,
-        "q": _clone_to_cpu(q),
+        "observed_call": observed_call,
+        "positions": _clone_to_cpu(positions_selected),
+        "token_indices": _clone_to_cpu(token_indices),
+        "token_to_req": _clone_to_cpu(token_to_req_selected),
+        "q": _clone_to_cpu(q_selected),
         "swa_cache": _clone_to_cpu(swa_cache),
         "compressed_cache": _clone_to_cpu(compressed_cache),
-        "swa_indices": _clone_to_cpu(swa_indices),
-        "topk_indices": _clone_to_cpu(topk_indices),
-        "swa_lens": _clone_to_cpu(swa_lens),
-        "topk_lens": _clone_to_cpu(topk_lens),
+        "swa_indices": _clone_to_cpu(swa_indices_selected),
+        "topk_indices": _clone_to_cpu(topk_indices_selected),
+        "swa_lens": _clone_to_cpu(swa_lens_selected),
+        "topk_lens": _clone_to_cpu(topk_lens_selected),
         "swa_block_table": _clone_to_cpu(swa_block_table),
         "compressed_block_table": _clone_to_cpu(compressed_block_table),
         "sm_scale": float(sm_scale),
@@ -420,7 +531,7 @@ def maybe_capture_sparse_mla_decode(
             "window_size": window_size,
         },
         "caller_out": _caller_out_meta(output),
-        "output": _clone_to_cpu(output),
+        "output": _clone_to_cpu(output_selected),
     }
     _atomic_torch_save(payload, path)
 

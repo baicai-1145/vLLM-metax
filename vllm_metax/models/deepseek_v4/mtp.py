@@ -51,6 +51,7 @@ from .model import (
     make_deepseek_v4_expert_params_mapping,
 )
 from .ops.mhc.backend import hc_head_fused_kernel, mhc_post
+from .mtp_debug import maybe_capture_mtp_stage
 
 logger = init_logger(__name__)
 
@@ -144,6 +145,16 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
         previous_hidden_states = previous_hidden_states.view(
             -1, self.hc_mult, self.config.hidden_size
         )
+        maybe_capture_mtp_stage(
+            "before_input_rms",
+            spec_step_index,
+            {
+                "input_ids": input_ids,
+                "positions": positions,
+                "inputs_embeds": inputs_embeds,
+                "previous_hidden_states": previous_hidden_states,
+            },
+        )
         # Fused: mask inputs at position 0 (not needed by MTP), enorm, hnorm.
         inputs_embeds, previous_hidden_states = fused_mtp_input_rmsnorm(
             inputs_embeds,
@@ -154,16 +165,66 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
             self.enorm.variance_epsilon,
             self.hc_mult,
         )
+        maybe_capture_mtp_stage(
+            "after_input_rms",
+            spec_step_index,
+            {
+                "input_ids": input_ids,
+                "positions": positions,
+                "inputs_embeds": inputs_embeds,
+                "previous_hidden_states": previous_hidden_states,
+            },
+        )
         hidden_states = self.h_proj(previous_hidden_states) + self.e_proj(
             inputs_embeds
         ).unsqueeze(-2)
+        maybe_capture_mtp_stage(
+            "after_h_proj_e_proj",
+            spec_step_index,
+            {
+                "input_ids": input_ids,
+                "positions": positions,
+                "pre_hidden_states": previous_hidden_states,
+                "hidden_states": hidden_states,
+            },
+        )
         hidden_states, residual, post_mix, res_mix = self.mtp_block(
             positions=positions, x=hidden_states, input_ids=None
         )
+        maybe_capture_mtp_stage(
+            "after_mtp_block",
+            spec_step_index,
+            {
+                "input_ids": input_ids,
+                "positions": positions,
+                "pre_hidden_states": hidden_states,
+                "residual": residual,
+                "post_mix": post_mix,
+                "res_mix": res_mix,
+            },
+        )
         hidden_states = mhc_post(hidden_states, residual, post_mix, res_mix)
+        maybe_capture_mtp_stage(
+            "after_mhc_post",
+            spec_step_index,
+            {
+                "input_ids": input_ids,
+                "positions": positions,
+                "post_hidden_states": hidden_states,
+            },
+        )
         # Return the flat pre-hc_head residual so it can be re-fed as the
         # next spec step's `previous_hidden_states` when
         # num_speculative_tokens > 1. hc_head is deferred to compute_logits.
+        maybe_capture_mtp_stage(
+            "before_spec_step_return",
+            spec_step_index,
+            {
+                "input_ids": input_ids,
+                "positions": positions,
+                "post_hidden_states": hidden_states,
+            },
+        )
         return hidden_states.flatten(1)
 
 
@@ -254,12 +315,22 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
             mtp_layer.rms_norm_eps,
             mtp_layer.hc_eps,
         )
+        maybe_capture_mtp_stage(
+            "after_hc_head",
+            spec_step_idx,
+            {"pre_hidden_states": hidden_states},
+        )
         hidden_states = mtp_shared_head_rmsnorm(
             hidden_states,
             mtp_layer.shared_head.norm.weight.data,
             mtp_layer.shared_head.norm.variance_epsilon,
         )
         logits = self.logits_processor(mtp_layer.shared_head.head, hidden_states)
+        maybe_capture_mtp_stage(
+            "after_logits",
+            spec_step_idx,
+            {"post_hidden_states": hidden_states, "logits": logits},
+        )
         return logits
 
 

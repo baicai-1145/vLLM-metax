@@ -25,6 +25,16 @@ if TYPE_CHECKING:
     VLLM_FUSED_MOE_CHUNK_SIZE: int = 16 * 1024
     VLLM_METAX_USE_FP8_SPARSE_ATTN_INDEXER: bool = False
     VLLM_METAX_USE_SGL_FUSED_MOE_GROUPED_TOPK: bool = False
+    VLLM_METAX_DSV4_PREFILL_GEMM_CHUNKING: bool = False
+    VLLM_METAX_DSV4_MTP_K1_CORRECTNESS_CANDIDATE: bool = False
+    VLLM_METAX_DSV4_MTP_K1_NATIVE_WQ_B_CANDIDATE: bool = False
+    VLLM_METAX_DSV4_MTP_K1_NATIVE_WQ_B_LAYERS: str | None = None
+    VLLM_METAX_DSV4_MTP_K1_NATIVE_O_PROJ_CANDIDATE: bool = False
+    VLLM_METAX_DSV4_MTP_K1_NATIVE_FFN_CANDIDATE: bool = False
+    VLLM_METAX_DSV4_MTP_K1_NATIVE_MHC_PRE_CANDIDATE: bool = False
+    VLLM_METAX_DSV4_MTP_K1_NATIVE_KV_PRENORM_CANDIDATE: bool = False
+    VLLM_METAX_DSV4_MTP_K1_SERIAL_TARGET: bool = False
+    VLLM_METAX_DSV4_MTP_STOP_AWARE_OUTPUT_TRUNCATION: bool = False
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Installation Time Env Vars ==================
@@ -114,6 +124,53 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_METAX_USE_SGL_FUSED_MOE_GROUPED_TOPK": lambda: bool(
         int(os.getenv("VLLM_METAX_USE_SGL_FUSED_MOE_GROUPED_TOPK", "0"))
     ),
+    # Align DeepSeek V4 prefill input GEMMs with the SWA cache block size.
+    "VLLM_METAX_DSV4_PREFILL_GEMM_CHUNKING": lambda: bool(
+        int(os.getenv("VLLM_METAX_DSV4_PREFILL_GEMM_CHUNKING", "0"))
+    ),
+    # Default-off DeepSeek V4 MTP k=1 exact-token correctness candidate.
+    "VLLM_METAX_DSV4_MTP_K1_CORRECTNESS_CANDIDATE": lambda: bool(
+        int(os.getenv("VLLM_METAX_DSV4_MTP_K1_CORRECTNESS_CANDIDATE", "0"))
+    ),
+    # Candidate experiment: use native/batched target WQ_B under the k=1
+    # umbrella while keeping other correctness-candidate paths enabled.
+    "VLLM_METAX_DSV4_MTP_K1_NATIVE_WQ_B_CANDIDATE": lambda: bool(
+        int(os.getenv("VLLM_METAX_DSV4_MTP_K1_NATIVE_WQ_B_CANDIDATE", "0"))
+    ),
+    "VLLM_METAX_DSV4_MTP_K1_NATIVE_WQ_B_LAYERS": lambda: os.getenv(
+        "VLLM_METAX_DSV4_MTP_K1_NATIVE_WQ_B_LAYERS"
+    ),
+    # Candidate experiment: use native/batched output projection under the k=1
+    # umbrella while keeping other correctness-candidate paths enabled.
+    "VLLM_METAX_DSV4_MTP_K1_NATIVE_O_PROJ_CANDIDATE": lambda: bool(
+        int(os.getenv("VLLM_METAX_DSV4_MTP_K1_NATIVE_O_PROJ_CANDIDATE", "0"))
+    ),
+    # Candidate experiment: use native/batched FFN under the k=1 umbrella while
+    # keeping other correctness-candidate paths enabled.
+    "VLLM_METAX_DSV4_MTP_K1_NATIVE_FFN_CANDIDATE": lambda: bool(
+        int(os.getenv("VLLM_METAX_DSV4_MTP_K1_NATIVE_FFN_CANDIDATE", "0"))
+    ),
+    # Candidate experiment: use native/batched initial MHC pre under the k=1
+    # umbrella while keeping other correctness-candidate paths enabled.
+    "VLLM_METAX_DSV4_MTP_K1_NATIVE_MHC_PRE_CANDIDATE": lambda: bool(
+        int(os.getenv("VLLM_METAX_DSV4_MTP_K1_NATIVE_MHC_PRE_CANDIDATE", "0"))
+    ),
+    # Candidate experiment: use native/batched target KV prenorm under the k=1
+    # umbrella while keeping other correctness-candidate paths enabled.
+    "VLLM_METAX_DSV4_MTP_K1_NATIVE_KV_PRENORM_CANDIDATE": lambda: bool(
+        int(os.getenv("VLLM_METAX_DSV4_MTP_K1_NATIVE_KV_PRENORM_CANDIDATE", "0"))
+    ),
+    # Correctness-only k=1 mode: execute one real target token per step while
+    # retaining the MTP drafter. This deliberately provides no speedup.
+    "VLLM_METAX_DSV4_MTP_K1_SERIAL_TARGET": lambda: bool(
+        int(os.getenv("VLLM_METAX_DSV4_MTP_K1_SERIAL_TARGET", "0"))
+    ),
+    # Candidate experiment: when speculative decoding returns multiple tokens
+    # in one engine output and a stop string is completed before the last token,
+    # trim the same-batch tail from externally visible token IDs.
+    "VLLM_METAX_DSV4_MTP_STOP_AWARE_OUTPUT_TRUNCATION": lambda: bool(
+        int(os.getenv("VLLM_METAX_DSV4_MTP_STOP_AWARE_OUTPUT_TRUNCATION", "0"))
+    ),
     # =================== Debug Env Vars ==================
     # if set, use vllm's fused_moe implementation instead of maca's one for debugging and comparison
     "USE_VLLM_TRITON_EXPERT": lambda: bool(
@@ -123,6 +180,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
 
 
 # end-env-vars-definition
+
+
+def register_metax_envs_with_vllm() -> None:
+    """Expose plugin-owned VLLM_METAX_* variables to vLLM's validator."""
+    from vllm import envs
+
+    for name, resolver in environment_variables.items():
+        if name.startswith("VLLM_METAX_"):
+            envs.environment_variables.setdefault(name, resolver)
+
+
 def override_vllm_env(env_name: str, value: Any, reason: str | None) -> None:
     """
     Override a vLLM environment variable at runtime.
