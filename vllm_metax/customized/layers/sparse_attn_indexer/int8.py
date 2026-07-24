@@ -18,6 +18,7 @@ from vllm_metax.utils.deep_gemm import (
     int8_mqa_logits,
     int8_paged_mqa_logits,
 )
+from vllm.utils.deep_gemm import get_paged_mqa_logits_metadata
 from vllm.utils.torch_utils import (
     LayerNameType,
     _resolve_layer_name,
@@ -43,6 +44,7 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 _INDEXER_CACHE_LAYOUT_LOG_ENV = "VLLM_METAX_DSV4_INDEXER_CACHE_LAYOUT_LOG"
 _INDEXER_CACHE_LAYOUT_LOGGED = False
 _INDEXER_CACHE_LAYOUT_LOG_LOCK = threading.Lock()
+_TOKENWISE_INDEXER_DECODE_ENV = "VLLM_METAX_DSV4_TOKENWISE_INDEXER_DECODE"
 
 
 def _indexer_cache_layout_is_standard(
@@ -192,6 +194,41 @@ def _int8_paged_decode_logits(
         max_model_len=max_model_len,
         clean_logits=True,
     )
+
+
+def _int8_paged_decode_logits_tokenwise(
+    q_quant: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    max_model_len: int,
+    num_sms: int,
+) -> torch.Tensor:
+    """Match N=1 native paged-logit numerics for speculative decode rows."""
+    batch_size, next_n = q_quant.shape[:2]
+    weights_by_token = weights.reshape(batch_size, next_n, -1)
+    logits = []
+    for index in range(next_n):
+        row_lens = seq_lens[:, index : index + 1].contiguous()
+        row_schedule = get_paged_mqa_logits_metadata(
+            row_lens,
+            kv_cache.shape[1],
+            num_sms,
+        )
+        logits.append(
+            _int8_paged_decode_logits(
+                q_quant[:, index : index + 1].contiguous(),
+                kv_cache,
+                weights_by_token[:, index : index + 1].reshape(batch_size, -1),
+                row_lens,
+                block_table,
+                row_schedule,
+                max_model_len=max_model_len,
+            )
+        )
+    return torch.stack(logits, dim=1).reshape(batch_size * next_n, -1)
 
 
 def _int8_prefill_logits(
@@ -419,18 +456,41 @@ def sparse_attn_indexer_int8(
         # otherwise. deep_gemm fp8_fp4_paged_mqa_logits requires 2D context_lens;
         # the downstream topk kernels accept both 1D and 2D.
         padded_q_quant_cast = padded_q_quant_decode_tokens
-        logits = _int8_paged_decode_logits(
-            padded_q_quant_cast,
-            kv_cache,
-            weights[:num_padded_tokens],
-            seq_lens,
-            decode_metadata.block_table,
-            decode_metadata.schedule_metadata,
-            max_model_len=max_model_len,
+        tokenwise_decode = (
+            os.getenv(_TOKENWISE_INDEXER_DECODE_ENV) == "1"
+            and 1 < next_n <= 5
+            and not decode_metadata.requires_padding
         )
+        if tokenwise_decode:
+            logger.warning_once(
+                "DeepSeek V4 speculative indexer uses tokenwise native paged logits"
+            )
+            logits = _int8_paged_decode_logits_tokenwise(
+                padded_q_quant_cast,
+                kv_cache,
+                weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
+                max_model_len=max_model_len,
+                num_sms=decode_metadata.num_sms,
+            )
+        else:
+            logits = _int8_paged_decode_logits(
+                padded_q_quant_cast,
+                kv_cache,
+                weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
+                decode_metadata.schedule_metadata,
+                max_model_len=max_model_len,
+            )
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
-        _fill_topk_indices_torch(logits, topk_indices, valid_counts=seq_lens)
+        _fill_topk_indices_torch(
+            logits,
+            topk_indices,
+            valid_counts=seq_lens,
+        )
         native_topk_indices = topk_indices
 
         if decode_metadata.requires_padding:

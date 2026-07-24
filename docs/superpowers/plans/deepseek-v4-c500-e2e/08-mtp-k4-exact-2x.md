@@ -3213,6 +3213,124 @@ Artifacts:
 - `.logs/deepseek_v4_mtp_performance/k4_hybrid_exact_v2_20260723/`;
 - `.logs/deepseek_v4_mtp_performance/k4_hybrid_100token_20260723/benchmark_summary.json`.
 
+## 2026-07-23 k=4 three-sample quality gate
+
+The TP=4 k=4 normal-graph quality blocker is closed for the frozen six-prompt
+gate. Two independent native-path defects were required:
+
+1. Compatibility sparse decode retained a 512-wide all-invalid top-k tensor
+   even when `topk_lens=0`. That changed the FP32 GEMM/softmax reduction from
+   `K=128` to `K=640` and changed BF16 output rounding. Tokenwise dispatch now
+   emits a true SWA-only native call for those rows.
+2. A speculative batch crossing the sliding-window boundary updated the
+   indexer compressor for short-context rows that single-token decode skips.
+   The indexer compressor now skips those rows and updates state beginning at
+   the first valid long-context position.
+
+The promoted three-prompt corpus passes `3/3` exact, and three prompts created
+only after that pass also pass `3/3` exact. Both matrix runs used TP=4,
+PIECEWISE graph mode, prefix cache on, `MAX_NUM_BATCHED_TOKENS=8192`, and 100
+output tokens. The prompt-specific indexer prefix mask used during diagnosis
+was removed before both accepted gates. MTP remains default-off until the
+separate performance and broader integration gates are rerun.
+
+The final single-prompt replay smoke also completed with
+`FINAL_SCOPE_SMOKE_EXACT True` under the same TP=4 PIECEWISE breakable-graph
+configuration. Review confirmed that the two data-dependent scalar reads in
+the tokenwise fixes execute inside `attention_impl`'s
+`eager_break_during_capture` segment, rather than inside a captured graph.
+They remain a performance optimization target because eager replay performs a
+device-to-host synchronization; this is not a correctness blocker for the
+accepted configuration.
+
+Artifacts:
+
+- `.logs/deepseek_v4_mtp_quality_3sample_20260723/promoted_systems_final_fixes_formal_3/summary.json`;
+- `.logs/deepseek_v4_mtp_quality_3sample_20260723/fresh_heldout_final_fixes_3/summary.json`;
+- `.logs/deepseek_v4_mtp_quality_3sample_20260723/final_scope_smoke/run.log`;
+- `.logs/deepseek_v4_mtp_quality_3sample_20260723/promoted_systems_pos125_layer2_sparse/kernel_validation/summary.json`;
+- `tools/debug/corpora/deepseek_v4_mtp_fresh_heldout_3_after_fix_20260723.jsonl`.
+
+### 2026-07-24 independent three-prompt quality recheck (superseded)
+
+A new corpus covering policy causal analysis, distributed percentile
+aggregation, and browser-extension security initially reported `0/3` exact.
+That result is retained as diagnostic history but is not an MTP quality gate:
+the candidate alone enabled MHC TileLang exact pre/post and prefill GEMM
+chunking, while the MTP=0 oracle used a different MHC/prefill workload. A
+rank-1 sparse-MLA capture localized the resulting difference to two prompt
+cache BF16 values, and a same-prompt MTP=0 rerun with the shared MHC settings
+changed the oracle's first tokens from `[10177, 19995]` to `[10177, 8618]`,
+matching MTP=4. The apparent token mismatches therefore compared two target
+execution configurations rather than isolating MTP.
+
+Artifacts:
+
+- `tools/debug/corpora/deepseek_v4_mtp_new_heldout_3_20260724.jsonl`;
+- `.logs/deepseek_v4_mtp_quality_3sample_20260724/new_heldout_3_explicit_full_v2/summary.json`;
+- `.logs/deepseek_v4_mtp_quality_3sample_20260724/new_heldout_3_explicit_full_v2/validation_manifest.json`.
+
+The earlier `new_heldout_3_full_candidate` 3/3 result also remains unpromoted:
+its baseline inherited candidate-only environment variables, including the
+MTP correctness candidate itself.
+
+#### Corrected shared-environment gate
+
+The validation matrix now accepts explicit `--shared-env` overrides and
+applies them to both MTP=0 and MTP=4 before applying side-specific overrides.
+The corrected gate held TP=4, PIECEWISE graph mode, prefix cache on,
+`MAX_NUM_BATCHED_TOKENS=8192`, 100 output tokens, MHC TileLang exact pre/post,
+and prefill GEMM chunking identical across both sides. Only MTP and its
+tokenwise correctness paths differed.
+
+All three corpora passed `3/3` exact, for `9/9` 100-token prompt sequences and
+matching `length` finish reasons:
+
+- regression corpus: `3/3` exact;
+- original heldout corpus: `3/3` exact;
+- newly created 2026-07-24 heldout corpus: `3/3` exact.
+
+Artifacts:
+
+- `.logs/deepseek_v4_mtp_quality_3sample_20260724/regression_3_shared_mhc_v1/summary.json`;
+- `.logs/deepseek_v4_mtp_quality_3sample_20260724/heldout_3_shared_mhc_v1/summary.json`;
+- `.logs/deepseek_v4_mtp_quality_3sample_20260724/new_heldout_3_shared_mhc_v1/summary.json`;
+- `.logs/deepseek_v4_mtp_quality_3sample_20260724/new_policy_sparse_capture/`;
+- `.logs/deepseek_v4_mtp_quality_3sample_20260724/new_policy_shared_mhc_probe/run.log`.
+
+This closes the current nine-prompt general-quality blocker under the frozen
+shared workload. MTP remains default-off until the performance and broader
+integration gates are accepted.
+
+#### Ten-sample quality acceptance extension
+
+A further corpus of ten prompts was created only after the nine-prompt gate
+passed. It covers four practical reasoning domains: distributed systems,
+data/statistics, security/reliability, and concurrent code/database design.
+The corpus is internally unique and disjoint by both ID and prompt text from
+the preceding nine prompts.
+
+The validation matrix was generalized from a fixed three-prompt batch to any
+non-empty corpus while retaining one MTP=0 engine load and one MTP=4 engine
+load. The frozen shared workload remained TP=4, K=4, PIECEWISE graph mode,
+prefix cache on, `MAX_NUM_BATCHED_TOKENS=8192`, MHC TileLang exact pre/post,
+prefill GEMM chunking, and 100 output tokens per prompt.
+
+Result: `10/10` exact token sequences and `10/10` matching `length` finish
+reasons. The candidate log records both `RUN_TOKEN_IDS_MATCH_EXPECTED` and
+`RUN_FINISH_REASONS_MATCH_EXPECTED`. Combined with the preceding gate, the
+current corpus evidence is `19/19` exact. The MTP quality gate is accepted for
+this frozen workload; default enablement still waits for performance and
+broader integration acceptance.
+
+Artifacts:
+
+- `tools/debug/corpora/deepseek_v4_mtp_acceptance_10_20260724.jsonl`;
+- `.logs/deepseek_v4_mtp_quality_10sample_20260724/acceptance_10_shared_mhc_v1/summary.json`;
+- `.logs/deepseek_v4_mtp_quality_10sample_20260724/acceptance_10_shared_mhc_v1/validation_manifest.json`;
+- `.logs/deepseek_v4_mtp_quality_10sample_20260724/acceptance_10_shared_mhc_v1/mtp0/workload.manifest`;
+- `.logs/deepseek_v4_mtp_quality_10sample_20260724/acceptance_10_shared_mhc_v1/mtp4/workload.manifest`.
+
 ## Stop conditions
 
 出现以下任一情况立即停止性能优化并保持 MTP default-off：

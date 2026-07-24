@@ -448,7 +448,42 @@ def _run_sparse_mla_decode(**kwargs) -> None:
             value = row_kwargs[name]
             if value is not None:
                 row_kwargs[name] = value[index : index + 1]
+        row_topk_lens = row_kwargs.get("topk_lens")
+        # This helper runs under attention_impl's eager-break segment.  The
+        # scalar branch is therefore replayed eagerly, never captured in a
+        # CUDA graph whose topology could change with topk_lens.
+        if (
+            row_kwargs.get("topk_indices") is not None
+            and row_topk_lens is not None
+            and row_topk_lens.numel() == 1
+            and row_topk_lens.item() == 0
+        ):
+            # The compatibility kernel derives its GEMM reduction width from
+            # the physical top-k tensor shape, not topk_lens. An all-invalid
+            # stream must therefore be omitted to match the SWA-only greedy
+            # decode contract exactly.
+            row_kwargs["topk_indices"] = None
+            row_kwargs["topk_lens"] = None
+            row_kwargs["compressed_cache"] = None
+            row_kwargs["compressed_block_table"] = None
+            row_kwargs["compressed_block_size"] = None
         sparse_mla_decode(**row_kwargs)
+
+
+def _mask_short_context_topk(
+    positions: torch.Tensor,
+    window_size: int,
+    topk_indices: torch.Tensor | None,
+    topk_lens: torch.Tensor | None,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    if topk_indices is None:
+        return None, topk_lens
+    short_context = positions.reshape(-1) < window_size
+    masked_indices = topk_indices.masked_fill(short_context[:, None, None], -1)
+    masked_lens = (
+        topk_lens.masked_fill(short_context, 0) if topk_lens is not None else None
+    )
+    return masked_indices, masked_lens
 
 
 def _warn_torch_reference_decode() -> None:
@@ -722,6 +757,13 @@ class MacaDeepseekV4FlashMLAAttention(MacaDeepseekV4Attention):
 
         swa_indices = swa_metadata.decode_swa_indices
         swa_lens = swa_metadata.decode_swa_lens
+        if not swa_only:
+            topk_indices, topk_lens = _mask_short_context_topk(
+                positions[:num_decode_tokens],
+                self.window_size,
+                topk_indices,
+                topk_lens,
+            )
 
         # Keep the original decode inputs for the opt-in debug capture.  The
         # Torch oracle below receives unsqueezed cache/query views, but the

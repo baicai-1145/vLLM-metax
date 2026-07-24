@@ -409,6 +409,9 @@ class MacaDeepseekCompressor(DeepseekCompressor):
 
         # [num_blocks, block_size, kv_dim+score_dim], where kv_dim == score_dim
         state_cache = self.state_cache.kv_cache
+        k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
+        k_cache_layer = self._static_forward_context[self.k_cache_prefix]
+        kv_cache = k_cache_layer.kv_cache
         if getattr(self, "_clear_initial_overlap", False):
             _zero_initial_overlap_state(
                 state_cache,
@@ -428,10 +431,6 @@ class MacaDeepseekCompressor(DeepseekCompressor):
         )
 
         cos_sin_cache = rotary_emb.cos_sin_cache
-        k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
-        k_cache_layer = self._static_forward_context[self.k_cache_prefix]
-        kv_cache = k_cache_layer.kv_cache
-
         # -----------------------------------------------
         # Note: Metax use full attn bf16 + indexer int8
         compress_norm_rope_store_fn = compress_norm_rope_store_triton
@@ -503,7 +502,16 @@ class MacaDeepseekCompressor(DeepseekCompressor):
             os.getenv("VLLM_METAX_DSV4_TOKENWISE_COMPRESSOR") == "1"
             and 1 < num_actual <= 5
         ):
+            min_position = getattr(self, "_tokenwise_min_position", None)
             for index in range(num_actual):
+                # The compressor is called only from attention_impl's
+                # eager-break segment, so this data-dependent branch is not
+                # recorded in the surrounding CUDA graph.
+                if (
+                    min_position is not None
+                    and positions[index].item() < min_position
+                ):
+                    continue
                 token_slice = slice(index, index + 1)
                 save_rows(token_slice)
                 compress_rows(token_slice)

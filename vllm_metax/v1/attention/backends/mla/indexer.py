@@ -197,6 +197,7 @@ class DeepSeekV32IndexerDecodeMetadata:
     decode_lens: torch.Tensor
     requires_padding: bool
     schedule_metadata: torch.Tensor
+    num_sms: int
 
 
 @dataclass
@@ -628,6 +629,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 decode_lens=decode_lens,
                 requires_padding=requires_padding,
                 schedule_metadata=self.scheduler_metadata_buffer,
+                num_sms=self.num_sms,
             )
 
         attn_metadata = DeepseekV32IndexerMetadata(

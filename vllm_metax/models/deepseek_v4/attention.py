@@ -93,6 +93,10 @@ _Q_INSERT_CUDAGRAPH_LAYER_ENV = "VLLM_METAX_DSV4_Q_INSERT_CUDAGRAPH_LAYER"
 _TOKENWISE_WQ_B_ENV = "VLLM_METAX_DSV4_TOKENWISE_WQ_B"
 _TOKENWISE_TARGET_WQ_B_ENV = "VLLM_METAX_DSV4_TOKENWISE_TARGET_WQ_B"
 _TOKENWISE_INDEXER_WQ_B_ENV = "VLLM_METAX_DSV4_TOKENWISE_INDEXER_WQ_B"
+_TOKENWISE_INDEXER_WQ_B_LAYERS_ENV = (
+    "VLLM_METAX_DSV4_TOKENWISE_INDEXER_WQ_B_LAYERS"
+)
+_TOKENWISE_ATTN_GEMM_ENV = "VLLM_METAX_DSV4_TOKENWISE_ATTN_GEMM"
 _TOKENWISE_TARGET_WQ_B_LAYERS_ENV = "VLLM_METAX_DSV4_TOKENWISE_TARGET_WQ_B_LAYERS"
 _TOKENWISE_TARGET_WQ_B_POSITIONS_ENV = (
     "VLLM_METAX_DSV4_TOKENWISE_TARGET_WQ_B_POSITIONS"
@@ -382,11 +386,29 @@ def _target_tokenwise_qkv_position_mask(positions: torch.Tensor) -> torch.Tensor
     return mask
 
 
-def _indexer_tokenwise_wq_b_enabled() -> bool:
-    return (
+def _indexer_tokenwise_wq_b_enabled(layer_idx: int) -> bool:
+    enabled = (
         os.getenv(_TOKENWISE_WQ_B_ENV) == "1"
         or os.getenv(_TOKENWISE_INDEXER_WQ_B_ENV) == "1"
     )
+    if not enabled:
+        return False
+    value = os.getenv(_TOKENWISE_INDEXER_WQ_B_LAYERS_ENV)
+    if value is None or not value.strip() or value.strip().lower() == "all":
+        return True
+    try:
+        selected = {int(item.strip()) for item in value.split(",") if item.strip()}
+    except ValueError as exc:
+        raise ValueError(
+            f"{_TOKENWISE_INDEXER_WQ_B_LAYERS_ENV} must be 'all' or a "
+            "comma-separated set of nonnegative integer layer indices"
+        ) from exc
+    if any(index < 0 for index in selected):
+        raise ValueError(
+            f"{_TOKENWISE_INDEXER_WQ_B_LAYERS_ENV} must be 'all' or a "
+            "comma-separated set of nonnegative integer layer indices"
+        )
+    return layer_idx in selected
 
 
 def _qnorm_rope_kv_insert_native(
@@ -749,6 +771,34 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
         return self._o_proj(o, positions)
 
     def attn_gemm_parallel_execute(self, hidden_states):
+        if (
+            os.getenv(_TOKENWISE_ATTN_GEMM_ENV) == "1"
+            and 1 < hidden_states.shape[0] <= 5
+        ):
+            logger.warning_once(
+                "DeepSeek V4 speculative attention uses tokenwise projection GEMMs"
+            )
+            results = [
+                super(MacaDeepseekV4Attention, self).attn_gemm_parallel_execute(
+                    hidden_states[index : index + 1]
+                )
+                for index in range(hidden_states.shape[0])
+            ]
+            none_mask = tuple(value is None for value in results[0])
+            if any(
+                tuple(value is None for value in result) != none_mask
+                for result in results[1:]
+            ):
+                raise RuntimeError(
+                    "DeepSeek V4 tokenwise projection GEMMs returned inconsistent "
+                    "None/non-None components"
+                )
+            return tuple(
+                None
+                if is_none
+                else torch.cat([result[index] for result in results], dim=0)
+                for index, is_none in enumerate(none_mask)
+            )
         if (
             not self._prefill_gemm_chunking_enabled
             or hidden_states.shape[0] <= self._prefill_gemm_chunk_size
@@ -1590,6 +1640,7 @@ class MacaDeepseekV4Indexer(nn.Module):
             vllm_config.model_config.max_model_len // self.compress_ratio
         )
         self.prefix = prefix
+        self.layer_idx = extract_layer_index(prefix)
 
         self.max_total_seq_len = (
             get_max_prefill_buffer_size(vllm_config) // self.compress_ratio
@@ -1661,6 +1712,7 @@ class MacaDeepseekV4Indexer(nn.Module):
     ) -> torch.Tensor:
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
+        swa_metadata = None
         if isinstance(attn_metadata, dict):
             swa_metadata = attn_metadata.get(self.prefix.replace('.indexer', '.swa_cache'))
             if (
@@ -1673,6 +1725,12 @@ class MacaDeepseekV4Indexer(nn.Module):
                 return self.topk_indices_buffer
 
         compressor = self.compressor
+        compressor._tokenwise_min_position = (
+            self.config.sliding_window
+            if swa_metadata is not None
+            and getattr(swa_metadata, "num_prefills", 0) == 0
+            else None
+        )
         compressor._clear_initial_overlap = getattr(
             self, "_short_context_pending", False
         )
@@ -1704,7 +1762,7 @@ class MacaDeepseekV4Indexer(nn.Module):
                 )
 
             if (
-                _indexer_tokenwise_wq_b_enabled()
+                _indexer_tokenwise_wq_b_enabled(self.layer_idx)
                 and 1 < qr.shape[0] <= 5
             ):
                 q_parts = []
