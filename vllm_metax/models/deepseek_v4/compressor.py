@@ -494,13 +494,16 @@ class MacaDeepseekCompressor(DeepseekCompressor):
                 quant_block=self._quant_block,
                 token_stride=self._token_stride,
                 scale_dim=self._scale_dim,
+                initial_overlap_boundary=getattr(
+                    self, "_initial_overlap_boundary", None
+                ),
             )
             if capture is not None:
                 capture.finish()
 
         if (
             os.getenv("VLLM_METAX_DSV4_TOKENWISE_COMPRESSOR") == "1"
-            and 1 < num_actual <= 5
+            and 1 < num_actual <= 6
         ):
             min_position = getattr(self, "_tokenwise_min_position", None)
             for index in range(num_actual):

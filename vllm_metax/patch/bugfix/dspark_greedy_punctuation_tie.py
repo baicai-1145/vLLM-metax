@@ -66,6 +66,25 @@ def _force_reject_v1_greedy_result(
     return forced
 
 
+def _force_reject_v2_greedy_result(
+    result: tuple[torch.Tensor, torch.Tensor],
+    target_logits: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    sampled, num_sampled = result
+    if target_logits.shape[0] == 0 or sampled.shape[0] == 0:
+        return result
+    row_indices = cu_num_logits[:-1].to(torch.long)
+    if row_indices.numel() != sampled.shape[0]:
+        return result
+    if int(row_indices.max().item()) >= target_logits.shape[0]:
+        return result
+    correction_ids = torch.argmax(target_logits[row_indices].float(), dim=-1)
+    forced = torch.full_like(sampled, -1)
+    forced[:, 0] = correction_ids.to(forced.dtype)
+    return forced, torch.ones_like(num_sampled)
+
+
 def _punctuation_mask(token_ids: torch.Tensor) -> torch.Tensor:
     punctuation_ids = torch.tensor(
         _PUNCTUATION_TOKEN_IDS,
@@ -319,6 +338,12 @@ def _v2_rejection_sample(
         use_fp64=use_fp64,
         use_block_verification=use_block_verification,
     )
+    if _force_reject_drafts_enabled() and bool(torch.all(temperature == 0).item()):
+        result = _force_reject_v2_greedy_result(
+            result,
+            target_logits,
+            cu_num_logits,
+        )
     if os.getenv("VLLM_METAX_DSV4_MTP_CAPTURE_DIR"):
         from vllm_metax.models.deepseek_v4.mtp_debug import (
             maybe_capture_greedy_verifier_batch,

@@ -12,10 +12,12 @@
 - 禁止修改：`/root/vllm`
 - 模型：`/root/models/DeepSeek-V4-Flash-W4A16-BF16Attn-MTP`
 - 验收 TP：4；TP=1 只允许做归因实验
-- 第一阶段关闭 MTP：`NUM_SPECULATIVE_TOKENS=0`
+- 当前优化范围关闭 MTP：`NUM_SPECULATIVE_TOKENS=0`
 - decode：greedy，`temperature=0`
-- 16-token oracle：
-  `[260,5036,294,10588,14,790,342,2118,436,734,260,1894,5090,304,611,260]`
+- 当前 16-token oracle：
+  `[260,9936,396,100854,270,9353,294,3226,4063,5363,513,1812,260,2395,14,8281]`
+  （2026-07-25，artifact：
+  `.logs/deepseek_v4_dspark_phase0_oracle_20260725/summary.json`）
 - 正常性能必须用 PIECEWISE graph；eager 只做差异归因
 - 不得把 profiler 下的吞吐当成正常推理吞吐
 - 不得通过降低精度、改变模型输出或减少层数获得性能结果
@@ -33,7 +35,7 @@ OUTPUT_TOKENS_PER_SECOND=11.624672
 
 | workload | 结果 | 备注 |
 | -------- | ---- | ---- |
-| MTP=0、TP=4、PIECEWISE、100-token decode | `15.2334 tok/s`、`65.65 ms/token` | 四卡利用率 `16.16%--16.42%` |
+| MTP=0、TP=4、PIECEWISE、100-prompt x 100-token decode | median `27.2195 tok/s`、P90 `42.879 ms/token` | 四卡平均利用率 `30.32%--30.43%` |
 | 1K prefill | `1321.61 input tok/s`、`0.774812 s` | MTP=0、TP=4 |
 | 10K prefill、`chunk=8192`、default | `torch.index_select` 尝试约 `10 GiB` 后 OOM | `torch_flash_mla_sparse_prefill` |
 | 10K prefill、`chunk=2048`、`GPU_MEM=0.8` | `1504.16 input tok/s`、median `6.648215 s` | 四卡利用率约 `89.1%--89.2%` |
@@ -44,6 +46,13 @@ prefill 必须同时保留 1K 和 10K 两个长度。10K default-chunk
 OOM 是当前 blocker，chunk=2048 只是可复现的 workaround，不能把 OOM 从验收矩阵中
 删除或推迟到 decode 完成后。
 
+2026-07-25 的扩展 baseline 使用 100 个不同 prompt、每条强制 100 token、一次 warmup，
+共测量 10,000 个输出 token。100 个 request 的 median 为 `3.6738315 s`
+（`27.219539 tok/s`），P90 为 `4.287923 s`；四卡 decode-window 平均利用率为
+`30.3217%--30.4343%`。相对 2026-07-24 同 corpus 的 `27.298076 tok/s` 漂移
+`-0.2877%`。artifact：
+`.logs/deepseek_v4_mtp0_baseline_100_20260725/fresh1/`。
+
 ## 已知 blocker 与实现状态
 
 - 已安装 `deep_gemm.int8_mqa_logits` 没有 `backend` kwarg；动态 multi-head Triton
@@ -51,7 +60,9 @@ OOM 是当前 blocker，chunk=2048 只是可复现的 workaround，不能把 OOM
   通过 differential、graph replay 和 TP=4 16-token gate，但重复浮点差约 `1.5e-3`，
   未达到默认推广条件。
 - MTP=1 虽有 `17.8358 tok/s`，却从第二个 token 起与 greedy oracle 分歧；MTP=1
-  必须 default-off，且任何分歧都 hard fail，不得以吞吐抵消错误。
+  必须 default-off，且任何分歧都 hard fail，不得以吞吐抵消错误。自 2026-07-25
+  起 MTP 工作标记为 **Deferred**，不再阻塞 MTP=0 baseline 优化；恢复前必须重新
+  通过扩展 corpus 的 TP=4 PIECEWISE exact-token 门禁。
 
 ## 必须建立的 A100/C500 矩阵
 

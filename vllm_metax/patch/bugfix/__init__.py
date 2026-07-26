@@ -21,3 +21,4 @@ from . import plan08_stop_aware_output  # noqa: F401
 from . import batch_invariant_metax  # noqa: F401
 from . import input_batch_condense  # noqa: F401
 from . import mtp_target_runtime_capture  # noqa: F401
+from . import spec_acceptance_capture  # noqa: F401

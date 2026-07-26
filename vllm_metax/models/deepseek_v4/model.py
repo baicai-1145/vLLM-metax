@@ -54,7 +54,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.interfaces import MixtureOfExperts, SupportsPP
+from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
+    MixtureOfExperts,
+    SupportsEagle3,
+    SupportsPP,
+)
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -1074,7 +1079,7 @@ def _ffn_for_input(
             or k1_native_ffn_candidate_enabled()
         )
         and os.getenv("VLLM_METAX_DSV4_TOKENWISE_FFN") != "1"
-        or not 1 < x.shape[0] <= 5
+        or not 1 < x.shape[0] <= 6
     ):
         return ffn(x, input_ids)
     selected_indices = _tokenwise_ffn_selected_indices(positions, x)
@@ -1128,6 +1133,57 @@ def _mhc_exact_post_pre_rms_for_stage(
     )
 
 
+def _mhc_exact_initial_pre_rms_for_input(
+    residual: torch.Tensor,
+    *args,
+    norm_weight: torch.Tensor,
+    workspace: dict[tuple[object, ...], dict[str, torch.Tensor]],
+):
+    if not _mhc_exact_pre_rms_enabled():
+        return None
+    num_tokens = residual.numel() // (4 * residual.shape[-1])
+    if num_tokens > 6:
+        return None
+    if get_mhc_backend_name() != "tilelang":
+        raise RuntimeError(
+            "VLLM_METAX_DSV4_MHC_EXACT_PRE_RMS=1 requires the TileLang "
+            "backend for initial MHC pre"
+        )
+    from .ops.mhc.tilelang import _mhc_exact_initial_pre_rms_impl
+
+    return _mhc_exact_initial_pre_rms_impl(
+        residual,
+        *args,
+        norm_weight=norm_weight,
+        workspace=workspace,
+    )
+
+
+def _mhc_initial_pre_for_layer(
+    is_target_model: bool,
+    residual: torch.Tensor,
+    *args,
+    norm_weight: torch.Tensor,
+    workspace: dict[tuple[object, ...], dict[str, torch.Tensor]],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Dispatch initial MHC pre only for target decoder layers."""
+    if is_target_model:
+        exact_result = _mhc_exact_initial_pre_rms_for_input(
+            residual,
+            *args,
+            norm_weight=norm_weight,
+            workspace=workspace,
+        )
+        if exact_result is not None:
+            return exact_result
+
+        post_mix, res_mix, layer_input = _mhc_pre_for_input(residual, *args)
+        return post_mix, res_mix, layer_input, None
+
+    post_mix, res_mix, layer_input = mhc_pre(residual, *args)
+    return post_mix, res_mix, layer_input, None
+
+
 class DeepseekV4DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -1135,10 +1191,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         prefix,
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
+        is_target_model: bool = False,
     ):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
+        self.is_target_model = is_target_model
         self.layer_idx = extract_layer_index(prefix)
         self.hidden_size = config.hidden_size
 
@@ -1148,6 +1206,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             prefix=f"{prefix}.attn",
             topk_indices_buffer=topk_indices_buffer,
             aux_stream_list=aux_stream_list,
+            is_target_model=is_target_model,
         )
         self.ffn = DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
 
@@ -1204,6 +1263,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         self._mhc_exact_workspace: dict[
             tuple[int, str, int], dict[str, torch.Tensor]
         ] = {}
+        self._mhc_exact_initial_workspace: dict[
+            tuple[object, ...], dict[str, torch.Tensor]
+        ] = {}
         self._layer_capture_enabled = (
             layer_capture_enabled()
             and layer_capture_layer_enabled(self.layer_idx)
@@ -1255,7 +1317,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         exact_result = None
         if residual is None:
             residual = x
-            post_mix, res_mix, x = _mhc_pre_for_input(
+            post_mix, res_mix, x, normalized_x = _mhc_initial_pre_for_layer(
+                self.is_target_model,
                 x,
                 self.hc_attn_fn,
                 self.hc_attn_scale,
@@ -1265,6 +1328,13 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_eps,
                 self.hc_post_alpha,
                 self.hc_sinkhorn_iters,
+                norm_weight=self.attn_norm.weight,
+                workspace=self._mhc_exact_initial_workspace,
+            )
+            exact_result = (
+                (post_mix, res_mix, x, normalized_x)
+                if normalized_x is not None
+                else None
             )
         else:
             prev_x, prev_residual = x, residual
@@ -1564,7 +1634,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
 
 
-class DeepseekV4Model(nn.Module):
+class DeepseekV4Model(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -1622,6 +1692,7 @@ class DeepseekV4Model(nn.Module):
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
                 aux_stream_list=aux_stream_list,
+                is_target_model=True,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -1709,7 +1780,12 @@ class DeepseekV4Model(nn.Module):
             input_ids = input_ids.to(torch.int64)
 
         residual, post_mix, res_mix = None, None, None
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        aux_hidden_states: list[torch.Tensor] = []
+        final_aux_recon: torch.Tensor | None = None
+        for idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
             hidden_states, residual, post_mix, res_mix = layer(
                 hidden_states,
                 positions,
@@ -1718,8 +1794,15 @@ class DeepseekV4Model(nn.Module):
                 res_mix,
                 residual,
             )
+            if idx + 1 in self.aux_hidden_state_layers:
+                aux_recon = mhc_post(hidden_states, residual, post_mix, res_mix)
+                aux_hidden_states.append(aux_recon.mean(dim=1))
+                final_aux_recon = aux_recon
         if layer is not None:
-            hidden_states = mhc_post(hidden_states, residual, post_mix, res_mix)
+            if self.end_layer in self.aux_hidden_state_layers:
+                hidden_states = final_aux_recon
+            else:
+                hidden_states = mhc_post(hidden_states, residual, post_mix, res_mix)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
@@ -1737,6 +1820,8 @@ class DeepseekV4Model(nn.Module):
             self.hc_eps,
         )
         hidden_states = self.norm(hidden_states)
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -1931,7 +2016,9 @@ class DeepseekV4MixtureOfExperts(MixtureOfExperts):
             moe.experts.update_expert_map()
 
 
-class DeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV4MixtureOfExperts):
+class DeepseekV4ForCausalLM(
+    nn.Module, SupportsPP, SupportsEagle3, DeepseekV4MixtureOfExperts
+):
     model_cls = DeepseekV4Model
 
     # Default mapper assumes the original FP4-expert checkpoint layout.

@@ -19,5 +19,8 @@ def test_metax_candidate_env_is_registered_with_vllm():
     import vllm.envs
     import vllm_metax.platform  # noqa: F401
 
-    env_name = "VLLM_METAX_DSV4_MTP_K1_CORRECTNESS_CANDIDATE"
-    assert env_name in vllm.envs.environment_variables
+    env_names = {
+        "VLLM_METAX_DSV4_MTP_K1_CORRECTNESS_CANDIDATE",
+        "VLLM_METAX_DSV4_MHC_HYBRID_POST_DOWNSTREAM",
+    }
+    assert env_names <= vllm.envs.environment_variables.keys()

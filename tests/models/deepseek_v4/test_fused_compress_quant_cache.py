@@ -8,6 +8,82 @@ from vllm_metax.models.deepseek_v4.ops.fused_compress_quant_cache import (
 )
 
 
+def _run_first_sparse_overlap_case(
+    stale_overlap: bool, *, initial_overlap_boundary: int | None
+) -> torch.Tensor:
+    device = torch.device("cuda")
+    head_dim = 512
+    state_width = 2 * head_dim
+    state_cache = torch.zeros(
+        (1, 256, 2 * state_width), device=device, dtype=torch.float32
+    )
+    if stale_overlap:
+        stale = torch.arange(4 * head_dim, device=device, dtype=torch.float32).reshape(
+            4, head_dim
+        )
+        state_cache[0, 124:128, :head_dim] = torch.sin(stale * 0.013)
+        state_cache[0, 124:128, state_width : state_width + head_dim] = (
+            torch.cos(stale * 0.017)
+        )
+    current = torch.arange(
+        4 * head_dim, device=device, dtype=torch.float32
+    ).reshape(4, head_dim)
+    state_cache[0, 128:132, head_dim:state_width] = torch.sin(current * 0.019)
+    state_cache[
+        0,
+        128:132,
+        state_width + head_dim : 2 * state_width,
+    ] = torch.cos(current * 0.023)
+
+    cos_sin_cache = torch.zeros((132, 64), device=device, dtype=torch.float32)
+    cos_sin_cache[:, :32] = 1.0
+    kv_cache = torch.zeros((1, 64, head_dim), device=device, dtype=torch.bfloat16)
+    compress_norm_rope_store_triton(
+        state_cache=state_cache,
+        num_actual=1,
+        token_to_req_indices=torch.zeros(1, device=device, dtype=torch.int32),
+        positions=torch.tensor([131], device=device, dtype=torch.int32),
+        slot_mapping=torch.tensor([131], device=device, dtype=torch.int32),
+        block_table=torch.zeros((1, 1), device=device, dtype=torch.int32),
+        block_size=256,
+        state_width=state_width,
+        cos_sin_cache=cos_sin_cache,
+        kv_cache=kv_cache,
+        k_cache_metadata=SimpleNamespace(
+            slot_mapping=torch.zeros(1, device=device, dtype=torch.int32)
+        ),
+        pdl_kwargs={},
+        head_dim=head_dim,
+        rope_head_dim=64,
+        compress_ratio=4,
+        overlap=True,
+        initial_overlap_boundary=initial_overlap_boundary,
+        use_fp4_cache=False,
+        rms_norm_weight=torch.ones(head_dim, device=device),
+        rms_norm_eps=1e-6,
+        quant_block=64,
+        token_stride=576,
+        scale_dim=8,
+    )
+    torch.cuda.synchronize()
+    return kv_cache.cpu()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="Compressor overlap test requires a MetaX CUDA-compatible device",
+)
+def test_first_sparse_compression_ignores_stale_initial_overlap() -> None:
+    expected = _run_first_sparse_overlap_case(
+        stale_overlap=False, initial_overlap_boundary=None
+    )
+    actual = _run_first_sparse_overlap_case(
+        stale_overlap=True, initial_overlap_boundary=128
+    )
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="BF16 compressor cache test requires a MetaX CUDA-compatible device",

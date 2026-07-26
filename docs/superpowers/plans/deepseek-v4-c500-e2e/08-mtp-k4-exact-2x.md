@@ -1,13 +1,20 @@
 # DeepSeek V4 MTP k=4 无损 2x 加速实施计划
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use `executing-plans` to
-> implement this plan task-by-task. Use TDD for every behavioral change and
-> update each checkbox as evidence is produced.
+> **Status: Deferred (2026-07-25).** 本计划暂不继续执行。MTP 保持默认关闭，现有
+> 代码、测试和 artifacts 仅作为历史诊断证据保留。当前优先级转为 TP=4、MTP=0
+> steady-state decode 优化。只有 MTP=0 baseline 明显收敛、重新确认 MTP 的净收益，
+> 且愿意重新承担扩展 corpus 的 exact-token 质量门禁后，才恢复本计划。
+
+**For agentic workers:** REQUIRED SUB-SKILL: Use `executing-plans` to implement
+this plan task-by-task. Use TDD for every behavioral change and update each
+checkbox as evidence is produced.
 
 **Goal:** 在 4x MetaX C500、TP=4、PIECEWISE graph 下完成 DeepSeek-V4-Flash
 单 MTP head 的 k=4 迭代式 speculative decoding 适配；保持与 MTP=0 greedy 输出逐
 token 完全一致，并在完全相同的正常 serving workload 上达到至少 `2.00x` 净
 tokens/s。
+
+该 Goal 是暂停前的原始目标，不再属于当前迭代的交付范围。
 
 **Architecture:** Target model 与 MTP layer 继续共用 TP=4 group，每个 rank 只加载
 自己的 shard；同一个 MTP layer 迭代生成最多四个 draft token，target 一次验证最多
@@ -3330,6 +3337,233 @@ Artifacts:
 - `.logs/deepseek_v4_mtp_quality_10sample_20260724/acceptance_10_shared_mhc_v1/validation_manifest.json`;
 - `.logs/deepseek_v4_mtp_quality_10sample_20260724/acceptance_10_shared_mhc_v1/mtp0/workload.manifest`;
 - `.logs/deepseek_v4_mtp_quality_10sample_20260724/acceptance_10_shared_mhc_v1/mtp4/workload.manifest`.
+
+#### Current exact-path performance diagnosis
+
+The same ten-prompt quality run also provides a normal-serving comparison for
+the representative `acceptance_distributed_cache` prompt. MTP=0 measured
+`3.616522 s` median, `3.638516 s` P90, and `27.650872 TPS`. Exact K=4 measured
+`10.273158 s` median, `10.644466 s` P90, and `9.734105 TPS`, or `0.3520x` the
+base throughput. Prefix caching, `MAX_NUM_BATCHED_TOKENS=8192`, PIECEWISE graph
+mode, and MHC TileLang exact pre/post were shared, so they do not explain this
+delta.
+
+An explicit acceptance-metrics run proposed 196 draft tokens over 49 target
+verification cycles and accepted 49 drafts. The average draft acceptance rate
+was therefore `25.0%`, mean committed length was `2.0`, and weighted
+per-position acceptance was `71.43%`, `24.49%`, `4.08%`, and `0.00%`. K=4 is
+paying to verify a five-row target batch while committing only two tokens per
+cycle on average.
+
+A fresh four-rank profiler run preserved the same exact native path and matched
+the frozen token and finish-reason oracle. In the rank-0 five-step active
+window, MTP=0 `execute_context` CUDA time was `239.466 ms` total
+(`47.893 ms/step`) and K=4 was `938.508 ms` total (`187.702 ms/step`). These are
+profiler-instrumented attribution numbers, not normal-serving TPS. The trace
+shows that the exactness policy serializes the five-row verification batch:
+
+- all-reduce calls increased from 435 to 2255 (`5.18x`), with CUDA time rising
+  from `79.702 ms` to `112.460 ms`;
+- device-to-device copies increased from 225 to 4540 (`20.18x`), with CUDA time
+  rising from `8.200 ms` to `47.990 ms`;
+- MHC downstream calls increased from 425 to 2165 (`5.09x`), and MoE calls from
+  430 to 2150 (`5.00x`).
+
+The current slowdown is therefore the product of low late-position acceptance
+and correctness-driven tokenwise execution across MHC, attention projections,
+KV compression, sparse MLA, output projection, FFN, and indexer paths. The next
+performance work must selectively restore exact batched execution and reduce
+TP collective/copy launch count, retaining the 19/19 exact gate after every
+change. Removing `.item()` and Python row-control synchronization is a smaller
+follow-up target. Broad kernel tuning without reducing the five-row
+serialization is not expected to close the gap.
+
+Performance diagnosis artifacts:
+
+- `.logs/deepseek_v4_mtp_performance/acceptance_metrics_20260724/run.log`;
+- `.logs/deepseek_v4_mtp_profile_current_exact_20260724/base/`;
+- `.logs/deepseek_v4_mtp_profile_current_exact_20260724/k4/`.
+
+#### First exact-path performance ablations
+
+The existing graph-safe selective native WQ_B control was retested against the
+current three-prompt independent corpus with the complete shared exact
+manifest. A preliminary run that omitted the shared MHC TileLang exact,
+tokenwise attention-GEMM, and tokenwise indexer settings is excluded from all
+comparisons.
+
+With the full manifest, native/batched WQ_B at layer 42 alone remained `3/3`
+exact. Its `9.879961 TPS` was indistinguishable from the current exact path's
+`9.880300 TPS`, so it provides no useful throughput improvement. Wider suffixes
+did not generalize:
+
+| native/batched WQ_B layers | exact | first mismatches |
+| --- | ---: | --- |
+| `42` | `3/3` | none |
+| `41--42` | `1/3` | policy `49`, security `46` |
+| `40--42` | `1/3` | policy `49`, data `10` |
+| `37--42` | `1/3` | policy `49`, data `10` |
+
+This supersedes the single-prompt historical `37--42` boundary: layer-static
+native replacement is not a general exact optimization.
+
+A second default-off candidate retained every rowwise inverse-RoPE, BF16
+einsum, and quantized `wo_b` local GEMM, then concatenated the five local
+results and issued one TP all-reduce instead of five. The candidate passed the
+current three-prompt gate `3/3 exact`, including PIECEWISE graph capture and
+the frozen finish reasons, but fell from `9.880300 TPS` to `9.773167 TPS`
+(`-1.08%`). It was therefore rejected before the ten-prompt gate and its code
+was removed. Reducing only the O-projection collective count does not offset
+the remaining rowwise launches and copy cost.
+
+A useful next candidate must reduce rowwise kernel and copy launches while
+preserving the rowwise numerical reduction contract, rather than switching to
+shape-5 GEMMs or merely batching one collective. In parallel, the current
+`25.0%` draft acceptance and `2.0` mean committed length must be improved;
+kernel work alone cannot deliver the target speedup at that acceptance level.
+
+The acceptance result is not a single-prompt anomaly. A stats-enabled run on
+the three independent prompts drafted 568 tokens over 142 verification cycles
+and accepted 131 drafts: `23.06%` aggregate draft acceptance and `1.923` mean
+committed length. Per-prompt draft acceptance was `14.0%`, `25.6%`, and
+`30.3%`. Weighted per-position acceptance was `62.68%`, `20.42%`, `8.45%`, and
+`0.70%`. Positions 3--4 therefore collapse systematically across this corpus;
+acceptance quality is now a co-primary performance blocker with tokenwise
+execution overhead.
+
+A deterministic 100-prompt K=1 run supersedes the earlier three-prompt
+`57.5%` estimate. The corpus contains 25 prompts each from math reasoning, code
+reasoning, high-school computer science, and factual safety. Across 5,400
+verification cycles, the target accepted 4,534 drafts: `83.96296%` acceptance,
+with a Wilson 95% confidence interval of `82.96015%--84.91749%`. The mean
+committed length was `1.83963`; metrics covered 9,934 of 10,000 generated
+tokens (`99.34%`). All 100 requests generated the required 100 tokens and
+finished by length. K=1 therefore clears the local `80%` acceptance gate;
+acceptance is no longer its primary performance blocker. The old three-prompt
+window remains historical evidence of why acceptance needed a broader corpus,
+not a current quality estimate.
+
+The user reports that stable upstream vLLM on A100 with the same model reaches
+approximately `80%` acceptance and a `10 ms` verification cycle, but recalls
+that this run was probably K=1. It therefore cannot be compared directly with
+the MetaX K=4 `23.06%` / approximately `195 ms` result. The current K=1
+acceptance of `83.96296%` is already comparable to that external reference;
+the remaining large gap is verification-cycle cost. The exact A100 command,
+prompt, metric definition, and timing window are still required before treating
+the `10 ms` number as a confirmed platform regression. A100 K=4 must be
+measured separately before setting an 80% target for all four recursive drafts.
+
+Normal-serving runs on the same three prompts establish the current K curve:
+
+| K | exact | median TPS | ratio to same-run MTP=0 |
+| ---: | ---: | ---: | ---: |
+| 0 | `3/3` | `27.08--27.15` | `1.000x` |
+| 1 | `3/3` | `17.362442` | `0.6412x` |
+| 2 | `3/3` | `14.001637` | `0.5185x` |
+| 4 | `3/3` | `9.880300` | `0.3639x` |
+
+K=1 is the fastest speculative setting, and K=2 is `41.7%` faster than K=4,
+but both remain slower than MTP=0. Using the observed mean committed lengths,
+plus K=2's `1.831` estimate from the first two K=4 position rates, acceptance
+improvements alone still cannot cross the baseline at the current verification
+cost: the perfect-acceptance ceilings are approximately `22.0 TPS` for K=1,
+`22.9 TPS` for K=2, and `25.7 TPS` for K=4. K=4 therefore needs both lower
+verification cost and materially better recursive acceptance; changing K only
+reduces the regression.
+
+#### K=1 performance-priority pivot
+
+The user reports that the relevant community deployments use K=1 and obtain
+approximately `1.5x--1.8x` speedup rather than recursively using K=4. This is
+consistent with the checkpoint's single trained next-token prediction layer
+and vLLM's warning that `num_speculative_tokens > 1` repeatedly executes the
+same MTP layer and can lower acceptance. Until a comparable community manifest
+is archived, treat the range as an external target rather than local evidence.
+
+Performance work now prioritizes K=1. With the current `27.076353 TPS` baseline,
+the community range corresponds to `40.61--48.74 TPS`; the existing user target
+of `50 TPS` remains the stretch gate. At the measured `83.96296%` acceptance,
+the mean committed length is `1.83963`, so those throughput targets require
+approximately `45.3--37.8 ms` per verification cycle (`36.8 ms` for `50 TPS`).
+The acceptance target is met; reducing the complete target verification cycle
+to approximately `34--38 ms`, while preserving exactness, is now the primary
+K=1 performance gate.
+
+#### Fresh K=1 verification-cycle profile
+
+A same-backend four-rank Torch profile compared MTP=0 and exact K=1 with
+tokenwise attention GEMM and indexer decode enabled for both configurations.
+Five active steady steps per rank produced tightly grouped `execute_context`
+medians: `53.66--53.85 ms` for MTP=0 and `92.54--93.39 ms` for K=1. The K=1
+full verification cycle is therefore approximately `1.73x` the base one-token
+step, or about `39.2 ms` additional profiled latency. At the measured `1.83963`
+mean committed length, reaching `1.8x` normal throughput requires a complete
+cycle near `37.8 ms`; the profiled cycle must shrink by approximately `2.46x`.
+Profiler-instrumented timings are attribution evidence, not normal-serving TPS.
+
+The trace and source path explain most of the cost. K=1 verification inherently
+evaluates two target rows: the proposed token and the mandatory target
+continuation. MHC downstream calls rose from 425 to 860 and MoE calls from 430
+to 860 over the five-step window; their CUDA totals rose from `29.48 ms` to
+`58.08 ms` and from `23.17 ms` to `46.40 ms`, respectively. TP all-reduce calls
+also rose from 435 to 890 because row-parallel output projections reduce both
+target rows. This approximately twofold target-model work is inherent unless
+the two rows are processed more efficiently as a batch.
+
+The current exactness path adds avoidable launch and copy overhead on top of
+that contract. Device-to-device copies rose from 225 to 1,810 (`8.04x`), with
+cross-rank CUDA totals increasing from `7.98--8.80 ms` to
+`22.90--24.70 ms`. The code performs per-row fused-QKV recomputation,
+clone/index/contiguous replacement, tokenwise Q/KV insertion, tokenwise WQ_B,
+tokenwise sparse-MLA launches, and MTP hidden-buffer copies. These are the first
+abatement targets. Per-event all-reduce time varied sharply by rank and even
+reversed between repeated traces while rank-level `execute_context` stayed
+stable; asynchronous collective durations must not be summed or treated as the
+primary root cause without a synchronized communication-specific profile.
+
+Both profile runs generated the expected 100 tokens and produced all four rank
+traces; K=1 exited zero and matched all nine frozen token sequences. The base
+wrapper returned `2` only during delayed profiler teardown after `GEN_OK`, with
+no model or profiler traceback, so its timing is usable for attribution but is
+not a clean acceptance process exit. The A100 `10 ms` reference remains
+ambiguous: if it measures a full cycle, compare it with `92.9 ms`; if it
+measures only incremental verification overhead, compare it with approximately
+`39.2 ms`. An exact A100 manifest and timing boundary are required for a strict
+platform comparison.
+
+The user subsequently confirmed the comparable A100 timing boundary: MTP=0 is
+approximately `10 ms` per decode cycle and K=1 remains below `11 ms`, producing
+stable throughput near `1.8x`. This changes the optimization contract. The
+extra arithmetic for two target rows is real, but doubling wall time is not
+inherent when batch-2 kernels process both rows in one launch. On C500 the
+current `92.9 / 53.7 = 1.73x` cycle ratio, approximately doubled MHC/MoE and
+all-reduce call counts, and `8.04x` D2D-copy count are implementation defects in
+the exact compatibility path, not an acceptable hardware floor.
+
+At the measured `1.83963` committed tokens per K=1 cycle, the interim cycle
+ratio gate is `<1.10x` and the `1.8x` throughput gate requires `<1.023x` before
+normal-serving overhead. Performance work must therefore restore exact batch-2
+execution one stage at a time. A candidate is retained only when it preserves
+the TP=4 frozen tokens and reduces the corresponding launch/copy count; broad
+full-native replacements already shown to diverge remain rejected.
+
+K=4 remains default-off and is deferred until K=1 reaches its exactness,
+acceptance, cycle-cost, and normal-serving throughput gates. K=4 artifacts stay
+as regression evidence, not as the immediate optimization target.
+
+Ablation artifacts:
+
+- `.logs/deepseek_v4_mtp_performance/selective_wqb_l42_full_exact_20260724/`;
+- `.logs/deepseek_v4_mtp_performance/selective_wqb_l41_42_full_exact_20260724/`;
+- `.logs/deepseek_v4_mtp_performance/selective_wqb_l40_42_full_exact_20260724/`;
+- `.logs/deepseek_v4_mtp_performance/selective_wqb_l37_42_full_exact_20260724/`;
+- `.logs/deepseek_v4_mtp_performance/oproj_batched_allreduce_current3_20260724/`.
+- `.logs/deepseek_v4_mtp_performance/acceptance_metrics_current3_20260724/run.log`.
+- `.logs/deepseek_v4_mtp_performance/acceptance_metrics_k1_current3_20260724/run.log`.
+- `.logs/deepseek_v4_mtp_k1_acceptance_100_20260724/run_v1/`;
+- `.logs/deepseek_v4_mtp_k1_profile_100corpus_20260724/`;
+- `.logs/deepseek_v4_mtp_performance/k1_full_exact_current3_20260724/`;
+- `.logs/deepseek_v4_mtp_performance/k2_full_exact_current3_20260724/`.
 
 ## Stop conditions
 

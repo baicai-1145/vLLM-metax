@@ -426,7 +426,7 @@ def _run_sparse_mla_decode(**kwargs) -> None:
     q = kwargs["q"]
     if (
         os.getenv("VLLM_METAX_DSV4_TOKENWISE_SPARSE_MLA_DECODE") != "1"
-        or not 1 < q.shape[0] <= 5
+        or not 1 < q.shape[0] <= 6
     ):
         sparse_mla_decode(**kwargs)
         return
@@ -575,8 +575,9 @@ class MacaDeepseekV4FlashMLAAttention(MacaDeepseekV4Attention):
             )
 
         if (
-            _tokenwise_o_proj_enabled()
-            and 1 < o.shape[0] <= 5
+            getattr(self, "is_target_model", True)
+            and _tokenwise_o_proj_enabled()
+            and 1 < o.shape[0] <= 6
         ):
             selected_indices = _tokenwise_o_proj_selected_indices(positions)
             if selected_indices.numel() == 0:

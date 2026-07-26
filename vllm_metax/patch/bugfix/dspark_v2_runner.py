@@ -12,6 +12,22 @@ from vllm.config.vllm import VllmConfig
 
 
 _original_use_v2_model_runner = VllmConfig.use_v2_model_runner.fget
+_DEEPSEEK_EXACTNESS_ENVS = (
+    "VLLM_METAX_DSV4_TOKENWISE_ATTN_GEMM",
+    "VLLM_METAX_DSV4_TOKENWISE_COMPRESSOR",
+    "VLLM_METAX_DSV4_TOKENWISE_INDEXER_DECODE",
+    "VLLM_METAX_DSV4_TOKENWISE_O_PROJ",
+    "VLLM_METAX_DSV4_TOKENWISE_Q_ONLY",
+    "VLLM_METAX_DSV4_TOKENWISE_TARGET_WQ_B",
+    "VLLM_METAX_DSV4_TOKENWISE_SPARSE_MLA_DECODE",
+    "VLLM_METAX_DSV4_TOKENWISE_FFN",
+)
+
+
+def _uses_qwen3_dspark_compat(speculative_config) -> bool:
+    draft_model_config = getattr(speculative_config, "draft_model_config", None)
+    architectures = getattr(draft_model_config, "architectures", ())
+    return "Qwen3DSparkModel" in architectures
 
 
 def _use_v2_model_runner(self) -> bool:
@@ -19,8 +35,14 @@ def _use_v2_model_runner(self) -> bool:
         return True
     speculative_config = self.speculative_config
     if speculative_config is not None and speculative_config.method == "dspark":
-        os.environ.setdefault("VLLM_METAX_USE_FP32_LOGITS", "auto")
-        os.environ["VLLM_METAX_DSPARK_GREEDY_TIE_PATCH"] = "1"
+        if _uses_qwen3_dspark_compat(speculative_config):
+            os.environ.setdefault("VLLM_METAX_USE_FP32_LOGITS", "auto")
+            os.environ["VLLM_METAX_DSPARK_GREEDY_TIE_PATCH"] = "1"
+        else:
+            os.environ["VLLM_METAX_DSPARK_GREEDY_TIE_PATCH"] = "0"
+            os.environ.setdefault("VLLM_METAX_USE_FP32_LOGITS", "0")
+            for name in _DEEPSEEK_EXACTNESS_ENVS:
+                os.environ.setdefault(name, "1")
         return True
     return _original_use_v2_model_runner(self)
 

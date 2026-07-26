@@ -17,7 +17,8 @@
 |    5 | `05-tp-communication.md`       | 优化 87 次/token 小消息 TP collective    | 00，03.5 路由     |
 |    6 | `06-cudagraph-launch.md`       | 减少 graph break、launch gap 和分配      | 00，03.5 路由     |
 |    7 | `07-integration-acceptance.md` | 汇总收益、回归和最终推广决策             | 01-06             |
-|    8 | `08-mtp-k4-exact-2x.md`        | 单 MTP head k=4 无损适配与正常 2x gate   | 00，07            |
+|    8 | `08-mtp-k4-exact-2x.md`        | Deferred：暂不继续 MTP 质量/性能适配     | 00，07            |
+|    9 | `09-dspark-bf16-adaptation.md` | DSpark BF16 功能适配、KV 和 TP=4 门禁    | 00，07            |
 
 Sparse MLA、MHC、O-proj、MoE 的静态调研可以在文件写集合不重叠时并行推进；
 Plan 04、05、06 的性能实现和推广必须等待 Plan 03.5 路由。执行上必须
@@ -28,14 +29,20 @@ decode-first，但 prefill 的 OOM blocker 要立即建立复现和修复门禁�
 ## 当前事实
 
 - 模型：`/root/models/DeepSeek-V4-Flash-W4A16-BF16Attn-MTP`
-- Plan 08 已定义 MTP k=4 的独立适配路径：保持 `max_num_seqs=1`，迭代复用 checkpoint
-  唯一的 MTP layer，并要求相对同 workload MTP=0 正常吞吐至少 `2.00x`；在所有
-  exact-token、质量、graph 和性能门通过前继续默认关闭。
+- DeepSeek-V4 DSpark BF16 的阶段 0-3 已于 2026-07-25 通过：TP=4 MTP=0
+  oracle 三次稳定，BF16 context-KV 与非因果 SWA differential/graph gate 通过，
+  合并 staging 完成 TP=4 PIECEWISE load、graph capture 和两次 16-token replay。
+  阶段 4 greedy exactness、接受率和性能尚未验收，详见 Plan 09。
+- 2026-07-25 决定将 Plan 08 标记为 **Deferred**。MTP 已投入超过一周但尚未通过
+  扩展 corpus 的逐 token exact 门禁，暂不继续质量修复或性能优化，并保持默认关闭。
+  当前资源转向 TP=4、MTP=0 steady-state decode；只有 baseline 明显收敛且重新评估
+  收益后，才恢复 MTP 工作。
 - **历史** TP=4 PIECEWISE、MTP=0、16-token 快速 gate：`11.624672 token/s`，约
   `86.0 ms/token`（仅作会话起始参考）
-- 最新受控 MTP=0、TP=4 PIECEWISE、100-token decode 前后夹具为
-  `16.2325/16.0112 tok/s`，漂移 `-1.363%`；累计消融见
-  [`2026-07-13-plan01-03-cumulative-ablation.md`](2026-07-13-plan01-03-cumulative-ablation.md)
+- 最新扩展 MTP=0、TP=4 PIECEWISE baseline 使用 100 个不同 prompt、每条 100 token：
+  median `27.2195 tok/s`，P90 `42.879 ms/token`，四卡 decode-window 平均利用率
+  `30.32%--30.43%`。相对 2026-07-24 同 corpus 的 `27.2981 tok/s` 漂移
+  `-0.288%`。artifact：`.logs/deepseek_v4_mtp0_baseline_100_20260725/fresh1/`。
 - 最新 1K prefill：`1321.61 input tok/s`、`0.774812 s`
 - 2026-07-16 已修复 Sparse MLA scale-mask 越界、C4 local top-k 越界、compatibility
   top-k 读错 cache 和 BF16 compressor 行 stride 四个原生缺陷。TP=4、MTP=0、

@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     VLLM_METAX_DSV4_MTP_K1_NATIVE_FFN_CANDIDATE: bool = False
     VLLM_METAX_DSV4_MTP_K1_NATIVE_MHC_PRE_CANDIDATE: bool = False
     VLLM_METAX_DSV4_MTP_K1_NATIVE_KV_PRENORM_CANDIDATE: bool = False
+    VLLM_METAX_DSV4_MHC_HYBRID_POST_DOWNSTREAM: bool = False
     VLLM_METAX_DSV4_MTP_K1_SERIAL_TARGET: bool = False
     VLLM_METAX_DSV4_MTP_STOP_AWARE_OUTPUT_TRUNCATION: bool = False
 
@@ -159,6 +160,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # umbrella while keeping other correctness-candidate paths enabled.
     "VLLM_METAX_DSV4_MTP_K1_NATIVE_KV_PRENORM_CANDIDATE": lambda: bool(
         int(os.getenv("VLLM_METAX_DSV4_MTP_K1_NATIVE_KV_PRENORM_CANDIDATE", "0"))
+    ),
+    # Batch exact MHC cast/sqrsum and downstream RMS while retaining the
+    # per-token FP32 GEMV reduction order required by the greedy-token oracle.
+    "VLLM_METAX_DSV4_MHC_HYBRID_POST_DOWNSTREAM": lambda: bool(
+        int(os.getenv("VLLM_METAX_DSV4_MHC_HYBRID_POST_DOWNSTREAM", "0"))
     ),
     # Correctness-only k=1 mode: execute one real target token per step while
     # retaining the MTP drafter. This deliberately provides no speedup.

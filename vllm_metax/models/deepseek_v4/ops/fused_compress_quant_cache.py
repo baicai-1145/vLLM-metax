@@ -27,6 +27,7 @@ def compress_norm_rope_store_triton(
     quant_block: int,
     token_stride: int,
     scale_dim: int,
+    initial_overlap_boundary: int | None = None,
 ) -> None:
     """Shared triton launcher for the fused compress+norm+RoPE+insert path.
 
@@ -52,6 +53,9 @@ def compress_norm_rope_store_triton(
         TOKEN_STRIDE=token_stride,
         SCALE_DIM=scale_dim,
         KV_BLOCK_STRIDE=kv_cache.stride(0),
+        INITIAL_OVERLAP_BOUNDARY=(
+            -1 if initial_overlap_boundary is None else initial_overlap_boundary
+        ),
     )
     if head_dim == 512:
         # BF16 cache rows are laid out with the actual tensor stride.  The
@@ -125,6 +129,7 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn_int8(
     TOKEN_STRIDE: tl.constexpr,  # 128 for indexer
     SCALE_DIM: tl.constexpr,  # 4 for indexer (1 float32)
     KV_BLOCK_STRIDE: tl.constexpr,
+    INITIAL_OVERLAP_BOUNDARY: tl.constexpr,
 ):
     """Fused compress → RMSNorm → RoPE → INT8 quant → store."""
     token_idx = tl.program_id(0)
@@ -172,6 +177,13 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn_int8(
         mask=combined_mask,
         other=float("-inf"),
     )
+    if OVERLAP and INITIAL_OVERLAP_BOUNDARY >= 0:
+        first_sparse_boundary = INITIAL_OVERLAP_BOUNDARY + COMPRESS_RATIO - 1
+        zero_initial_overlap = (
+            (position == first_sparse_boundary)
+            & (pos < INITIAL_OVERLAP_BOUNDARY)
+        )
+        score = tl.where(zero_initial_overlap[:, None], 0.0, score)
     score = tl.softmax(score, dim=0)
 
     kv = tl.load(
@@ -179,6 +191,8 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn_int8(
         mask=combined_mask,
         other=0.0,
     )
+    if OVERLAP and INITIAL_OVERLAP_BOUNDARY >= 0:
+        kv = tl.where(zero_initial_overlap[:, None], 0.0, kv)
 
     compressed_kv = tl.sum(kv * score, axis=0)  # [TRITON_BLOCK_SIZE] fp32
 
@@ -288,6 +302,7 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn_bf16(
     KV_TOKEN_STRIDE: tl.constexpr,  # Actual BF16 cache row stride
     SCALE_DIM: tl.constexpr,  # Bytes per token for scales
     KV_BLOCK_STRIDE: tl.constexpr,
+    INITIAL_OVERLAP_BOUNDARY: tl.constexpr,
 ):
     """Fused compress → RMSNorm → RoPE → bf16 store.
 
@@ -343,6 +358,13 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn_bf16(
         mask=combined_mask,
         other=float("-inf"),
     )
+    if OVERLAP and INITIAL_OVERLAP_BOUNDARY >= 0:
+        first_sparse_boundary = INITIAL_OVERLAP_BOUNDARY + COMPRESS_RATIO - 1
+        zero_initial_overlap = (
+            (position == first_sparse_boundary)
+            & (pos < INITIAL_OVERLAP_BOUNDARY)
+        )
+        score = tl.where(zero_initial_overlap[:, None], 0.0, score)
     score = tl.softmax(score, dim=0)
 
     kv = tl.load(
@@ -350,6 +372,8 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn_bf16(
         mask=combined_mask,
         other=0.0,
     )
+    if OVERLAP and INITIAL_OVERLAP_BOUNDARY >= 0:
+        kv = tl.where(zero_initial_overlap[:, None], 0.0, kv)
 
     compressed_kv = tl.sum(kv * score, axis=0)  # [TRITON_BLOCK_SIZE] fp32
 

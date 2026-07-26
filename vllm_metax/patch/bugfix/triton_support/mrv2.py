@@ -20,6 +20,41 @@ def _load_ptr_i32(ptr_to_ptr):
     return tl.cast(ptr, tl.pointer_type(tl.int32))
 
 
+@triton.jit
+def _apply_write_kernel(
+    output_ptr,
+    output_stride,
+    write_indices_ptr,
+    write_starts_ptr,
+    write_contents_ptr,
+    write_cu_lens_ptr,
+    write_group_ids_ptr,
+    BLOCK_SIZE: tl.constexpr,
+    MULTI_GROUP: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    row_idx = tl.load(write_indices_ptr + pid)
+    start_idx = tl.load(write_starts_ptr + pid)
+    cu_start = tl.load(write_cu_lens_ptr + pid - 1) if pid > 0 else 0
+    cu_end = tl.load(write_cu_lens_ptr + pid)
+    content_len = cu_end - cu_start
+
+    if MULTI_GROUP:
+        group_id = tl.load(write_group_ids_ptr + pid)
+        row_ptr = _load_ptr_i32(output_ptr + group_id)
+        row_stride = tl.load(output_stride + group_id)
+    else:
+        row_ptr = output_ptr
+        row_stride = output_stride
+    row_ptr += row_idx * row_stride + start_idx
+
+    for i in range(0, content_len, BLOCK_SIZE):
+        block = i + tl.arange(0, BLOCK_SIZE)
+        mask = block < content_len
+        content = tl.load(write_contents_ptr + cu_start + block, mask=mask)
+        tl.store(row_ptr + block, content, mask=mask)
+
+
 @triton.jit(do_not_specialize=["num_reqs"])
 def _gather_block_tables_kernel(
     batch_idx_to_req_idx,  # [batch_size]
@@ -209,11 +244,13 @@ def _penalties_kernel(
 
 
 import vllm.v1.worker.gpu.block_table
+import vllm.v1.worker.gpu.buffer_utils
 
 vllm.v1.worker.gpu.block_table._gather_block_tables_kernel = _gather_block_tables_kernel
 vllm.v1.worker.gpu.block_table._compute_slot_mappings_kernel = (
     _compute_slot_mappings_kernel
 )
+vllm.v1.worker.gpu.buffer_utils._apply_write_kernel = _apply_write_kernel
 
 import vllm.v1.worker.gpu.sample.penalties
 

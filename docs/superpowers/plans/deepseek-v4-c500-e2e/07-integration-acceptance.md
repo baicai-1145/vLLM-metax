@@ -117,8 +117,8 @@ Sparse MLA 四组 graph/eager、batch1/2 native/reference 差分只得到 layer0
 
 表中空值由集成会话根据实际日志填写，不能预估或用 microbenchmark 代替。
 
-最新 MTP=0、TP=4、PIECEWISE、100-token decode 参考为 `15.2334 tok/s`、
-`65.65 ms/token`，四卡利用率 `16.16%--16.42%`。目录中更早的
+最新 MTP=0、TP=4、PIECEWISE、100-prompt x 100-token decode 参考为 median
+`27.2195 tok/s`、P90 `42.879 ms/token`，四卡利用率 `30.32%--30.43%`。目录中更早的
 `11.624672 token/s`/`86.0 ms/token` 必须标为历史起始基线，不得与新 workload 直接
 比较。
 
@@ -142,7 +142,7 @@ Sparse MLA 四组 graph/eager、batch1/2 native/reference 差分只得到 layer0
 1. 4x C500 相对 4x A100 的总差距从多少缩小到多少？
 2. 每个阶段贡献了多少真实 ms/token，而不是百分比推测？
 3. 剩余差距属于 kernel、带宽、互联、软件栈还是硬件上限？
-4. MTP 开启后的 acceptance rate、额外成本和净吞吐是多少？
+4. MTP 当前状态为何是 Deferred，恢复工作需要满足哪些前置条件？
 5. 哪些 opt-in 可以默认推广，哪些必须保留回退和显式告警？
 
 ## 会话任务提示
@@ -150,6 +150,7 @@ Sparse MLA 四组 graph/eager、batch1/2 native/reference 差分只得到 layer0
 ```text
 完成 deepseek-v4-c500-e2e/07-integration-acceptance.md。收集各子会话的真实
 artifact，按 Sparse MLA→MHC→O-proj→MoE→collective→graph 顺序逐项集成并重跑
-门禁。先完成 MTP=0 的稳定 100-token A100/C500 同口径对比，再决定是否启用 MTP。
+门禁。当前只推进 MTP=0 的稳定 100-token A100/C500 同口径对比和 baseline 优化；
+MTP 自 2026-07-25 起为 Deferred，不属于本轮推广范围。
 不得用 microbenchmark 或 profiler 吞吐代替端到端 normal inference。
 ```

@@ -3,8 +3,10 @@
 
 from .model import DeepseekV4ForCausalLM  # type: ignore[assignment]
 from .mtp import DeepSeekV4MTP  # type: ignore[assignment]
+from .dspark import DSparkDeepseekV4ForCausalLM  # type: ignore[assignment]
 
 __all__ = [
     "DeepSeekV4MTP",
     "DeepseekV4ForCausalLM",
+    "DSparkDeepseekV4ForCausalLM",
 ]

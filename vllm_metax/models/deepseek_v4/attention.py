@@ -445,7 +445,7 @@ def _run_qnorm_rope_kv_insert(
 ) -> None:
     if (
         os.getenv("VLLM_METAX_DSV4_TOKENWISE_QKV_INSERT") != "1"
-        or not 1 < q.shape[0] <= 5
+        or not 1 < q.shape[0] <= 6
     ):
         _qnorm_rope_kv_insert_native(
             q,
@@ -536,6 +536,7 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
         prefix: str,
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
+        is_target_model: bool = False,
     ) -> None:
         super(DeepseekV4Attention, self).__init__()
         config = vllm_config.model_config.hf_config
@@ -544,6 +545,7 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
         tp_size = get_tensor_model_parallel_world_size()
         layer_id = extract_layer_index(prefix)
         self.layer_idx = layer_id
+        self.is_target_model = is_target_model
         self._attention_input_capture_enabled = (
             layer_capture_enabled()
             and layer_capture_layer_enabled(self.layer_idx)
@@ -733,7 +735,7 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
         )
         if (
             qkv_prenorm_shadow_compare_enabled()
-            and 1 < single_hidden_states.shape[0] <= 5
+            and 1 < single_hidden_states.shape[0] <= 6
         ):
             self._capture_qkv_prenorm_shadow_compare(
                 positions, single_hidden_states, qr_kv
@@ -773,7 +775,7 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
     def attn_gemm_parallel_execute(self, hidden_states):
         if (
             os.getenv(_TOKENWISE_ATTN_GEMM_ENV) == "1"
-            and 1 < hidden_states.shape[0] <= 5
+            and 1 < hidden_states.shape[0] <= 6
         ):
             logger.warning_once(
                 "DeepSeek V4 speculative attention uses tokenwise projection GEMMs"
@@ -839,7 +841,7 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
         tokenwise_q_only = os.getenv("VLLM_METAX_DSV4_TOKENWISE_Q_ONLY") == "1"
         if (
             not (tokenwise_qkv or tokenwise_q_only)
-            or not 1 < hidden_states.shape[0] <= 5
+            or not 1 < hidden_states.shape[0] <= 6
         ):
             return result
         logger.warning_once(
@@ -878,7 +880,7 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
         if (
             not (tokenwise_qkv or tokenwise_kv)
             or not _target_tokenwise_qkv_layer_enabled(self.layer_idx)
-            or not 1 < hidden_states.shape[0] <= 5
+            or not 1 < hidden_states.shape[0] <= 6
         ):
             return qr_kv
         call_index = _next_target_tokenwise_qkv_call_index(self)
@@ -1183,7 +1185,7 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
             _target_tokenwise_qkv_enabled()
             and _target_tokenwise_qkv_layer_enabled(self.layer_idx)
             and _target_tokenwise_qkv_position_enabled(positions)
-            and 1 < hidden_states.shape[0] <= 5
+            and 1 < hidden_states.shape[0] <= 6
         ):
             logger.warning_once(
                 "DeepSeek V4 speculative target attention uses tokenwise QKV "
@@ -1193,9 +1195,10 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
         if getattr(self, "_attention_input_capture_enabled", False):
             maybe_capture_attention_inputs(self.layer_idx, positions, qr, kv)
         if (
-            _target_tokenwise_wq_b_enabled()
+            self.is_target_model
+            and _target_tokenwise_wq_b_enabled()
             and _target_tokenwise_wq_b_layer_enabled(self.layer_idx)
-            and 1 < hidden_states.shape[0] <= 5
+            and 1 < hidden_states.shape[0] <= 6
         ):
             target_wq_b_indices = _target_tokenwise_wq_b_selected_indices(positions)
             if target_wq_b_indices.numel() > 0:
@@ -1217,7 +1220,7 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
                     maybe_capture_attention_output(self.layer_idx, positions, out)
                 return
         if (
-            1 < hidden_states.shape[0] <= 5
+            1 < hidden_states.shape[0] <= 6
             and wq_b_shadow_compare_selected(self.layer_idx, positions)
         ):
             logger.warning_once(
@@ -1731,6 +1734,13 @@ class MacaDeepseekV4Indexer(nn.Module):
             and getattr(swa_metadata, "num_prefills", 0) == 0
             else None
         )
+        compressor._initial_overlap_boundary = (
+            self.config.sliding_window
+            if compressor.overlap
+            and swa_metadata is not None
+            and getattr(swa_metadata, "num_prefills", 0) == 0
+            else None
+        )
         compressor._clear_initial_overlap = getattr(
             self, "_short_context_pending", False
         )
@@ -1763,7 +1773,7 @@ class MacaDeepseekV4Indexer(nn.Module):
 
             if (
                 _indexer_tokenwise_wq_b_enabled(self.layer_idx)
-                and 1 < qr.shape[0] <= 5
+                and 1 < qr.shape[0] <= 6
             ):
                 q_parts = []
                 weight_parts = []

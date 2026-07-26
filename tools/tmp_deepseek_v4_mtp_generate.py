@@ -111,6 +111,48 @@ def _serialize_run_token_ids(run_token_ids: list[list[int]]) -> str:
     return json.dumps(run_token_ids, separators=(",", ":"))
 
 
+def _async_scheduling_override() -> dict[str, bool]:
+    value = os.environ.get("ASYNC_SCHEDULING")
+    if value is None:
+        return {}
+    if value not in {"0", "1"}:
+        raise ValueError("ASYNC_SCHEDULING must be 0 or 1")
+    return {"async_scheduling": value == "1"}
+
+
+def _log_stats_override() -> dict[str, bool]:
+    value = os.environ.get("DISABLE_LOG_STATS")
+    if value is None:
+        return {}
+    if value not in {"0", "1"}:
+        raise ValueError("DISABLE_LOG_STATS must be 0 or 1")
+    return {"disable_log_stats": value == "1"}
+
+
+def _build_speculative_config(num_speculative_tokens: int) -> dict | None:
+    if num_speculative_tokens == 0:
+        return None
+
+    method = os.environ.get("SPECULATIVE_METHOD", "mtp")
+    if method == "mtp":
+        return {
+            "method": "mtp",
+            "num_speculative_tokens": num_speculative_tokens,
+        }
+    if method != "dspark":
+        raise ValueError("SPECULATIVE_METHOD must be mtp or dspark")
+
+    draft_model = os.environ.get("SPECULATIVE_MODEL")
+    if not draft_model:
+        raise ValueError("SPECULATIVE_MODEL is required for dspark")
+    return {
+        "method": "dspark",
+        "model": draft_model,
+        "num_speculative_tokens": num_speculative_tokens,
+        "draft_sample_method": "greedy",
+    }
+
+
 def main() -> None:
     model = os.environ["MODEL"]
     tensor_parallel_size = int(os.environ.get("TP", "1"))
@@ -145,12 +187,7 @@ def main() -> None:
             "cudagraph_mode": os.environ.get("CUDAGRAPH_MODE", "PIECEWISE"),
             "cudagraph_capture_sizes": capture_sizes,
         }
-    speculative_config = None
-    if num_speculative_tokens:
-        speculative_config = {
-            "method": "mtp",
-            "num_speculative_tokens": num_speculative_tokens,
-        }
+    speculative_config = _build_speculative_config(num_speculative_tokens)
     profiler_config = None
     if profile_dir:
         profiler_config = {
@@ -176,6 +213,8 @@ def main() -> None:
         profiler_config=profiler_config,
         gpu_memory_utilization=gpu_memory_utilization,
         enable_prefix_caching=enable_prefix_caching,
+        **_async_scheduling_override(),
+        **_log_stats_override(),
         **(
             {"max_num_batched_tokens": max_num_batched_tokens}
             if max_num_batched_tokens

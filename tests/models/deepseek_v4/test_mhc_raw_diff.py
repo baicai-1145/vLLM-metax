@@ -300,6 +300,29 @@ def test_exact_post_contract_rejects_non_decode_shape():
         _mhc_post_exact_tl(x, residual, post_mix, comb_mix)
 
 
+def test_exact_post_contract_supports_six_row_dspark_verifier(monkeypatch):
+    from vllm_metax.models.deepseek_v4.ops.mhc import tilelang_kernels
+
+    calls = []
+
+    def kernel_factory(num_tokens):
+        calls.append(num_tokens)
+        return lambda *args: args[-1]
+
+    monkeypatch.setattr(tilelang_kernels, "_mhc_post_exact_mma", kernel_factory)
+    x = torch.zeros((6, 4096), dtype=torch.bfloat16)
+    residual = torch.zeros((6, 4, 4096), dtype=torch.bfloat16)
+    post_mix = torch.zeros((6, 4), dtype=torch.float32)
+    comb_mix = torch.zeros((6, 4, 4), dtype=torch.float32)
+
+    result = tilelang_kernels._mhc_post_exact_tl(
+        x, residual, post_mix, comb_mix
+    )
+
+    assert result.shape == residual.shape
+    assert calls == [6]
+
+
 def test_exact_post_mma_opt_in_is_disabled_by_default(monkeypatch):
     monkeypatch.delenv("VLLM_METAX_DSV4_MHC_EXACT_POST_MMA", raising=False)
     from vllm_metax.models.deepseek_v4.ops.mhc.tilelang import (
@@ -333,6 +356,44 @@ def test_hybrid_post_downstream_candidate_is_opt_in(monkeypatch):
     assert not _hybrid_post_downstream_enabled()
     monkeypatch.setenv("VLLM_METAX_DSV4_MHC_HYBRID_POST_DOWNSTREAM", "1")
     assert _hybrid_post_downstream_enabled()
+
+
+def test_hybrid_exact_post_dispatches_one_batch(monkeypatch):
+    from vllm_metax.models.deepseek_v4.ops.mhc import tilelang
+
+    calls = []
+
+    def fake_exact_post(x, residual, post_mix, comb_mix, *, out):
+        calls.append(x.shape[0])
+        return out
+
+    monkeypatch.setattr(tilelang, "_mhc_post_exact_decode", fake_exact_post)
+    x = torch.empty((2, 8))
+    residual = torch.empty((2, 4, 8))
+    post_mix = torch.empty((2, 4))
+    comb_mix = torch.empty((2, 4, 4))
+    out = torch.empty_like(residual)
+
+    tilelang._run_exact_post_rows(
+        x,
+        residual,
+        post_mix,
+        comb_mix,
+        out=out,
+        batched=True,
+    )
+    assert calls == [2]
+
+    calls.clear()
+    tilelang._run_exact_post_rows(
+        x,
+        residual,
+        post_mix,
+        comb_mix,
+        out=out,
+        batched=False,
+    )
+    assert calls == [1, 1]
 
 
 @pytest.mark.parametrize("num_tokens", [1, 2])
@@ -372,6 +433,83 @@ def test_exact_post_pre_rms_fake_shapes(num_tokens):
         torch.bfloat16,
         torch.bfloat16,
     ]
+
+
+@pytest.mark.parametrize("num_tokens", [1, 6])
+def test_exact_initial_pre_rms_fake_shapes(num_tokens):
+    from vllm_metax.models.deepseek_v4.ops.mhc.tilelang import (
+        _mhc_exact_initial_pre_rms_fake,
+    )
+
+    outputs = _mhc_exact_initial_pre_rms_fake(
+        torch.empty((num_tokens, 4, 4096), dtype=torch.bfloat16),
+        torch.empty((24, 16384), dtype=torch.float32),
+        torch.empty(3, dtype=torch.float32),
+        torch.empty(24, dtype=torch.float32),
+        1e-6,
+        1e-6,
+        1e-6,
+        2.0,
+        20,
+        torch.empty(4096, dtype=torch.bfloat16),
+    )
+
+    assert [tuple(output.shape) for output in outputs] == [
+        (num_tokens, 4, 1),
+        (num_tokens, 4, 4),
+        (num_tokens, 4096),
+        (num_tokens, 4096),
+    ]
+    assert [output.dtype for output in outputs] == [
+        torch.float32,
+        torch.float32,
+        torch.bfloat16,
+        torch.bfloat16,
+    ]
+
+
+def test_exact_initial_pre_rms_public_wrapper_dispatch(monkeypatch):
+    from vllm_metax.models.deepseek_v4.ops.mhc import tilelang
+
+    sentinel = object()
+    monkeypatch.setattr(
+        tilelang,
+        "_mhc_exact_initial_pre_rms_impl",
+        lambda *args, **kwargs: sentinel,
+    )
+    result = tilelang.mhc_exact_initial_pre_rms(
+        torch.empty((1, 4, 4096), dtype=torch.bfloat16),
+        torch.empty((24, 16384), dtype=torch.float32),
+        torch.empty(3, dtype=torch.float32),
+        torch.empty(24, dtype=torch.float32),
+        1e-6,
+        1e-6,
+        1e-6,
+        2.0,
+        20,
+        torch.empty(4096, dtype=torch.bfloat16),
+    )
+    assert result is sentinel
+
+
+def test_exact_initial_pre_rms_rejects_cpu_tensors():
+    from vllm_metax.models.deepseek_v4.ops.mhc.tilelang import (
+        mhc_exact_initial_pre_rms,
+    )
+
+    with pytest.raises(RuntimeError, match="contiguous CUDA tensors"):
+        mhc_exact_initial_pre_rms(
+            torch.empty((1, 4, 4096), dtype=torch.bfloat16),
+            torch.empty((24, 16384), dtype=torch.float32),
+            torch.empty(3, dtype=torch.float32),
+            torch.empty(24, dtype=torch.float32),
+            1e-6,
+            1e-6,
+            1e-6,
+            2.0,
+            20,
+            torch.empty(4096, dtype=torch.bfloat16),
+        )
 
 
 def test_exact_post_pre_rms_rejects_unsupported_hidden_size():
@@ -446,6 +584,38 @@ def test_exact_post_pre_rms_batch_matches_stacked_single_tokens():
         hc_base,
         *args,
     )
+
+    for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
+        assert torch.equal(actual_tensor, expected_tensor)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_exact_initial_pre_rms_batch_matches_stacked_single_tokens():
+    from vllm_metax.models.deepseek_v4.ops.mhc.tilelang import (
+        mhc_exact_initial_pre_rms,
+    )
+
+    torch.manual_seed(17)
+    device = torch.device("cuda")
+    num_tokens = 6
+    residual = torch.randn(
+        num_tokens, 4, 4096, dtype=torch.bfloat16, device=device
+    )
+    fn = torch.randn(24, 16384, dtype=torch.float32, device=device)
+    hc_scale = torch.randn(3, dtype=torch.float32, device=device)
+    hc_base = torch.randn(24, dtype=torch.float32, device=device)
+    norm_weight = torch.randn(4096, dtype=torch.bfloat16, device=device)
+    args = (fn, hc_scale, hc_base, 1e-6, 1e-6, 1e-6, 2.0, 20, norm_weight)
+
+    expected_per_token = [
+        mhc_exact_initial_pre_rms(residual[index : index + 1], *args)
+        for index in range(num_tokens)
+    ]
+    expected = tuple(
+        torch.cat([outputs[field] for outputs in expected_per_token], dim=0)
+        for field in range(len(expected_per_token[0]))
+    )
+    actual = mhc_exact_initial_pre_rms(residual, *args)
 
     for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
         assert torch.equal(actual_tensor, expected_tensor)
