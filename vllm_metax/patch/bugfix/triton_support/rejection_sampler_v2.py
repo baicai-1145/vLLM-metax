@@ -14,6 +14,7 @@ from vllm.v1.worker.gpu.spec_decode import rejection_sampler_utils as rsu
 
 tl = rsu.tl
 _original_rejection_sample = rsu.rejection_sample
+_GPU_GREEDY_ACCEPT_ENV = "VLLM_METAX_DSV4_GPU_GREEDY_ACCEPT"
 
 
 @triton.jit
@@ -200,6 +201,45 @@ def _rejection_kernel(
 rsu._rejection_kernel = _rejection_kernel
 
 
+@triton.jit
+def _greedy_accept_kernel(
+    target_argmax_ptr,
+    draft_sampled_ptr,
+    cu_num_logits_ptr,
+    sampled_ptr,
+    sampled_stride,
+    num_sampled_ptr,
+    NUM_SPECULATIVE_STEPS: tl.constexpr,
+):
+    req_idx = tl.program_id(0)
+    start = tl.load(cu_num_logits_ptr + req_idx)
+    end = tl.load(cu_num_logits_ptr + req_idx + 1)
+    num_draft_tokens = end - start - 1
+    accepted = 1
+    accepted_len = 0
+
+    for step in range(NUM_SPECULATIVE_STEPS):
+        valid = step < num_draft_tokens
+        target_token = tl.load(target_argmax_ptr + start + step, mask=valid)
+        draft_token = tl.load(draft_sampled_ptr + start + step + 1, mask=valid)
+        matches = target_token == draft_token
+        write = valid & (accepted != 0)
+        tl.store(
+            sampled_ptr + req_idx * sampled_stride + step,
+            tl.where(matches, draft_token, target_token),
+            mask=write,
+        )
+        accepted_len += write & matches
+        accepted = accepted & (~valid | matches)
+
+    tl.store(
+        sampled_ptr + req_idx * sampled_stride + accepted_len,
+        tl.load(target_argmax_ptr + start + accepted_len),
+        mask=accepted != 0,
+    )
+    tl.store(num_sampled_ptr + req_idx, accepted_len + 1)
+
+
 def _greedy_rejection_sample(
     target_logits: torch.Tensor,
     draft_sampled: torch.Tensor,
@@ -218,26 +258,40 @@ def _greedy_rejection_sample(
     )
     num_sampled = torch.empty(num_reqs, dtype=torch.int32, device=draft_sampled.device)
 
-    cu = cu_num_logits.detach().cpu().tolist()
-    for req_idx in range(num_reqs):
-        start = cu[req_idx]
-        end = cu[req_idx + 1]
-        num_draft_tokens = end - start - 1
-        accepted_len = 0
-        for i in range(num_draft_tokens):
-            logit_idx = start + i
-            draft_token = draft_sampled[logit_idx + 1]
-            target_token = target_argmax[logit_idx]
-            if bool((draft_token == target_token).item()):
-                sampled[req_idx, i] = draft_token
-                accepted_len += 1
+    if os.getenv(_GPU_GREEDY_ACCEPT_ENV) != "1":
+        cu = cu_num_logits.detach().cpu().tolist()
+        for req_idx in range(num_reqs):
+            start = cu[req_idx]
+            end = cu[req_idx + 1]
+            num_draft_tokens = end - start - 1
+            accepted_len = 0
+            for step in range(num_draft_tokens):
+                logit_idx = start + step
+                draft_token = draft_sampled[logit_idx + 1]
+                target_token = target_argmax[logit_idx]
+                if bool((draft_token == target_token).item()):
+                    sampled[req_idx, step] = draft_token
+                    accepted_len += 1
+                else:
+                    sampled[req_idx, step] = target_token
+                    break
             else:
-                sampled[req_idx, i] = target_token
-                break
-        else:
-            sampled[req_idx, accepted_len] = target_argmax[start + accepted_len]
+                sampled[req_idx, accepted_len] = target_argmax[
+                    start + accepted_len
+                ]
+            num_sampled[req_idx] = accepted_len + 1
+        return sampled, num_sampled
 
-        num_sampled[req_idx] = accepted_len + 1
+    _greedy_accept_kernel[(num_reqs,)](
+        target_argmax,
+        draft_sampled,
+        cu_num_logits,
+        sampled,
+        sampled.stride(0),
+        num_sampled,
+        NUM_SPECULATIVE_STEPS=num_speculative_steps,
+        num_warps=1,
+    )
     return sampled, num_sampled
 
 

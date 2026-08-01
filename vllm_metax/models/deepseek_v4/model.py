@@ -71,7 +71,11 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from .attention import MacaDeepseekV4Attention
+from .collective_census import collective_census
 from .flashmla import MacaDeepseekV4FlashMLAAttention
+from .ffn_collective import coalesce_moe_row_reductions
+from .moe_grouped_gate import maybe_run_grouped_moe_gate
+from .row_indices import get_cached_row_indices
 from .layer_debug import (
     copy_graph_layer_decode_output_to_workspace,
     copy_graph_layer_mhc_input_to_workspace,
@@ -100,6 +104,14 @@ import vllm_metax.envs as mx_envs
 
 logger = init_logger(__name__)
 
+_ENABLE_OUT_OF_TREE_AUX_STREAMS_ENV = (
+    "VLLM_METAX_DSV4_ENABLE_OUT_OF_TREE_AUX_STREAMS"
+)
+
+
+def _out_of_tree_aux_streams_enabled() -> bool:
+    return os.getenv(_ENABLE_OUT_OF_TREE_AUX_STREAMS_ENV, "0") == "1"
+
 
 @eager_break_during_capture
 def _save_layer_capture_stage_during_capture(
@@ -124,7 +136,10 @@ def _capture_mhc_pre_shadow_during_capture(
     mhc_args: tuple,
 ) -> None:
     rowwise_results = [
-        tuple(value.clone() for value in mhc_pre(residual_cur[index : index + 1], *mhc_args))
+        tuple(
+            value.clone()
+            for value in mhc_pre(residual_cur[index : index + 1], *mhc_args)
+        )
         for index in range(residual_cur.shape[0])
     ]
     rowwise_outputs = tuple(
@@ -202,9 +217,7 @@ class DeepseekV4MLP(nn.Module):
 
     def forward(self, x):
         capture = (
-            active_ffn_capture(self.layer_idx)
-            if self._capture_shared_stages
-            else None
+            active_ffn_capture(self.layer_idx) if self._capture_shared_stages else None
         )
         if capture is not None:
             capture.record_shared("shared_input", x)
@@ -884,9 +897,7 @@ _TILELANG_FUSED_STAGES = {
 _MHC_EXACT_PER_TOKEN_MAX_TOKENS = 16
 
 
-def _tokenwise_mhc_pre_layer_selected(
-    stage: str, layer_idx: int | None
-) -> bool:
+def _tokenwise_mhc_pre_layer_selected(stage: str, layer_idx: int | None) -> bool:
     if stage == "ffn":
         env_name = "VLLM_METAX_DSV4_TOKENWISE_MHC_PRE_AFTER_POST_LAYERS"
         default_enabled = True
@@ -904,13 +915,11 @@ def _tokenwise_mhc_pre_layer_selected(
         selected = {int(item.strip()) for item in value.split(",") if item.strip()}
     except ValueError as exc:
         raise ValueError(
-            f"{env_name} must be 'all' or comma-separated nonnegative "
-            "integers"
+            f"{env_name} must be 'all' or comma-separated nonnegative integers"
         ) from exc
     if not selected or any(index < 0 for index in selected):
         raise ValueError(
-            f"{env_name} must be 'all' or comma-separated nonnegative "
-            "integers"
+            f"{env_name} must be 'all' or comma-separated nonnegative integers"
         )
     return layer_idx in selected
 
@@ -958,10 +967,7 @@ def _mhc_fused_post_pre_for_stage(
     **kwargs,
 ):
     def run(*call_args):
-        if (
-            get_mhc_backend_name() == "tilelang"
-            and stage not in _TILELANG_FUSED_STAGES
-        ):
+        if get_mhc_backend_name() == "tilelang" and stage not in _TILELANG_FUSED_STAGES:
             return mhc_fused_post_pre_torch(*call_args, **kwargs)
         return mhc_fused_post_pre(*call_args, **kwargs)
 
@@ -1029,9 +1035,7 @@ def _mhc_pre_for_input(x: torch.Tensor, *args):
         or not 1 < x.shape[0] <= 5
     ):
         return mhc_pre(x, *args)
-    logger.warning_once(
-        "DeepSeek V4 speculative decode uses tokenwise initial MHC pre"
-    )
+    logger.warning_once("DeepSeek V4 speculative decode uses tokenwise initial MHC pre")
     tokenwise_results = [
         tuple(value.clone() for value in mhc_pre(x[index : index + 1], *args))
         for index in range(x.shape[0])
@@ -1047,10 +1051,15 @@ def _tokenwise_ffn_selected_indices(
     x: torch.Tensor,
 ) -> torch.Tensor:
     if k1_correctness_candidate_enabled():
-        return torch.arange(x.shape[0], device=x.device)
+        return get_cached_row_indices(x.shape[0], x.device)
     value = os.getenv("VLLM_METAX_DSV4_TOKENWISE_FFN_POSITIONS")
-    if positions is None or value is None or not value.strip() or value.strip().lower() == "all":
-        return torch.arange(x.shape[0], device=x.device)
+    if (
+        positions is None
+        or value is None
+        or not value.strip()
+        or value.strip().lower() == "all"
+    ):
+        return get_cached_row_indices(x.shape[0], x.device)
     try:
         selected = {int(item.strip()) for item in value.split(",") if item.strip()}
     except ValueError as exc:
@@ -1059,7 +1068,7 @@ def _tokenwise_ffn_selected_indices(
             "comma-separated set of integer positions"
         ) from exc
     if not selected:
-        return torch.arange(x.shape[0], device=x.device)
+        return get_cached_row_indices(x.shape[0], x.device)
     flat_positions = positions.detach().reshape(-1)
     mask = torch.zeros_like(flat_positions, dtype=torch.bool)
     for position in selected:
@@ -1072,7 +1081,23 @@ def _ffn_for_input(
     x: torch.Tensor,
     input_ids: torch.Tensor | None,
     positions: torch.Tensor | None = None,
+    *,
+    is_target_model: bool = False,
 ) -> torch.Tensor:
+    layer_idx = getattr(ffn, "layer_idx", 0)
+    projection = "target_ffn" if is_target_model else "draft_ffn"
+
+    def invoke_ffn(
+        value: torch.Tensor, value_input_ids: torch.Tensor | None
+    ) -> torch.Tensor:
+        collective_census(
+            projection,
+            layer_idx,
+            int(value.shape[0]),
+            expects_reduce=True,
+        )
+        return ffn(value, value_input_ids)
+
     if (
         (
             not env_or_k1_candidate_enabled("VLLM_METAX_DSV4_TOKENWISE_FFN")
@@ -1081,22 +1106,76 @@ def _ffn_for_input(
         and os.getenv("VLLM_METAX_DSV4_TOKENWISE_FFN") != "1"
         or not 1 < x.shape[0] <= 6
     ):
-        return ffn(x, input_ids)
+        return invoke_ffn(x, input_ids)
     selected_indices = _tokenwise_ffn_selected_indices(positions, x)
     if selected_indices.numel() == 0:
-        return ffn(x, input_ids)
+        return invoke_ffn(x, input_ids)
     logger.warning_once("DeepSeek V4 speculative decode uses tokenwise FFN")
+    if (
+        is_target_model
+        and selected_indices.numel() == x.shape[0]
+        and os.getenv("VLLM_METAX_DSV4_COALESCE_TOKENWISE_FFN_REDUCE") == "1"
+    ):
+        if getattr(ffn, "use_mega_moe", False):
+            raise RuntimeError(
+                "tokenwise FFN reduction coalescing does not support MegaMoE"
+            )
+        experts = getattr(ffn, "experts", None)
+        gate = getattr(ffn, "gate", None)
+        if experts is None or gate is None:
+            raise RuntimeError(
+                "tokenwise FFN reduction coalescing requires DeepseekV4MoE"
+            )
+
+        def router_logits_fn(
+            row: torch.Tensor, row_input_ids: torch.Tensor | None
+        ) -> torch.Tensor:
+            if experts.is_internal_router:
+                return row
+            router_logits, _ = gate(row)
+            return router_logits
+
+        maybe_run_grouped_moe_gate(
+            experts,
+            x,
+            input_ids,
+            router_logits_fn,
+            layer_idx,
+        )
+
+        group_rows = int(
+            os.getenv("VLLM_METAX_DSV4_FFN_REDUCE_GROUP_ROWS", str(x.shape[0]))
+        )
+        if group_rows < 1:
+            raise ValueError("VLLM_METAX_DSV4_FFN_REDUCE_GROUP_ROWS must be positive")
+        for start in range(0, x.shape[0], group_rows):
+            collective_census(
+                projection,
+                layer_idx,
+                min(group_rows, int(x.shape[0]) - start),
+                expects_reduce=True,
+            )
+        return coalesce_moe_row_reductions(
+            experts,
+            x,
+            input_ids,
+            router_logits_fn,
+            group_rows=group_rows,
+            group_routed_experts=os.getenv("VLLM_METAX_DSV4_GROUP_ROUTED_EXPERT_ROWS")
+            == "1",
+            group_router=os.getenv("VLLM_METAX_DSV4_GROUP_MOE_ROUTER_ROWS") == "1",
+        )
     if selected_indices.numel() != x.shape[0]:
-        output = ffn(x, input_ids)
+        output = invoke_ffn(x, input_ids)
         for index in selected_indices.tolist():
-            output[index : index + 1] = ffn(
+            output[index : index + 1] = invoke_ffn(
                 x[index : index + 1],
                 None if input_ids is None else input_ids[index : index + 1],
             ).clone()
         return output.contiguous()
     return torch.cat(
         [
-            ffn(
+            invoke_ffn(
                 x[index : index + 1],
                 None if input_ids is None else input_ids[index : index + 1],
             ).clone()
@@ -1267,8 +1346,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             tuple[object, ...], dict[str, torch.Tensor]
         ] = {}
         self._layer_capture_enabled = (
-            layer_capture_enabled()
-            and layer_capture_layer_enabled(self.layer_idx)
+            layer_capture_enabled() and layer_capture_layer_enabled(self.layer_idx)
         )
         self._graph_capture_output_enabled = graph_layer_capture_layer_enabled(
             self.layer_idx
@@ -1289,15 +1367,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         if stage not in self._graph_weak_capture_stages:
             return
         self._graph_weak_refs[stage] = tuple(
-            weakref.ref(value)
-            for value in (hidden_states, residual, post_mix, res_mix)
+            weakref.ref(value) for value in (hidden_states, residual, post_mix, res_mix)
         )
 
     def get_graph_weak_stage_buffers(
         self,
-    ) -> dict[
-        str, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-    ]:
+    ) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
         stages = {}
         for stage, references in self._graph_weak_refs.items():
             values = tuple(reference() for reference in references)
@@ -1444,9 +1519,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 pre_norm=pre_attn_norm,
             )
         x = self.attn(positions, x, None)
-        self._store_graph_weak_refs(
-            "after_attention", x, residual, post_mix, res_mix
-        )
+        self._store_graph_weak_refs("after_attention", x, residual, post_mix, res_mix)
         if self._layer_capture_enabled:
             _save_layer_capture_stage_during_capture(
                 self.layer_idx,
@@ -1576,7 +1649,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             sinkhorn_repeat=self.hc_sinkhorn_iters,
             n_splits=1,
         )
-        x = _ffn_for_input(self.ffn, x, input_ids, positions)
+        x = _ffn_for_input(
+            self.ffn,
+            x,
+            input_ids,
+            positions,
+            is_target_model=self.is_target_model,
+        )
         self._store_graph_weak_refs("after_ffn", x, residual, post_mix, res_mix)
         if self._layer_capture_enabled:
             _save_layer_capture_stage_during_capture(
@@ -1607,9 +1686,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
     def get_graph_capture_stage_buffers(
         self,
-    ) -> dict[
-        str, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-    ]:
+    ) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
         if not self._graph_capture_output_enabled:
             return {}
         stages = {}
@@ -1661,12 +1738,22 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # (compressor kv_score, indexer.weights_proj, indexer.compressor
         # kv_score). fused_wqa_wkv stays on the default stream.
         # ------------------------------------------------
-        # Note: Metax disable multi stream for performance
+        # Note: MetaX disables multi-stream by default for performance.
+        # Keep the out-of-tree path opt-in until DSpark verifier evidence shows
+        # this overlap is both exact and faster on C500.
         aux_stream_list = (
             None
-            if current_platform.is_out_of_tree()
+            if (
+                current_platform.is_out_of_tree()
+                and not _out_of_tree_aux_streams_enabled()
+            )
             else [torch.cuda.Stream() for _ in range(3)]
         )
+        if current_platform.is_out_of_tree() and aux_stream_list is not None:
+            logger.warning_once(
+                "DeepSeek V4 MetaX out-of-tree auxiliary streams enabled by %s",
+                _ENABLE_OUT_OF_TREE_AUX_STREAMS_ENV,
+            )
 
         # Reserved topk indices buffer for all Indexer layers to reuse.
         self.topk_indices_buffer = torch.empty(

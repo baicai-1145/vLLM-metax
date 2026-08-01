@@ -8,6 +8,9 @@ import torch
 from torch import nn
 
 from vllm_metax.models.deepseek_v4.ops import o_proj
+from vllm_metax.models.deepseek_v4.ops.o_proj_collective import (
+    coalesce_wo_b_row_reductions,
+)
 from vllm_metax.models.deepseek_v4.ops import o_proj_debug
 
 
@@ -55,6 +58,22 @@ class _FakeWoB:
     def __call__(self, input_):
         self.calls += 1
         return self.value
+
+
+class UnquantizedLinearMethod:
+    def __init__(self):
+        self.calls = 0
+
+    def apply(self, _layer, input_, _bias):
+        self.calls += 1
+        return input_
+
+
+class _NativeWoB(_FakeWoB):
+    def __init__(self):
+        super().__init__(torch.empty(0))
+        self.weight = torch.ones(3, 2, dtype=torch.bfloat16)
+        self.quant_method = UnquantizedLinearMethod()
 
 
 def test_wo_b_stage_capture_disabled_keeps_module_call(monkeypatch):
@@ -135,6 +154,321 @@ def test_wo_b_stage_capture_rejects_contract_mismatch():
     layer.input_is_parallel = False
     with pytest.raises(RuntimeError, match="RowParallelLinear contract"):
         o_proj_debug.apply_wo_b_with_stages(layer, torch.zeros(1))
+
+
+def test_wo_b_row_local_outputs_use_one_collective_and_materialize_buffers():
+    shared = torch.empty(1, 2, dtype=torch.bfloat16)
+    layer = _FakeWoB(shared)
+
+    def apply(_layer, input_, bias):
+        assert bias is None
+        shared.copy_(input_ + 3)
+        return shared
+
+    layer.quant_method.apply = apply
+    inputs = torch.tensor([[1.0, 2.0], [4.0, 8.0]], dtype=torch.bfloat16)
+    reductions = []
+
+    def all_reduce(value):
+        reductions.append(value.clone())
+        return value + 10
+
+    actual = coalesce_wo_b_row_reductions(
+        layer,
+        [inputs[:1], inputs[1:]],
+        all_reduce=all_reduce,
+    )
+
+    expected_local = inputs + 3
+    assert len(reductions) == 1
+    torch.testing.assert_close(reductions[0], expected_local)
+    torch.testing.assert_close(actual, expected_local + 10)
+
+
+def test_wo_b_row_local_outputs_support_grouped_reductions():
+    shared = torch.empty(1, 2, dtype=torch.bfloat16)
+    layer = _FakeWoB(shared)
+    inputs = torch.arange(12, dtype=torch.bfloat16).reshape(6, 2)
+    reductions = []
+
+    def apply(_layer, input_, bias):
+        assert bias is None
+        shared.copy_(input_ + 3)
+        return shared
+
+    layer.quant_method.apply = apply
+    actual = coalesce_wo_b_row_reductions(
+        layer,
+        list(inputs.split(1)),
+        group_rows=3,
+        all_reduce=lambda value: reductions.append(value.clone()) or value + 10,
+    )
+
+    assert [value.shape[0] for value in reductions] == [3, 3]
+    torch.testing.assert_close(torch.cat(reductions), inputs + 3)
+    torch.testing.assert_close(actual, inputs + 13)
+
+
+def test_wo_b_native_serial_rows_reuse_output_workspace(monkeypatch):
+    layer = _NativeWoB()
+    inputs = torch.arange(12, dtype=torch.bfloat16).reshape(6, 2)
+    native_calls = []
+    reductions = []
+
+    def native_op(grouped_input, weight, output):
+        native_calls.append((grouped_input.clone(), weight, output.data_ptr()))
+        output.copy_(grouped_input[:, :1].expand_as(output))
+
+    monkeypatch.setenv("VLLM_METAX_DSV4_NATIVE_SERIAL_O_PROJ_ROWS", "1")
+    monkeypatch.setattr(
+        torch.ops._metax_sparse_C,
+        "gemv_bf16_serial_rows_out",
+        native_op,
+        raising=False,
+    )
+
+    first = coalesce_wo_b_row_reductions(
+        layer,
+        list(inputs.split(1)),
+        all_reduce=lambda value: reductions.append(value.clone()) or value + 10,
+    )
+    second = coalesce_wo_b_row_reductions(
+        layer,
+        list(inputs.split(1)),
+        all_reduce=lambda value: reductions.append(value.clone()) or value + 10,
+    )
+
+    assert layer.quant_method.calls == 0
+    assert len(native_calls) == 2
+    assert native_calls[0][2] == native_calls[1][2]
+    torch.testing.assert_close(torch.cat(reductions), torch.cat([inputs[:, :1]] * 2).expand(-1, 3))
+    torch.testing.assert_close(first, inputs[:, :1].expand(-1, 3) + 10)
+    torch.testing.assert_close(second, first)
+
+
+def test_wo_b_exact_grouped_rows_selects_grouped_op(monkeypatch):
+    layer = _NativeWoB()
+    inputs = torch.arange(12, dtype=torch.bfloat16).reshape(6, 2)
+    grouped_calls = []
+    serial_calls = []
+    reductions = []
+
+    def grouped_op(grouped_input, weight, output):
+        grouped_calls.append((grouped_input.clone(), weight, output.data_ptr()))
+        output.copy_(grouped_input[:, :1].expand_as(output))
+
+    def serial_op(_grouped_input, _weight, _output):
+        serial_calls.append(True)
+
+    monkeypatch.setenv("VLLM_METAX_DSV4_NATIVE_SERIAL_O_PROJ_ROWS", "1")
+    monkeypatch.setenv("VLLM_METAX_DSV4_EXACT_GROUPED_O_PROJ_ROWS", "1")
+    monkeypatch.setattr(
+        torch.ops._metax_sparse_C,
+        "gemv_bf16_exact_oproj_grouped_rows_out",
+        grouped_op,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops._metax_sparse_C,
+        "gemv_bf16_serial_rows_out",
+        serial_op,
+        raising=False,
+    )
+
+    actual = coalesce_wo_b_row_reductions(
+        layer,
+        list(inputs.split(1)),
+        group_rows=3,
+        all_reduce=lambda value: reductions.append(value.clone()) or value + 10,
+    )
+
+    assert layer.quant_method.calls == 0
+    assert serial_calls == []
+    assert [call[0].shape[0] for call in grouped_calls] == [3, 3]
+    assert grouped_calls[0][2] == grouped_calls[1][2]
+    torch.testing.assert_close(torch.cat(reductions), inputs[:, :1].expand(-1, 3))
+    torch.testing.assert_close(actual, inputs[:, :1].expand(-1, 3) + 10)
+
+
+def test_wo_b_exact_row_list_skips_group_input_cat(monkeypatch):
+    layer = _NativeWoB()
+    inputs = torch.arange(12, dtype=torch.bfloat16).reshape(6, 2)
+    row_list_calls = []
+    grouped_calls = []
+    reductions = []
+
+    def row_list_op(row_inputs, weight, output):
+        row_list_calls.append(([row.clone() for row in row_inputs], weight))
+        output.copy_(torch.cat(row_inputs, dim=0)[:, :1].expand_as(output))
+
+    def grouped_op(_grouped_input, _weight, _output):
+        grouped_calls.append(True)
+
+    monkeypatch.setenv("VLLM_METAX_DSV4_NATIVE_SERIAL_O_PROJ_ROWS", "1")
+    monkeypatch.setenv("VLLM_METAX_DSV4_EXACT_GROUPED_O_PROJ_ROWS", "1")
+    monkeypatch.setenv("VLLM_METAX_DSV4_EXACT_OPROJ_ROW_LIST", "1")
+    monkeypatch.setattr(
+        torch.ops._metax_sparse_C,
+        "gemv_bf16_exact_oproj_row_list_out",
+        row_list_op,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops._metax_sparse_C,
+        "gemv_bf16_exact_oproj_grouped_rows_out",
+        grouped_op,
+        raising=False,
+    )
+
+    actual = coalesce_wo_b_row_reductions(
+        layer,
+        list(inputs.split(1)),
+        group_rows=3,
+        all_reduce=lambda value: reductions.append(value.clone()) or value + 10,
+    )
+
+    assert [len(call[0]) for call in row_list_calls] == [3, 3]
+    assert grouped_calls == []
+    assert [value.shape[0] for value in reductions] == [3, 3]
+    torch.testing.assert_close(torch.cat(reductions), inputs[:, :1].expand(-1, 3))
+    torch.testing.assert_close(actual, inputs[:, :1].expand(-1, 3) + 10)
+
+
+def test_exact_oproj_grouped_kernel_keeps_row_serial_target_shape():
+    source = (
+        Path(__file__).parents[3] / "csrc" / "metax_sparse" / "gemm_fp32.cu"
+    ).read_text(encoding="utf-8")
+    grouped_start = source.index("void gemv_bf16_exact_grouped_rows_out")
+    grouped_end = source.index(
+        "void gemv_bf16_fp32_serial_rows_out", grouped_start
+    )
+    grouped_impl = source[grouped_start:grouped_end]
+
+    assert "gemv_bf16_exact_grouped_rows_kernel<<<" in grouped_impl
+    assert "if (o_proj_shape)" in grouped_impl
+    assert "at::mm_out" in grouped_impl
+    oproj_start = source.index("void gemv_bf16_exact_oproj_grouped_rows_out")
+    oproj_end = source.index("void gemv_bf16_fp32_serial_rows_out", oproj_start)
+    oproj_impl = source[oproj_start:oproj_end]
+    assert "gemv_bf16_exact_grouped_rows_out(input, weight, out);" in oproj_impl
+
+
+def test_wo_b_exact_grouped_rows_handles_singleton_tail(monkeypatch):
+    layer = _NativeWoB()
+    inputs = torch.arange(12, dtype=torch.bfloat16).reshape(6, 2)
+    grouped_shapes = []
+
+    def grouped_op(grouped_input, _weight, output):
+        grouped_shapes.append(tuple(grouped_input.shape))
+        output.copy_(grouped_input[:, :1].expand_as(output))
+
+    monkeypatch.setenv("VLLM_METAX_DSV4_NATIVE_SERIAL_O_PROJ_ROWS", "1")
+    monkeypatch.setenv("VLLM_METAX_DSV4_EXACT_GROUPED_O_PROJ_ROWS", "1")
+    monkeypatch.setattr(
+        torch.ops._metax_sparse_C,
+        "gemv_bf16_exact_oproj_grouped_rows_out",
+        grouped_op,
+        raising=False,
+    )
+
+    actual = coalesce_wo_b_row_reductions(
+        layer,
+        list(inputs.split(1)),
+        group_rows=5,
+        all_reduce=lambda value: value + 10,
+    )
+
+    assert grouped_shapes == [(5, 2), (1, 2)]
+    torch.testing.assert_close(actual, inputs[:, :1].expand(-1, 3) + 10)
+
+
+def test_wo_b_exact_grouped_rows_supports_single_row_groups(monkeypatch):
+    layer = _NativeWoB()
+    inputs = torch.arange(12, dtype=torch.bfloat16).reshape(6, 2)
+    grouped_shapes = []
+
+    def grouped_op(grouped_input, _weight, output):
+        grouped_shapes.append(tuple(grouped_input.shape))
+        output.copy_(grouped_input[:, :1].expand_as(output))
+
+    monkeypatch.setenv("VLLM_METAX_DSV4_NATIVE_SERIAL_O_PROJ_ROWS", "1")
+    monkeypatch.setenv("VLLM_METAX_DSV4_EXACT_GROUPED_O_PROJ_ROWS", "1")
+    monkeypatch.setattr(
+        torch.ops._metax_sparse_C,
+        "gemv_bf16_exact_oproj_grouped_rows_out",
+        grouped_op,
+        raising=False,
+    )
+
+    actual = coalesce_wo_b_row_reductions(
+        layer,
+        list(inputs.split(1)),
+        group_rows=1,
+        all_reduce=lambda value: value + 10,
+    )
+
+    assert grouped_shapes == [(1, 2)] * 6
+    torch.testing.assert_close(actual, inputs[:, :1].expand(-1, 3) + 10)
+
+
+def test_wo_b_native_serial_rows_reject_quantized_method(monkeypatch):
+    layer = _FakeWoB(torch.zeros(1, 2, dtype=torch.bfloat16))
+    layer.weight = torch.ones(2, 2, dtype=torch.bfloat16)
+    monkeypatch.setenv("VLLM_METAX_DSV4_NATIVE_SERIAL_O_PROJ_ROWS", "1")
+
+    with pytest.raises(RuntimeError, match="UnquantizedLinearMethod"):
+        coalesce_wo_b_row_reductions(
+            layer,
+            [torch.zeros(1, 2, dtype=torch.bfloat16)] * 2,
+            all_reduce=lambda value: value,
+        )
+
+
+def test_single_reduced_o_proj_group_can_be_returned_directly(monkeypatch):
+    monkeypatch.setenv("VLLM_METAX_DSV4_RETURN_SINGLE_REDUCED_GROUP", "1")
+    layer = _FakeWoB(torch.zeros(1, 2, dtype=torch.bfloat16))
+    inputs = torch.arange(12, dtype=torch.bfloat16).reshape(6, 2)
+    reduced = None
+
+    def apply(_layer, input_, _bias):
+        return input_ + 3
+
+    def all_reduce(value):
+        nonlocal reduced
+        reduced = value + 10
+        return reduced
+
+    layer.quant_method.apply = apply
+    actual = coalesce_wo_b_row_reductions(
+        layer,
+        list(inputs.split(1)),
+        all_reduce=all_reduce,
+    )
+
+    assert actual is reduced
+    torch.testing.assert_close(actual, inputs + 13)
+
+
+@pytest.mark.parametrize("group_rows", [0, -1])
+def test_wo_b_row_collective_rejects_invalid_group_rows(group_rows):
+    with pytest.raises(ValueError, match="group_rows"):
+        coalesce_wo_b_row_reductions(
+            _FakeWoB(torch.zeros(1, 2)),
+            [torch.zeros(1, 2)],
+            group_rows=group_rows,
+            all_reduce=lambda value: value,
+        )
+
+
+def test_wo_b_row_collective_rejects_contract_mismatch():
+    layer = _FakeWoB(torch.zeros(1, 2))
+    layer.reduce_results = False
+    with pytest.raises(RuntimeError, match="RowParallelLinear contract"):
+        coalesce_wo_b_row_reductions(
+            layer,
+            [torch.zeros(1, 2)],
+            all_reduce=lambda value: value,
+        )
 
 
 def test_torch_replay_has_bitwise_stage_match(tmp_path, monkeypatch):

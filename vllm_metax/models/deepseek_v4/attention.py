@@ -6,9 +6,29 @@ DeepseekV4 MLA Attention Layer
 """
 
 import os
+import time
 from typing import TYPE_CHECKING, ClassVar, Literal, cast
 
 import torch
+
+# Diagnostic: accumulate attention_impl eager-break wall time
+_ATTN_TIMING = {"total": 0.0, "count": 0, "enabled": False}
+
+import atexit as _atexit
+
+def _print_attn_timing():
+    if _ATTN_TIMING["count"] > 0:
+        import os as _os
+        _rank = int(_os.getenv("RANK", _os.getenv("LOCAL_RANK", "0")))
+        _path = f"/tmp/attn_timing_rank{_rank}.txt"
+        with open(_path, "w") as _f:
+            _f.write(f"rank={_rank}\n")
+            _f.write(f"total={_ATTN_TIMING['total']:.6f}\n")
+            _f.write(f"count={_ATTN_TIMING['count']}\n")
+            _f.write(f"avg_ms={_ATTN_TIMING['total']/max(1,_ATTN_TIMING['count'])*1000:.4f}\n")
+
+_atexit.register(_print_attn_timing)
+
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import DeepseekV2Config, DeepseekV3Config
@@ -41,6 +61,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.models.utils import extract_layer_index
 from .compressor import MacaDeepseekCompressor
+from .row_indices import get_cached_row_indices
 from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
     maybe_execute_in_parallel,
@@ -92,11 +113,27 @@ logger = init_logger(__name__)
 _Q_INSERT_CUDAGRAPH_LAYER_ENV = "VLLM_METAX_DSV4_Q_INSERT_CUDAGRAPH_LAYER"
 _TOKENWISE_WQ_B_ENV = "VLLM_METAX_DSV4_TOKENWISE_WQ_B"
 _TOKENWISE_TARGET_WQ_B_ENV = "VLLM_METAX_DSV4_TOKENWISE_TARGET_WQ_B"
+_NATIVE_SERIAL_WQ_B_ROWS_ENV = (
+    "VLLM_METAX_DSV4_NATIVE_SERIAL_WQ_B_ROWS"
+)
+_EXACT_GROUPED_WQ_B_ROWS_ENV = (
+    "VLLM_METAX_DSV4_EXACT_GROUPED_WQ_B_ROWS"
+)
+_EXACT_GROUPED_INDEXER_WQ_B_ROWS_ENV = (
+    "VLLM_METAX_DSV4_EXACT_GROUPED_INDEXER_WQ_B_ROWS"
+)
 _TOKENWISE_INDEXER_WQ_B_ENV = "VLLM_METAX_DSV4_TOKENWISE_INDEXER_WQ_B"
 _TOKENWISE_INDEXER_WQ_B_LAYERS_ENV = (
     "VLLM_METAX_DSV4_TOKENWISE_INDEXER_WQ_B_LAYERS"
 )
+_TOKENWISE_INDEXER_WEIGHT_ROWS_ENV = (
+    "VLLM_METAX_DSV4_TOKENWISE_INDEXER_WEIGHT_ROWS"
+)
 _TOKENWISE_ATTN_GEMM_ENV = "VLLM_METAX_DSV4_TOKENWISE_ATTN_GEMM"
+_TOKENWISE_ATTN_GEMM_AUX_ENV = "VLLM_METAX_DSV4_TOKENWISE_ATTN_GEMM_AUX"
+_NATIVE_SERIAL_ATTN_GEMM_ROWS_ENV = (
+    "VLLM_METAX_DSV4_NATIVE_SERIAL_ATTN_GEMM_ROWS"
+)
 _TOKENWISE_TARGET_WQ_B_LAYERS_ENV = "VLLM_METAX_DSV4_TOKENWISE_TARGET_WQ_B_LAYERS"
 _TOKENWISE_TARGET_WQ_B_POSITIONS_ENV = (
     "VLLM_METAX_DSV4_TOKENWISE_TARGET_WQ_B_POSITIONS"
@@ -189,6 +226,22 @@ def _target_tokenwise_wq_b_enabled() -> bool:
     )
 
 
+def _native_serial_wq_b_rows_enabled() -> bool:
+    return os.getenv(_NATIVE_SERIAL_WQ_B_ROWS_ENV, "0") == "1"
+
+
+def _exact_grouped_wq_b_rows_enabled() -> bool:
+    return os.getenv(_EXACT_GROUPED_WQ_B_ROWS_ENV, "0") == "1"
+
+
+def _exact_grouped_indexer_wq_b_rows_enabled() -> bool:
+    return os.getenv(_EXACT_GROUPED_INDEXER_WQ_B_ROWS_ENV, "0") == "1"
+
+
+def _native_serial_attn_gemm_rows_enabled() -> bool:
+    return os.getenv(_NATIVE_SERIAL_ATTN_GEMM_ROWS_ENV, "0") == "1"
+
+
 def _target_tokenwise_wq_b_layer_enabled(layer_idx: int) -> bool:
     if (
         os.getenv(_TOKENWISE_WQ_B_ENV) == "1"
@@ -240,10 +293,10 @@ def _target_tokenwise_wq_b_position_enabled(positions: torch.Tensor) -> bool:
 def _target_tokenwise_wq_b_selected_indices(positions: torch.Tensor) -> torch.Tensor:
     flat_positions = positions.detach().reshape(-1)
     if k1_correctness_candidate_enabled():
-        return torch.arange(flat_positions.numel(), device=positions.device)
+        return get_cached_row_indices(flat_positions.numel(), positions.device)
     value = os.getenv(_TOKENWISE_TARGET_WQ_B_POSITIONS_ENV)
     if value is None or not value.strip() or value.strip().lower() == "all":
-        return torch.arange(flat_positions.numel(), device=positions.device)
+        return get_cached_row_indices(flat_positions.numel(), positions.device)
     try:
         selected = {int(item.strip()) for item in value.split(",") if item.strip()}
     except ValueError as exc:
@@ -252,11 +305,13 @@ def _target_tokenwise_wq_b_selected_indices(positions: torch.Tensor) -> torch.Te
             "comma-separated set of integer positions"
         ) from exc
     if not selected:
-        return torch.arange(flat_positions.numel(), device=positions.device)
+        return get_cached_row_indices(flat_positions.numel(), positions.device)
     mask = torch.zeros_like(flat_positions, dtype=torch.bool)
     for position in selected:
         mask |= flat_positions == position
     return torch.nonzero(mask, as_tuple=False).reshape(-1)
+
+
 def _target_tokenwise_qkv_enabled() -> bool:
     return os.getenv(_TOKENWISE_TARGET_QKV_ENV) == "1"
 
@@ -347,10 +402,10 @@ def _next_target_tokenwise_qkv_call_index(layer: object) -> int:
 def _target_tokenwise_qkv_selected_indices(positions: torch.Tensor) -> torch.Tensor:
     flat_positions = positions.detach().reshape(-1)
     if _k1_target_qkv_scope_unrestricted():
-        return torch.arange(flat_positions.numel(), device=positions.device)
+        return get_cached_row_indices(flat_positions.numel(), positions.device)
     value = os.getenv(_TOKENWISE_TARGET_QKV_POSITIONS_ENV)
     if value is None or not value.strip() or value.strip().lower() == "all":
-        return torch.arange(flat_positions.numel(), device=positions.device)
+        return get_cached_row_indices(flat_positions.numel(), positions.device)
     try:
         selected = {int(item.strip()) for item in value.split(",") if item.strip()}
     except ValueError as exc:
@@ -359,7 +414,7 @@ def _target_tokenwise_qkv_selected_indices(positions: torch.Tensor) -> torch.Ten
             "comma-separated set of integer positions"
         ) from exc
     if not selected:
-        return torch.arange(flat_positions.numel(), device=positions.device)
+        return get_cached_row_indices(flat_positions.numel(), positions.device)
     mask = torch.zeros_like(flat_positions, dtype=torch.bool)
     for position in selected:
         mask |= flat_positions == position
@@ -409,6 +464,42 @@ def _indexer_tokenwise_wq_b_enabled(layer_idx: int) -> bool:
             "comma-separated set of nonnegative integer layer indices"
         )
     return layer_idx in selected
+
+
+def _indexer_tokenwise_weight_rows_enabled(
+    layer_idx: int, num_hidden_layers: int
+) -> bool:
+    value = os.getenv(_TOKENWISE_INDEXER_WEIGHT_ROWS_ENV, "").strip().lower()
+    if not value or value in {"0", "false", "off", "no"}:
+        return False
+    if value == "target":
+        return layer_idx < num_hidden_layers
+    raise ValueError(
+        f"{_TOKENWISE_INDEXER_WEIGHT_ROWS_ENV} must be off or target"
+    )
+
+
+def _tokenwise_attn_gemm_aux_components() -> tuple[str, ...]:
+    value = os.getenv(_TOKENWISE_ATTN_GEMM_AUX_ENV, "").strip()
+    if not value or value.lower() in {"0", "false", "off", "no"}:
+        return ()
+    valid = {
+        "kv_score",
+        "indexer_kv_score",
+        "indexer_weights",
+    }
+    components = tuple(
+        component.strip()
+        for component in value.split(",")
+        if component.strip()
+    )
+    invalid = [component for component in components if component not in valid]
+    if invalid:
+        raise ValueError(
+            f"{_TOKENWISE_ATTN_GEMM_AUX_ENV} must be a comma-separated subset "
+            "of kv_score,indexer_kv_score,indexer_weights"
+        )
+    return components
 
 
 def _qnorm_rope_kv_insert_native(
@@ -667,6 +758,22 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
                 "DeepSeek V4 prefill GEMM chunk size must be positive, got "
                 f"{self._prefill_gemm_chunk_size}"
             )
+
+        # Cache per-call env-flag decisions (constant per session/layer)
+        # to reduce host-side eager dispatch overhead in attention_impl.
+        self._cached_tw_qkv_enabled = _target_tokenwise_qkv_enabled()
+        self._cached_tw_qkv_layer = _target_tokenwise_qkv_layer_enabled(
+            self.layer_idx
+        )
+        self._cached_tw_wq_b_enabled = _target_tokenwise_wq_b_enabled()
+        self._cached_tw_wq_b_layer = _target_tokenwise_wq_b_layer_enabled(
+            self.layer_idx
+        )
+        self._cached_is_target_tw_wq_b = (
+            self.is_target_model
+            and self._cached_tw_wq_b_enabled
+            and self._cached_tw_wq_b_layer
+        )
         # ---- Attention / KV-cache setup ----
         self.max_num_batched_tokens = (
             vllm_config.scheduler_config.max_num_batched_tokens
@@ -801,12 +908,17 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
                 else torch.cat([result[index] for result in results], dim=0)
                 for index, is_none in enumerate(none_mask)
             )
+        if self._qkv_kv_score_with_batched_indexer_enabled(hidden_states):
+            return self._attn_gemm_qkv_kv_score_with_batched_indexer(
+                hidden_states
+            )
         if (
             not self._prefill_gemm_chunking_enabled
             or hidden_states.shape[0] <= self._prefill_gemm_chunk_size
         ):
             result = super().attn_gemm_parallel_execute(hidden_states)
-            return self._replace_fused_q_tokenwise(hidden_states, result)
+            result = self._replace_fused_q_tokenwise(hidden_states, result)
+            return self._replace_attn_gemm_aux_tokenwise(hidden_states, result)
 
         chunk_results = []
         chunk_size = self._prefill_gemm_chunk_size
@@ -834,7 +946,242 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
             else torch.cat([result[index] for result in chunk_results], dim=0)
             for index, is_none in enumerate(expected_none)
         )
-        return self._replace_fused_q_tokenwise(hidden_states, result)
+        result = self._replace_fused_q_tokenwise(hidden_states, result)
+        return self._replace_attn_gemm_aux_tokenwise(hidden_states, result)
+
+    def _replace_attn_gemm_aux_tokenwise(self, hidden_states, result):
+        components = _tokenwise_attn_gemm_aux_components()
+        if not components or not 1 < hidden_states.shape[0] <= 6:
+            return result
+
+        component_indices = {
+            "kv_score": 1,
+            "indexer_kv_score": 2,
+            "indexer_weights": 3,
+        }
+        selected_indices = [
+            component_indices[component] for component in components
+        ]
+        selected_indices = [
+            index for index in selected_indices if result[index] is not None
+        ]
+        if not selected_indices:
+            return result
+
+        logger.warning_once(
+            "DeepSeek V4 speculative attention uses tokenwise auxiliary "
+            "projection GEMMs: %s",
+            ",".join(components),
+        )
+        row_results = [
+            super(MacaDeepseekV4Attention, self).attn_gemm_parallel_execute(
+                hidden_states[index : index + 1]
+            )
+            for index in range(hidden_states.shape[0])
+        ]
+        expected_none = tuple(value is None for value in row_results[0])
+        if any(
+            tuple(value is None for value in row_result) != expected_none
+            for row_result in row_results[1:]
+        ):
+            raise RuntimeError(
+                "DeepSeek V4 tokenwise auxiliary projection GEMMs returned "
+                "inconsistent None/non-None components"
+            )
+
+        output = list(result)
+        for index in selected_indices:
+            if expected_none[index]:
+                output[index] = None
+            else:
+                output[index] = torch.cat(
+                    [row_result[index] for row_result in row_results], dim=0
+                )
+        return tuple(output)
+
+    def _qkv_kv_score_with_batched_indexer_enabled(self, hidden_states) -> bool:
+        components = _tokenwise_attn_gemm_aux_components()
+        return (
+            os.getenv("VLLM_METAX_DSV4_TOKENWISE_QKV") == "1"
+            and len(components) == 1
+            and components[0] == "kv_score"
+            and getattr(self, "compressor", None) is not None
+            and 1 < hidden_states.shape[0] <= 6
+        )
+
+    def _attn_gemm_qkv_kv_score_with_batched_indexer(self, hidden_states):
+        logger.warning_once(
+            "DeepSeek V4 speculative attention uses tokenwise QKV and "
+            "kv_score projection GEMMs with batched indexer auxiliary GEMMs"
+        )
+        compressor = self.compressor
+        assert compressor is not None
+        indexer = getattr(self, "indexer", None)
+
+        aux_streams = self.aux_stream_list
+        if aux_streams is not None:
+            assert len(aux_streams) >= 3
+            aux_streams = aux_streams[:3]
+
+        def fused_wqa_wkv_tokenwise() -> torch.Tensor:
+            if _native_serial_attn_gemm_rows_enabled():
+                return self._project_fused_qkv_native_serial_rows(hidden_states)
+            return torch.cat(
+                [
+                    self.fused_wqa_wkv(hidden_states[index : index + 1])[
+                        0
+                    ].clone()
+                    for index in range(hidden_states.shape[0])
+                ],
+                dim=0,
+            )
+
+        def compressor_kv_score_tokenwise() -> torch.Tensor:
+            if _native_serial_attn_gemm_rows_enabled():
+                return self._project_kv_score_fp32_serial_rows(hidden_states)
+            return torch.cat(
+                [
+                    torch.mm(
+                        hidden_states[index : index + 1],
+                        compressor.fused_wkv_wgate.weight.T,
+                        out_dtype=torch.float32,
+                    ).clone()
+                    for index in range(hidden_states.shape[0])
+                ],
+                dim=0,
+            )
+
+        aux_fns = [compressor_kv_score_tokenwise, None, None]
+        if indexer is not None:
+
+            def indexer_weights_proj() -> torch.Tensor:
+                weights, _ = indexer.weights_proj(hidden_states)
+                return weights
+
+            def indexer_compressor_kv_score() -> torch.Tensor:
+                return torch.mm(
+                    hidden_states,
+                    indexer.compressor.fused_wkv_wgate.weight.T,
+                    out_dtype=torch.float32,
+                )
+
+            aux_fns[1] = indexer_weights_proj
+            aux_fns[2] = indexer_compressor_kv_score
+
+        qr_kv, (kv_score, indexer_weights, indexer_kv_score) = execute_in_parallel(
+            fused_wqa_wkv_tokenwise,
+            aux_fns,
+            self.ln_events[0],
+            self.ln_events[1:4],
+            aux_streams,
+            enable=aux_streams is not None,
+        )
+        return qr_kv, kv_score, indexer_kv_score, indexer_weights
+
+    def _project_fused_qkv_native_serial_rows(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        rows = hidden_states.shape[0]
+        weight = getattr(self.fused_wqa_wkv, "weight", None)
+        expected_width = self.q_lora_rank + self.head_dim
+        if not 2 <= rows <= 6:
+            raise RuntimeError("native serial attention QKV requires 2 <= rows <= 6")
+        if (
+            hidden_states.ndim != 2
+            or not isinstance(weight, torch.Tensor)
+            or weight.ndim != 2
+            or tuple(weight.shape) != (expected_width, hidden_states.shape[1])
+            or hidden_states.dtype != torch.bfloat16
+            or weight.dtype != torch.bfloat16
+            or hidden_states.device != weight.device
+            or not hidden_states.is_contiguous()
+            or not weight.is_contiguous()
+        ):
+            raise RuntimeError(
+                "native serial attention QKV requires contiguous BF16 input "
+                f"[B,K] and weight [{expected_width},K] on the same device"
+            )
+        try:
+            op = torch.ops._metax_sparse_C.gemv_bf16_serial_rows_out
+        except AttributeError as exc:
+            raise RuntimeError(
+                "native attention QKV operator gemv_bf16_serial_rows_out "
+                "is unavailable"
+            ) from exc
+
+        key = (rows, expected_width, hidden_states.dtype, hidden_states.device)
+        workspaces = getattr(self, "_native_serial_attn_qkv_workspaces", None)
+        if workspaces is None:
+            workspaces = {}
+            self._native_serial_attn_qkv_workspaces = workspaces
+        output = workspaces.get(key)
+        if output is None:
+            output = torch.empty(
+                (rows, expected_width),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            workspaces[key] = output
+        op(hidden_states, weight, output)
+        logger.warning_once(
+            "DeepSeek V4 speculative attention QKV uses native serial-row "
+            "workspace: rows=%d launches=%d",
+            rows,
+            rows,
+        )
+        return output
+
+    def _project_kv_score_fp32_serial_rows(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        rows = hidden_states.shape[0]
+        compressor = self.compressor
+        weight = getattr(compressor.fused_wkv_wgate, "weight", None)
+        if not 2 <= rows <= 6:
+            raise RuntimeError("serial attention kv_score requires 2 <= rows <= 6")
+        if (
+            hidden_states.ndim != 2
+            or not isinstance(weight, torch.Tensor)
+            or weight.ndim != 2
+            or weight.shape[1] != hidden_states.shape[1]
+            or hidden_states.dtype != torch.bfloat16
+            or weight.dtype != torch.bfloat16
+            or hidden_states.device != weight.device
+            or not hidden_states.is_contiguous()
+            or not weight.is_contiguous()
+        ):
+            raise RuntimeError(
+                "serial attention kv_score requires contiguous BF16 input "
+                "[B,K] and BF16 weight [N,K] on the same device"
+            )
+        try:
+            op = torch.ops._metax_sparse_C.gemv_bf16_fp32_serial_rows_out
+        except AttributeError as exc:
+            raise RuntimeError(
+                "native FP32 serial attention kv_score operator is unavailable"
+            ) from exc
+
+        key = (rows, weight.shape[0], torch.float32, hidden_states.device)
+        workspaces = getattr(self, "_serial_attn_kv_score_workspaces", None)
+        if workspaces is None:
+            workspaces = {}
+            self._serial_attn_kv_score_workspaces = workspaces
+        output = workspaces.get(key)
+        if output is None:
+            output = torch.empty(
+                (rows, weight.shape[0]),
+                dtype=torch.float32,
+                device=hidden_states.device,
+            )
+            workspaces[key] = output
+        op(hidden_states, weight, output)
+        logger.warning_once(
+            "DeepSeek V4 speculative attention kv_score uses native FP32 "
+            "serial-row workspace: rows=%d launches=%d",
+            rows,
+            rows,
+        )
+        return output
 
     def _replace_fused_q_tokenwise(self, hidden_states, result):
         tokenwise_qkv = os.getenv("VLLM_METAX_DSV4_TOKENWISE_QKV") == "1"
@@ -1021,6 +1368,58 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
         )
 
     def _project_wq_b_tokenwise(self, qr: torch.Tensor) -> torch.Tensor:
+        if _native_serial_wq_b_rows_enabled():
+            rows = qr.shape[0]
+            weight = getattr(self.wq_b, "weight", None)
+            if not 2 <= rows <= 6:
+                raise RuntimeError(
+                    "native serial WQ-B rows require 2 <= rows <= 6"
+                )
+            if (
+                not isinstance(weight, torch.Tensor)
+                or qr.dtype != torch.bfloat16
+                or weight.dtype != torch.bfloat16
+                or not qr.is_contiguous()
+                or not weight.is_contiguous()
+            ):
+                raise RuntimeError(
+                    "native serial WQ-B rows require contiguous BF16 input "
+                    "and weight"
+                )
+            exact_grouped = _exact_grouped_wq_b_rows_enabled()
+            op_name = (
+                "gemv_bf16_exact_grouped_rows_out"
+                if exact_grouped
+                else "gemv_bf16_serial_rows_out"
+            )
+            try:
+                op = getattr(torch.ops._metax_sparse_C, op_name)
+            except AttributeError as exc:
+                raise RuntimeError(
+                    f"native WQ-B rows operator {op_name} is unavailable"
+                ) from exc
+
+            key = (rows, weight.shape[0], qr.dtype, qr.device)
+            workspaces = getattr(self, "_native_serial_wq_b_workspaces", None)
+            if workspaces is None:
+                workspaces = {}
+                self._native_serial_wq_b_workspaces = workspaces
+            output = workspaces.get(key)
+            if output is None:
+                output = torch.empty(
+                    (rows, weight.shape[0]), dtype=qr.dtype, device=qr.device
+                )
+                workspaces[key] = output
+            op(qr, weight, output)
+            launches = 1 if exact_grouped else rows
+            logger.warning_once(
+                "DeepSeek V4 target WQ-B uses native %s output workspace: "
+                "rows=%d launches=%d",
+                "exact-grouped-row" if exact_grouped else "serial-row",
+                rows,
+                launches,
+            )
+            return output
         return torch.cat(
             [
                 self.wq_b(qr[index : index + 1]).clone()
@@ -1181,9 +1580,67 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
         positions: torch.Tensor,
         out: torch.Tensor,
     ) -> None:
+        _ATTN_TIMING["enabled"] = os.getenv("VLLM_METAX_DSV4_ATTENTION_TIMING") == "1"
+        _do_sync = os.getenv("VLLM_METAX_DSV4_ATTENTION_SYNC") == "1"
+        _t0 = time.perf_counter() if _ATTN_TIMING["enabled"] else 0.0
+        if _ATTN_TIMING["enabled"]:
+            # Track gap between calls (framework overhead between forwards)
+            _last_t = _ATTN_TIMING.get("last_call_t", 0.0)
+            _gap = _t0 - _last_t if _last_t > 0 else 0.0
+            _ATTN_TIMING["last_call_t"] = _t0
+            _ATTN_TIMING.setdefault("gaps", [])
+            if _gap > 5.0:  # only track large gaps (>5ms = between forwards)
+                _ATTN_TIMING["gaps"].append(_gap)
+        if _ATTN_TIMING["enabled"] and _do_sync:
+            torch.cuda.synchronize()
+            _t_sync = time.perf_counter()
+        else:
+            _t_sync = _t0
+        try:
+            return self._attention_impl_inner(
+                hidden_states, qr, kv, kv_score, indexer_kv_score,
+                indexer_weights, positions, out,
+            )
+        finally:
+            if _ATTN_TIMING["enabled"]:
+                _t_end = time.perf_counter()
+                _ATTN_TIMING["total"] += _t_end - _t0
+                _ATTN_TIMING["count"] += 1
+                if _do_sync:
+                    _ATTN_TIMING.setdefault("sync_total", 0.0)
+                    _ATTN_TIMING.setdefault("sync_count", 0)
+                    _ATTN_TIMING["sync_total"] += _t_end - _t_sync
+                    _ATTN_TIMING["sync_count"] += 1
+                if _ATTN_TIMING["count"] % 100 == 0:
+                    _rank = int(os.getenv("RANK", os.getenv("LOCAL_RANK", "0")))
+                    _gaps = _ATTN_TIMING.get("gaps", [])
+                    _gap_total = sum(_gaps)
+                    _gap_count = len(_gaps)
+                    with open(f"/tmp/attn_timing_rank{_rank}.txt", "w") as _f:
+                        _f.write(f"rank={_rank}\n")
+                        _f.write(f"total={_ATTN_TIMING['total']:.6f}\n")
+                        _f.write(f"count={_ATTN_TIMING['count']}\n")
+                        _f.write(f"avg_ms={_ATTN_TIMING['total']/max(1,_ATTN_TIMING['count'])*1000:.4f}\n")
+                        _f.write(f"gap_count={_gap_count}\n")
+                        _f.write(f"gap_total={_gap_total:.6f}\n")
+                        _f.write(f"gap_avg_ms={_gap_total/max(1,_gap_count)*1000:.4f}\n")
+                        if _gaps:
+                            _f.write(f"gap_first_10={[round(g,4) for g in _gaps[:10]]}\n")
+
+    def _attention_impl_inner(
+        self,
+        hidden_states: torch.Tensor,
+        qr: torch.Tensor,
+        kv: torch.Tensor,
+        kv_score: torch.Tensor,
+        indexer_kv_score: torch.Tensor,
+        indexer_weights: torch.Tensor,
+        positions: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
         if (
-            _target_tokenwise_qkv_enabled()
-            and _target_tokenwise_qkv_layer_enabled(self.layer_idx)
+            self._cached_tw_qkv_enabled
+            and self._cached_tw_qkv_layer
             and _target_tokenwise_qkv_position_enabled(positions)
             and 1 < hidden_states.shape[0] <= 6
         ):
@@ -1192,15 +1649,15 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
                 "projection"
             )
             qr, kv = self._project_target_qkv_tokenwise(hidden_states)
-        if getattr(self, "_attention_input_capture_enabled", False):
+        if self._attention_input_capture_enabled:
             maybe_capture_attention_inputs(self.layer_idx, positions, qr, kv)
         if (
-            self.is_target_model
-            and _target_tokenwise_wq_b_enabled()
-            and _target_tokenwise_wq_b_layer_enabled(self.layer_idx)
+            self._cached_is_target_tw_wq_b
             and 1 < hidden_states.shape[0] <= 6
         ):
-            target_wq_b_indices = _target_tokenwise_wq_b_selected_indices(positions)
+            target_wq_b_indices = _target_tokenwise_wq_b_selected_indices(
+                positions
+            )
             if target_wq_b_indices.numel() > 0:
                 logger.warning_once(
                     "DeepSeek V4 speculative attention uses tokenwise wq_b projection"
@@ -1216,7 +1673,7 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
                     out,
                     target_wq_b_indices,
                 )
-                if getattr(self, "_attention_input_capture_enabled", False):
+                if self._attention_input_capture_enabled:
                     maybe_capture_attention_output(self.layer_idx, positions, out)
                 return
         if (
@@ -1237,7 +1694,7 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
                 positions,
                 out,
             )
-            if getattr(self, "_attention_input_capture_enabled", False):
+            if self._attention_input_capture_enabled:
                 maybe_capture_attention_output(self.layer_idx, positions, out)
             return
         if (
@@ -1256,7 +1713,7 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
                 q, kv, positions, get_forward_context().attn_metadata
             )
             self.forward_mqa(q, kv, positions, out)
-            if getattr(self, "_attention_input_capture_enabled", False):
+            if self._attention_input_capture_enabled:
                 maybe_capture_attention_output(self.layer_idx, positions, out)
             return
         target_layer = _q_insert_cudagraph_target_layer()
@@ -1275,7 +1732,7 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
                 positions,
                 out,
             )
-            if getattr(self, "_attention_input_capture_enabled", False):
+            if self._attention_input_capture_enabled:
                 maybe_capture_attention_output(self.layer_idx, positions, out)
             return
 
@@ -1292,7 +1749,7 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
                 positions,
                 out,
             )
-            if getattr(self, "_attention_input_capture_enabled", False):
+            if self._attention_input_capture_enabled:
                 maybe_capture_attention_output(self.layer_idx, positions, out)
             return
         swa_metadata = attn_metadata.get(self.swa_cache_layer.prefix)
@@ -1311,7 +1768,7 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
                 positions,
                 out,
             )
-            if getattr(self, "_attention_input_capture_enabled", False):
+            if self._attention_input_capture_enabled:
                 maybe_capture_attention_output(self.layer_idx, positions, out)
             return
 
@@ -1361,7 +1818,7 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
         else:
             q = wq_b_kv_insert()
         self.forward_mqa(q, kv, positions, out)
-        if getattr(self, "_attention_input_capture_enabled", False):
+        if self._attention_input_capture_enabled:
             maybe_capture_attention_output(self.layer_idx, positions, out)
 
 
@@ -1427,7 +1884,7 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
         q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
         q_capture = (
             maybe_prepare_q_stage_capture(self.layer_idx, positions, q)
-            if getattr(self, "_attention_input_capture_enabled", False)
+            if self._attention_input_capture_enabled
             else None
         )
         output = self._q_insert_cudagraph_native(q, kv, positions, swa_metadata)
@@ -1529,7 +1986,7 @@ class MacaDeepseekV4Attention(DeepseekV4Attention):
 
         q_capture = (
             maybe_prepare_q_stage_capture(self.layer_idx, positions, q)
-            if getattr(self, "_attention_input_capture_enabled", False)
+            if self._attention_input_capture_enabled
             else None
         )
 
@@ -1704,6 +2161,59 @@ class MacaDeepseekV4Indexer(nn.Module):
             torch.cuda.Event(),
         ]
 
+    def _project_wq_b_exact_grouped_rows(self, qr: torch.Tensor) -> torch.Tensor:
+        rows = qr.shape[0]
+        weight = getattr(self.wq_b, "weight", None)
+        expected_weight_shape = (self.n_head * self.head_dim, self.q_lora_rank)
+        if not 2 <= rows <= 6:
+            raise RuntimeError(
+                "exact-grouped indexer WQ-B requires 2 <= rows <= 6"
+            )
+        if (
+            qr.ndim != 2
+            or not isinstance(weight, torch.Tensor)
+            or tuple(weight.shape) != expected_weight_shape
+            or qr.shape[1] != self.q_lora_rank
+            or qr.dtype != torch.bfloat16
+            or weight.dtype != torch.bfloat16
+            or qr.device != weight.device
+            or not qr.is_contiguous()
+            or not weight.is_contiguous()
+        ):
+            raise RuntimeError(
+                "exact-grouped indexer WQ-B requires contiguous BF16 "
+                f"input [B,{self.q_lora_rank}] and weight "
+                f"[{expected_weight_shape[0]},{expected_weight_shape[1]}] "
+                "on the same device"
+            )
+        try:
+            op = torch.ops._metax_sparse_C.gemv_bf16_exact_grouped_rows_out
+        except AttributeError as exc:
+            raise RuntimeError(
+                "native exact-grouped indexer WQ-B operator is unavailable"
+            ) from exc
+
+        key = (rows, qr.dtype, qr.device)
+        workspaces = getattr(self, "_exact_grouped_indexer_wq_b_workspaces", None)
+        if workspaces is None:
+            workspaces = {}
+            self._exact_grouped_indexer_wq_b_workspaces = workspaces
+        output = workspaces.get(key)
+        if output is None:
+            output = torch.empty(
+                (rows, expected_weight_shape[0]),
+                dtype=qr.dtype,
+                device=qr.device,
+            )
+            workspaces[key] = output
+        op(qr, weight, output)
+        logger.warning_once(
+            "DeepSeek V4 target indexer WQ-B uses native exact-grouped-row "
+            "workspace: rows=%d launches=1",
+            rows,
+        )
+        return output
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1750,6 +2260,7 @@ class MacaDeepseekV4Indexer(nn.Module):
             def project_quantize(
                 qr_chunk: torch.Tensor,
                 positions_chunk: torch.Tensor,
+                indexer_weights_chunk: torch.Tensor,
                 chunk_index: int | None,
             ) -> tuple[torch.Tensor, torch.Tensor]:
                 if chunk_index is not None:
@@ -1766,7 +2277,7 @@ class MacaDeepseekV4Indexer(nn.Module):
                     positions_chunk,
                     q,
                     rotary_emb.cos_sin_cache,
-                    indexer_weights,
+                    indexer_weights_chunk,
                     self.softmax_scale,
                     self.n_head**-0.5,
                 )
@@ -1775,19 +2286,77 @@ class MacaDeepseekV4Indexer(nn.Module):
                 _indexer_tokenwise_wq_b_enabled(self.layer_idx)
                 and 1 < qr.shape[0] <= 6
             ):
+                split_weight_rows = _indexer_tokenwise_weight_rows_enabled(
+                    self.layer_idx, self.config.num_hidden_layers
+                )
+                if (
+                    _exact_grouped_indexer_wq_b_rows_enabled()
+                    and self.layer_idx < self.config.num_hidden_layers
+                ):
+                    if not split_weight_rows:
+                        raise RuntimeError(
+                            "exact-grouped target indexer WQ-B requires "
+                            "token-aligned indexer weight rows"
+                        )
+                    rows = qr.shape[0]
+                    if (
+                        positions.ndim != 1
+                        or positions.shape[0] != rows
+                        or positions.dtype != torch.int64
+                        or positions.device != qr.device
+                        or indexer_weights.ndim != 2
+                        or tuple(indexer_weights.shape) != (rows, self.n_head)
+                        or indexer_weights.dtype
+                        not in (torch.bfloat16, torch.float32)
+                        or indexer_weights.device != qr.device
+                    ):
+                        logger.warning_once(
+                            "DeepSeek V4 target indexer WQ-B exact-grouped "
+                            "path skipped: requires int64 positions [B] and "
+                            "BF16/FP32 indexer weights [B,%d] aligned with "
+                            "input rows on the same device; got "
+                            "positions=%s/%s weights=%s/%s",
+                            self.n_head,
+                            tuple(positions.shape),
+                            positions.dtype,
+                            tuple(indexer_weights.shape),
+                            indexer_weights.dtype,
+                        )
+                    else:
+                        q = self._project_wq_b_exact_grouped_rows(qr).view(
+                            -1, self.n_head, self.head_dim
+                        )
+                        return fused_indexer_q_rope_int8_quant(
+                            positions.contiguous(),
+                            q,
+                            rotary_emb.cos_sin_cache,
+                            indexer_weights.contiguous(),
+                            self.softmax_scale,
+                            self.n_head**-0.5,
+                        )
                 q_parts = []
                 weight_parts = []
+                split_current_weight_rows = (
+                    split_weight_rows
+                    and indexer_weights.ndim >= 1
+                    and indexer_weights.shape[0] == qr.shape[0]
+                )
                 for index in range(qr.shape[0]):
                     q_quant, weights = project_quantize(
                         qr[index : index + 1],
                         positions[index : index + 1],
+                        (
+                            indexer_weights[index : index + 1]
+                            if split_current_weight_rows
+                            else indexer_weights
+                        ),
                         index,
                     )
                     q_parts.append(q_quant.clone())
                     weight_parts.append(weights.clone())
                 return torch.cat(q_parts, dim=0), torch.cat(weight_parts, dim=0)
 
-            return project_quantize(qr, positions, None)
+            return project_quantize(qr, positions, indexer_weights, None)
 
         # compressor returns None and writes K to the indexer KV cache; the
         # join orders that write before indexer_op (skip_k_cache_insert=True).

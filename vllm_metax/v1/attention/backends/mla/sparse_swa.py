@@ -23,6 +23,9 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
 )
+from vllm_metax.v1.attention.backends.mla.metadata_utils import (
+    build_token_to_req_indices_out,
+)
 
 # DeepseekV4 decode layer types, keyed by compress_ratio. Each type has a distinct
 # (topk, extra_topk, extra_page_block_size) config, so they cannot share a
@@ -322,10 +325,13 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
 
         # NOTE: Ensure all metadata tensors maintain fixed memory addresses
         # for CUDA graph compatibility.
-        query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-        x = torch.repeat_interleave(torch.arange(num_reqs), query_lens).pin_memory()
-        token_to_req_indices = self.token_to_req_indices[: x.shape[0]]
-        token_to_req_indices.copy_(x, non_blocking=True)
+        token_to_req_indices = build_token_to_req_indices_out(
+            query_start_loc,
+            num_reqs,
+            common_attn_metadata.num_actual_tokens,
+            self.token_to_req_indices,
+            max_query_len=common_attn_metadata.max_query_len,
+        )
 
         is_valid_token = self.is_valid_token[: slot_mapping.shape[0]]
         is_valid_token.copy_(slot_mapping >= 0)

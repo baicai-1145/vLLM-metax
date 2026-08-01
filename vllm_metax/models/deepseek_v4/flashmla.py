@@ -12,12 +12,15 @@ import torch
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from .attention import MacaDeepseekV4Attention
+from .collective_census import collective_census
 from vllm.models.deepseek_v4.common.ops import (
     combine_topk_swa_indices,
 )
 from .ops.o_proj import (
     deep_gemm_bf16_o_proj,
+    deep_gemm_bf16_o_proj_row_inputs,
 )
+from .ops.o_proj_collective import coalesce_wo_b_row_reductions
 from .ops import (
     compute_global_topk_indices_and_lens_bounded,
     gather_k_cache,
@@ -30,6 +33,7 @@ from .mtp_candidate import (
     k1_correctness_candidate_enabled,
     k1_native_o_proj_candidate_enabled,
 )
+from .row_indices import get_cached_row_indices
 from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLAMetadata,
 )
@@ -53,10 +57,10 @@ _TOKENWISE_O_PROJ_POSITIONS_ENV = "VLLM_METAX_DSV4_TOKENWISE_O_PROJ_POSITIONS"
 def _tokenwise_o_proj_selected_indices(positions: torch.Tensor) -> torch.Tensor:
     flat_positions = positions.detach().reshape(-1)
     if k1_correctness_candidate_enabled():
-        return torch.arange(flat_positions.numel(), device=positions.device)
+        return get_cached_row_indices(flat_positions.numel(), positions.device)
     value = os.getenv(_TOKENWISE_O_PROJ_POSITIONS_ENV)
     if value is None or not value.strip() or value.strip().lower() == "all":
-        return torch.arange(flat_positions.numel(), device=positions.device)
+        return get_cached_row_indices(flat_positions.numel(), positions.device)
     try:
         selected = {int(item.strip()) for item in value.split(",") if item.strip()}
     except ValueError as exc:
@@ -65,11 +69,21 @@ def _tokenwise_o_proj_selected_indices(positions: torch.Tensor) -> torch.Tensor:
             "comma-separated set of integer positions"
         ) from exc
     if not selected:
-        return torch.arange(flat_positions.numel(), device=positions.device)
+        return get_cached_row_indices(flat_positions.numel(), positions.device)
     mask = torch.zeros_like(flat_positions, dtype=torch.bool)
     for position in selected:
         mask |= flat_positions == position
     return torch.nonzero(mask, as_tuple=False).reshape(-1)
+
+
+def _tokenwise_o_proj_selects_all_rows() -> bool:
+    if k1_correctness_candidate_enabled():
+        return True
+    value = os.getenv(_TOKENWISE_O_PROJ_POSITIONS_ENV)
+    if value is None or not value.strip() or value.strip().lower() == "all":
+        return True
+    selected = {item.strip() for item in value.split(",") if item.strip()}
+    return not selected
 
 
 def _tokenwise_o_proj_enabled() -> bool:
@@ -433,6 +447,22 @@ def _run_sparse_mla_decode(**kwargs) -> None:
     logger.warning_once(
         "DeepSeek V4 speculative attention uses tokenwise sparse MLA decode"
     )
+    if os.getenv("VLLM_METAX_DSV4_SPARSE_MLA_GROUPED_ROWS") == "1":
+        topk_indices = kwargs.get("topk_indices")
+        topk_lens = kwargs.get("topk_lens")
+        if topk_indices is None:
+            logger.warning_once(
+                "DeepSeek V4 sparse MLA decode uses grouped native rows"
+            )
+            sparse_mla_decode(**kwargs)
+            return
+        if topk_lens is None:
+            raise ValueError("topk_indices require topk_lens for grouped sparse MLA decode")
+        logger.warning_once(
+            "DeepSeek V4 sparse MLA decode uses grouped native rows"
+        )
+        sparse_mla_decode(**kwargs)
+        return
     token_aligned = (
         "q",
         "swa_indices",
@@ -559,6 +589,14 @@ class MacaDeepseekV4FlashMLAAttention(MacaDeepseekV4Attention):
             positions_chunk: torch.Tensor,
             chunk_index: int,
         ):
+            collective_census(
+                "target_o_proj"
+                if getattr(self, "is_target_model", True)
+                else "draft_o_proj",
+                self.layer_idx,
+                int(o_chunk.shape[0]),
+                expects_reduce=True,
+            )
             return deep_gemm_bf16_o_proj(
                 o_chunk,
                 positions_chunk,
@@ -579,14 +617,59 @@ class MacaDeepseekV4FlashMLAAttention(MacaDeepseekV4Attention):
             and _tokenwise_o_proj_enabled()
             and 1 < o.shape[0] <= 6
         ):
-            selected_indices = _tokenwise_o_proj_selected_indices(positions)
-            if selected_indices.numel() == 0:
+            selected_indices = None
+            selected_count = o.shape[0]
+            if not _tokenwise_o_proj_selects_all_rows():
+                selected_indices = _tokenwise_o_proj_selected_indices(positions)
+                selected_count = selected_indices.numel()
+            if selected_count == 0:
                 return project(o, positions, 0)
             logger.warning_once(
                 "DeepSeek V4 speculative attention uses tokenwise output "
                 "projection"
             )
-            if selected_indices.numel() == o.shape[0]:
+            if selected_count == o.shape[0]:
+                if (
+                    os.getenv(
+                        "VLLM_METAX_DSV4_COALESCE_TOKENWISE_O_PROJ_REDUCE"
+                    )
+                    == "1"
+                ):
+                    group_rows = int(
+                        os.getenv(
+                            "VLLM_METAX_DSV4_O_PROJ_REDUCE_GROUP_ROWS",
+                            str(o.shape[0]),
+                        )
+                    )
+                    if group_rows < 1:
+                        raise ValueError(
+                            "VLLM_METAX_DSV4_O_PROJ_REDUCE_GROUP_ROWS must be positive"
+                        )
+                    for start in range(0, o.shape[0], group_rows):
+                        collective_census(
+                            "target_o_proj",
+                            self.layer_idx,
+                            min(group_rows, int(o.shape[0]) - start),
+                            expects_reduce=True,
+                        )
+                    row_inputs = deep_gemm_bf16_o_proj_row_inputs(
+                        o,
+                        positions,
+                        self.rotary_emb.cos_sin_cache,
+                        self.wo_a,
+                        n_groups=self.n_local_groups,
+                        heads_per_group=(
+                            self.n_local_heads // self.n_local_groups
+                        ),
+                        nope_dim=self.nope_head_dim,
+                        rope_dim=self.rope_head_dim,
+                        o_lora_rank=self.o_lora_rank,
+                        layer_idx=self.layer_idx,
+                        chunk_index=0,
+                    )
+                    return coalesce_wo_b_row_reductions(
+                        self.wo_b, row_inputs, group_rows=group_rows
+                    )
                 return torch.cat(
                     [
                         project(
@@ -599,6 +682,7 @@ class MacaDeepseekV4FlashMLAAttention(MacaDeepseekV4Attention):
                     dim=0,
                 )
             output = project(o, positions, 0)
+            assert selected_indices is not None
             for index in selected_indices.tolist():
                 output[index : index + 1] = project(
                     o[index : index + 1],

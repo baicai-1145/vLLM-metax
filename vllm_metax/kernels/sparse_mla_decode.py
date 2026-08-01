@@ -16,10 +16,12 @@ from vllm.triton_utils import tl, triton
 # their own tensors through ``workspace`` when they need explicit lifetime
 # control.
 _COMPAT_WORKSPACES: dict[tuple, tuple[torch.Tensor, ...]] = {}
+_COMPAT_DUAL_WORKSPACES: dict[tuple, tuple[torch.Tensor, ...]] = {}
 _LAST_COMPAT_WORKSPACE: tuple[torch.Tensor, ...] | None = None
 _COMPAT_CUDAGRAPHS: dict[tuple, object] = {}
 _COMPAT_CUDAGRAPH_POOL = None
 _COMPAT_CUDAGRAPH_ENV = "VLLM_METAX_SPARSE_MLA_COMPAT_CUDAGRAPH"
+_GROUPED_ROWS_ENV = "VLLM_METAX_DSV4_SPARSE_MLA_GROUPED_ROWS"
 
 
 def _gemm_fp32_out_op():
@@ -35,6 +37,26 @@ def _gemm_fp32_out_op():
     if op is None:
         raise RuntimeError(
             "native sparse MLA decode requires _metax_sparse_C.gemm_fp32_out"
+        )
+    return op
+
+
+def _gemm_fp32_strided_batched_out_op():
+    try:
+        import vllm_metax._metax_sparse_C  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "grouped sparse MLA decode requires the MetaX extension"
+        ) from exc
+    op = getattr(
+        getattr(torch.ops, "_metax_sparse_C", None),
+        "gemm_fp32_strided_batched_out",
+        None,
+    )
+    if op is None:
+        raise RuntimeError(
+            "grouped sparse MLA decode requires "
+            "_metax_sparse_C.gemm_fp32_strided_batched_out"
         )
     return op
 
@@ -253,6 +275,49 @@ def _sparse_mla_cast_kernel(src, dst, tokens, heads, d_v, stride_st, stride_sh, 
     tl.store(dst + token * stride_dt + head * stride_dh + dv * stride_dd,
              tl.load(src + token * stride_st + head * stride_sh + dv * stride_sd, mask=mask, other=0.0).to(tl.bfloat16),
              mask=mask)
+
+
+@triton.jit
+def _sparse_mla_select_rows_kernel(
+    full,
+    swa,
+    topk_lens,
+    out,
+    tokens,
+    heads,
+    d_v,
+    stride_ft,
+    stride_fh,
+    stride_fd,
+    stride_st,
+    stride_sh,
+    stride_sd,
+    stride_lt,
+    stride_ot,
+    stride_oh,
+    stride_od,
+    BLOCK_DV: tl.constexpr,
+):
+    token = tl.program_id(0)
+    head = tl.program_id(1)
+    dv = tl.arange(0, BLOCK_DV)
+    mask = (token < tokens) & (head < heads) & (dv < d_v)
+    use_full = tl.load(topk_lens + token * stride_lt, mask=token < tokens, other=0) > 0
+    full_value = tl.load(
+        full + token * stride_ft + head * stride_fh + dv * stride_fd,
+        mask=mask,
+        other=0.0,
+    )
+    swa_value = tl.load(
+        swa + token * stride_st + head * stride_sh + dv * stride_sd,
+        mask=mask,
+        other=0.0,
+    )
+    tl.store(
+        out + token * stride_ot + head * stride_oh + dv * stride_od,
+        tl.where(use_full, full_value, swa_value),
+        mask=mask,
+    )
 
 
 @triton.jit
@@ -602,7 +667,43 @@ def _compat_workspace(
     return probs, values, transposed, gemm_out, q_fp32
 
 
-def _sparse_mla_decode_compat_eager(
+def _compat_dual_workspace(
+    q: torch.Tensor,
+    tokens: int,
+    heads: int,
+    topk_width: int,
+    swa_width: int,
+    d_v: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, ...]:
+    key = (
+        q.device.type,
+        q.device.index,
+        tokens,
+        heads,
+        topk_width,
+        swa_width,
+        d_v,
+        head_dim,
+    )
+    workspace = _COMPAT_DUAL_WORKSPACES.get(key)
+    if workspace is None:
+        full_workspace = _compat_workspace(
+            q, tokens, heads, topk_width + swa_width, d_v, head_dim, None
+        )
+        swa_workspace = _compat_workspace(
+            q, tokens, heads, swa_width, d_v, head_dim, None
+        )
+        full_out = torch.empty(
+            (tokens, heads, d_v), device=q.device, dtype=torch.bfloat16
+        )
+        swa_out = torch.empty_like(full_out)
+        workspace = full_workspace + swa_workspace + (full_out, swa_out)
+        _COMPAT_DUAL_WORKSPACES[key] = workspace
+    return workspace
+
+
+def _sparse_mla_decode_compat_single(
     q: torch.Tensor,
     swa_cache: torch.Tensor,
     compressed_cache: torch.Tensor | None,
@@ -612,6 +713,7 @@ def _sparse_mla_decode_compat_eager(
     d_v: int,
     out: torch.Tensor,
     workspace: tuple[torch.Tensor, ...] | None,
+    grouped_rows: bool,
 ) -> None:
     global _LAST_COMPAT_WORKSPACE
     tokens, heads, head_dim = q.shape
@@ -655,9 +757,17 @@ def _sparse_mla_decode_compat_eager(
         q_fp32.stride(0), q_fp32.stride(1), q_fp32.stride(2),
         BLOCK_D=triton.next_power_of_2(head_dim), num_warps=4, num_stages=2,
     )
-    gemm_op = _gemm_fp32_out_op()
-    for token in range(tokens):
-        gemm_op(q_fp32[token].reshape(heads, head_dim), values[token], probs[token])
+    if grouped_rows:
+        grouped_gemm_op = _gemm_fp32_strided_batched_out_op()
+        grouped_gemm_op(q_fp32, values, probs)
+    else:
+        gemm_op = _gemm_fp32_out_op()
+        for token in range(tokens):
+            gemm_op(
+                q_fp32[token].reshape(heads, head_dim),
+                values[token],
+                probs[token],
+            )
     _sparse_mla_scale_mask_kernel[(tokens, heads)](
         probs,
         topk,
@@ -674,12 +784,110 @@ def _sparse_mla_decode_compat_eager(
     )
     _softmax_fp32_out_op()(probs.view(tokens * heads, k),
                            probs.view(tokens * heads, k))
-    for token in range(tokens):
-        gemm_op(probs[token].reshape(heads, k), transposed[token], gemm_out[token])
+    if grouped_rows:
+        grouped_gemm_op(probs, transposed, gemm_out)
+    else:
+        for token in range(tokens):
+            gemm_op(
+                probs[token].reshape(heads, k),
+                transposed[token],
+                gemm_out[token],
+            )
     _sparse_mla_cast_kernel[(tokens, heads)](
         gemm_out, out, tokens, heads, d_v, gemm_out.stride(0), gemm_out.stride(1),
         gemm_out.stride(2), out.stride(0), out.stride(1), out.stride(2),
         BLOCK_DV=triton.next_power_of_2(d_v), num_warps=4,
+    )
+
+
+def _sparse_mla_decode_compat_eager(
+    q: torch.Tensor,
+    swa_cache: torch.Tensor,
+    compressed_cache: torch.Tensor | None,
+    swa_indices: torch.Tensor,
+    topk_indices: torch.Tensor | None,
+    sm_scale: float,
+    d_v: int,
+    out: torch.Tensor,
+    workspace: tuple[torch.Tensor, ...] | None,
+    topk_lens: torch.Tensor | None = None,
+) -> None:
+    global _LAST_COMPAT_WORKSPACE
+    tokens = q.shape[0]
+    grouped_rows = os.getenv(_GROUPED_ROWS_ENV) == "1" and 1 < tokens <= 6
+    if grouped_rows and topk_indices is not None and topk_lens is not None:
+        topk_width = topk_indices.shape[2]
+        swa_width = swa_indices.shape[2]
+        dual_workspace = _compat_dual_workspace(
+            q,
+            tokens,
+            q.shape[1],
+            topk_width,
+            swa_width,
+            d_v,
+            q.shape[2],
+        )
+        full_workspace = dual_workspace[:5]
+        swa_workspace = dual_workspace[5:10]
+        full_out, swa_out = dual_workspace[10:]
+        _sparse_mla_decode_compat_single(
+            q=q,
+            swa_cache=swa_cache,
+            compressed_cache=compressed_cache,
+            swa_indices=swa_indices,
+            topk_indices=topk_indices,
+            sm_scale=sm_scale,
+            d_v=d_v,
+            out=full_out,
+            workspace=full_workspace,
+            grouped_rows=True,
+        )
+        _sparse_mla_decode_compat_single(
+            q=q,
+            swa_cache=swa_cache,
+            compressed_cache=None,
+            swa_indices=swa_indices,
+            topk_indices=None,
+            sm_scale=sm_scale,
+            d_v=d_v,
+            out=swa_out,
+            workspace=swa_workspace,
+            grouped_rows=True,
+        )
+        _sparse_mla_select_rows_kernel[(tokens, q.shape[1])](
+            full_out,
+            swa_out,
+            topk_lens,
+            out,
+            tokens,
+            q.shape[1],
+            d_v,
+            full_out.stride(0),
+            full_out.stride(1),
+            full_out.stride(2),
+            swa_out.stride(0),
+            swa_out.stride(1),
+            swa_out.stride(2),
+            topk_lens.stride(0),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            BLOCK_DV=triton.next_power_of_2(d_v),
+            num_warps=4,
+        )
+        _LAST_COMPAT_WORKSPACE = dual_workspace
+        return
+    _sparse_mla_decode_compat_single(
+        q=q,
+        swa_cache=swa_cache,
+        compressed_cache=compressed_cache,
+        swa_indices=swa_indices,
+        topk_indices=topk_indices,
+        sm_scale=sm_scale,
+        d_v=d_v,
+        out=out,
+        workspace=workspace,
+        grouped_rows=grouped_rows,
     )
 
 
@@ -718,6 +926,7 @@ def _compat_cudagraph_key(
     compressed_cache: torch.Tensor | None,
     swa_indices: torch.Tensor,
     topk_indices: torch.Tensor | None,
+    topk_lens: torch.Tensor | None,
     out: torch.Tensor,
     workspace: tuple[torch.Tensor, ...],
     sm_scale: float,
@@ -731,6 +940,7 @@ def _compat_cudagraph_key(
         _compat_tensor_key(compressed_cache),
         _compat_tensor_key(swa_indices),
         _compat_tensor_key(topk_indices),
+        _compat_tensor_key(topk_lens),
         _compat_tensor_key(out),
         tuple(_compat_tensor_key(tensor) for tensor in workspace),
         float(sm_scale),
@@ -757,6 +967,7 @@ def _sparse_mla_decode_compat(
     d_v: int,
     out: torch.Tensor,
     workspace: tuple[torch.Tensor, ...] | None,
+    topk_lens: torch.Tensor | None = None,
 ) -> None:
     if topk_indices is not None:
         if compressed_cache is None:
@@ -770,6 +981,7 @@ def _sparse_mla_decode_compat(
             compressed_cache=compressed_cache,
             swa_indices=swa_indices,
             topk_indices=topk_indices,
+            topk_lens=topk_lens,
             sm_scale=sm_scale,
             d_v=d_v,
             out=out,
@@ -790,21 +1002,28 @@ def _sparse_mla_decode_compat(
     tokens, heads, head_dim = q.shape
     swa_width = swa_indices.shape[2]
     topk_width = topk_indices.shape[2] if topk_indices is not None else 0
-    resolved_workspace = _compat_workspace(
-        q,
-        tokens,
-        heads,
-        topk_width + swa_width,
-        d_v,
-        head_dim,
-        workspace,
-    )
+    grouped_rows = os.getenv(_GROUPED_ROWS_ENV) == "1" and 1 < tokens <= 6
+    if grouped_rows and topk_indices is not None and topk_lens is not None:
+        resolved_workspace = _compat_dual_workspace(
+            q, tokens, heads, topk_width, swa_width, d_v, head_dim
+        )
+    else:
+        resolved_workspace = _compat_workspace(
+            q,
+            tokens,
+            heads,
+            topk_width + swa_width,
+            d_v,
+            head_dim,
+            workspace,
+        )
     key = _compat_cudagraph_key(
         q,
         swa_cache,
         compressed_cache,
         swa_indices,
         topk_indices,
+        topk_lens,
         out,
         resolved_workspace,
         sm_scale,
@@ -823,6 +1042,7 @@ def _sparse_mla_decode_compat(
         compressed_cache=compressed_cache,
         swa_indices=swa_indices,
         topk_indices=topk_indices,
+        topk_lens=topk_lens,
         sm_scale=sm_scale,
         d_v=d_v,
         out=out,
@@ -838,6 +1058,7 @@ def _sparse_mla_decode_compat(
             compressed_cache=compressed_cache,
             swa_indices=swa_indices,
             topk_indices=topk_indices,
+            topk_lens=topk_lens,
             sm_scale=sm_scale,
             d_v=d_v,
             out=out,
@@ -910,6 +1131,13 @@ def sparse_mla_decode(
         raise ValueError("token_to_req must be int32 [tokens] on q's device")
     if swa_indices.shape[0] != tokens or swa_lens.numel() != tokens:
         raise ValueError("SWA metadata token dimensions do not match q")
+    if topk_lens is not None and (
+        topk_lens.ndim != 1
+        or topk_lens.numel() != tokens
+        or topk_lens.dtype != torch.int32
+        or topk_lens.device != q.device
+    ):
+        raise ValueError("topk_lens must be int32 [tokens] on q's device")
     if swa_block_size <= 0 or d_v <= 0 or d_v > 512 or d_v > head_dim:
         raise ValueError("invalid block size or value dimension")
     if swa_cache.device != q.device or swa_indices.device != q.device or swa_lens.device != q.device:
@@ -924,6 +1152,8 @@ def sparse_mla_decode(
         if topk_indices is not None:
             if compressed_cache is None:
                 raise ValueError("topk_indices require compressed_cache")
+            if topk_lens is None:
+                raise ValueError("topk_indices require topk_lens")
             if compressed_cache.dtype != torch.bfloat16 or compressed_cache.device != q.device:
                 raise ValueError("compressed_cache must be BF16 on q's device")
         _sparse_mla_decode_compat(
@@ -932,6 +1162,7 @@ def sparse_mla_decode(
             compressed_cache=compressed_cache,
             swa_indices=swa_indices,
             topk_indices=topk_indices,
+            topk_lens=topk_lens,
             sm_scale=sm_scale,
             d_v=d_v,
             out=out,

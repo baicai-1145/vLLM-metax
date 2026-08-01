@@ -13,6 +13,7 @@ import torch
 from vllm.triton_utils import tl, triton
 
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops.save_partial_states import (
     save_partial_states,
 )
@@ -32,6 +33,10 @@ _COMPRESSOR_CAPTURE_LOCK = threading.Lock()
 _COMPRESSOR_CAPTURE_STATE_ONLY_ENV = (
     "VLLM_METAX_DSV4_COMPRESSOR_CAPTURE_STATE_ONLY"
 )
+_FUSED_SAVE_PARTIAL_STATES_ENV = (
+    "VLLM_METAX_DSV4_COMPRESSOR_FUSED_SAVE_PARTIAL_STATES"
+)
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -449,7 +454,9 @@ class MacaDeepseekCompressor(DeepseekCompressor):
                 pdl_kwargs=pdl_kwargs,
             )
 
-        def compress_rows(token_slice: slice) -> None:
+        def compress_rows(
+            token_slice: slice, *, fuse_save_partial_states: bool = False
+        ) -> None:
             sliced_k_cache_metadata = SimpleNamespace(
                 slot_mapping=k_cache_metadata.slot_mapping[token_slice],
             )
@@ -497,6 +504,10 @@ class MacaDeepseekCompressor(DeepseekCompressor):
                 initial_overlap_boundary=getattr(
                     self, "_initial_overlap_boundary", None
                 ),
+                kv=kv[token_slice] if fuse_save_partial_states else None,
+                score=score[token_slice] if fuse_save_partial_states else None,
+                ape=self.ape if fuse_save_partial_states else None,
+                fuse_save_partial_states=fuse_save_partial_states,
             )
             if capture is not None:
                 capture.finish()
@@ -505,6 +516,14 @@ class MacaDeepseekCompressor(DeepseekCompressor):
             os.getenv("VLLM_METAX_DSV4_TOKENWISE_COMPRESSOR") == "1"
             and 1 < num_actual <= 6
         ):
+            fuse_save_partial_states = (
+                os.getenv(_FUSED_SAVE_PARTIAL_STATES_ENV) == "1"
+            )
+            if fuse_save_partial_states:
+                logger.warning_once(
+                    "DeepSeek V4 tokenwise compressor fuses partial-state save "
+                    "into the native compress kernel"
+                )
             min_position = getattr(self, "_tokenwise_min_position", None)
             for index in range(num_actual):
                 # The compressor is called only from attention_impl's
@@ -516,8 +535,12 @@ class MacaDeepseekCompressor(DeepseekCompressor):
                 ):
                     continue
                 token_slice = slice(index, index + 1)
-                save_rows(token_slice)
-                compress_rows(token_slice)
+                if not fuse_save_partial_states:
+                    save_rows(token_slice)
+                compress_rows(
+                    token_slice,
+                    fuse_save_partial_states=fuse_save_partial_states,
+                )
         else:
             save_rows(slice(0, num_actual))
             compress_rows(slice(0, num_actual))

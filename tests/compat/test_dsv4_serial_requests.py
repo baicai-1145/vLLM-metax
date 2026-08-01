@@ -85,6 +85,22 @@ def test_serial_requests_allow_k4_single_request_graphs(monkeypatch):
     assert config.compilation_config.max_cudagraph_capture_size == 5
 
 
+def test_serial_requests_allow_dspark_k5_verifier_graph(monkeypatch):
+    from vllm_metax.platform import _enforce_dsv4_serial_requests
+
+    monkeypatch.delenv("VLLM_METAX_DSV4_ALLOW_UNSAFE_BATCHING", raising=False)
+    config = _config(
+        "DeepseekV4ForCausalLM",
+        speculative_tokens=5,
+        speculative_method="dspark",
+    )
+
+    assert _enforce_dsv4_serial_requests(config)
+    assert config.scheduler_config.max_num_seqs == 1
+    assert config.compilation_config.cudagraph_capture_sizes == [1, 6]
+    assert config.compilation_config.max_cudagraph_capture_size == 6
+
+
 @pytest.mark.parametrize(
     ("speculative_tokens", "speculative_method"),
     [(5, "mtp"), (4, "unknown")],

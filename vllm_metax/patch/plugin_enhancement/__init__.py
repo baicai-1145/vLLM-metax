@@ -13,5 +13,6 @@ from . import quant_kernels  # noqa: F401
 from . import worker_affinity  # noqa: F401
 
 # single files
+from . import batch_invariant_fix  # noqa: F401
 from . import device_allocator  # noqa: F401
 from . import utils  # noqa: F401

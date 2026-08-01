@@ -11,6 +11,7 @@ import vllm_metax.models.deepseek_v4.flashmla as flashmla
 from vllm_metax.kernels.sparse_mla_decode import (
     _sparse_mla_scale_mask_kernel,
     sparse_mla_decode,
+    sparse_mla_decode_compat_workspace,
 )
 from vllm_metax.models.deepseek_v4.flashmla import (
     MacaDeepseekV4FlashMLAAttention,
@@ -545,6 +546,246 @@ def test_native_sparse_decode_compat_matches_torch_fixed_softmax() -> None:
     assert returned is actual
     assert actual.dtype == torch.bfloat16
     torch.testing.assert_close(actual, expected, atol=1e-3, rtol=0)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="native sparse MLA decode requires a MetaX CUDA-compatible device",
+)
+@pytest.mark.parametrize("use_topk", [False, True])
+@pytest.mark.parametrize("seed", [163, 167, 173])
+def test_grouped_sparse_decode_matches_six_serial_production_rows(
+    monkeypatch, use_topk: bool, seed: int
+) -> None:
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(seed)
+    tokens, heads, head_dim, width = 6, 64, 512, 128
+    num_blocks, block_size = 8, 64
+    q = torch.randn(
+        (tokens, heads, head_dim),
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    swa_cache = torch.randn(
+        (num_blocks, block_size, 1, head_dim),
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    compressed_cache = torch.randn_like(swa_cache)
+    swa_indices = torch.randint(
+        0,
+        num_blocks * block_size,
+        (tokens, 1, width),
+        generator=generator,
+        device=device,
+        dtype=torch.int32,
+    )
+    topk_indices = torch.randint(
+        0,
+        num_blocks * block_size,
+        (tokens, 1, width),
+        generator=generator,
+        device=device,
+        dtype=torch.int32,
+    )
+    lens = torch.full((tokens,), width, device=device, dtype=torch.int32)
+    block_table = torch.zeros(
+        (tokens, num_blocks), device=device, dtype=torch.int32
+    )
+    expected = torch.empty_like(q)
+    actual = torch.empty_like(q)
+    common = {
+        "swa_cache": swa_cache,
+        "compressed_cache": compressed_cache if use_topk else None,
+        "swa_block_size": block_size,
+        "compressed_block_size": block_size,
+        "sm_scale": head_dim**-0.5,
+        "d_v": head_dim,
+        "compatibility_mode": True,
+    }
+
+    monkeypatch.delenv(
+        "VLLM_METAX_DSV4_SPARSE_MLA_GROUPED_ROWS", raising=False
+    )
+    for token in range(tokens):
+        sparse_mla_decode(
+            q=q[token : token + 1],
+            swa_indices=swa_indices[token : token + 1],
+            topk_indices=(
+                topk_indices[token : token + 1] if use_topk else None
+            ),
+            swa_lens=lens[token : token + 1],
+            topk_lens=lens[token : token + 1] if use_topk else None,
+            swa_block_table=block_table[token : token + 1],
+            compressed_block_table=block_table[token : token + 1],
+            out=expected[token : token + 1],
+            **common,
+        )
+
+    monkeypatch.setenv("VLLM_METAX_DSV4_SPARSE_MLA_GROUPED_ROWS", "1")
+    actual.fill_(float("nan"))
+    sparse_mla_decode(
+        q=q,
+        swa_indices=swa_indices,
+        topk_indices=topk_indices if use_topk else None,
+        swa_lens=lens,
+        topk_lens=lens if use_topk else None,
+        swa_block_table=block_table,
+        compressed_block_table=block_table,
+        out=actual,
+        **common,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(actual).all()
+    assert torch.equal(actual, expected)
+    output_ptr = actual.data_ptr()
+    workspace_ptrs = tuple(
+        tensor.data_ptr() for tensor in sparse_mla_decode_compat_workspace()
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        sparse_mla_decode(
+            q=q,
+            swa_indices=swa_indices,
+            topk_indices=topk_indices if use_topk else None,
+            swa_lens=lens,
+            topk_lens=lens if use_topk else None,
+            swa_block_table=block_table,
+            compressed_block_table=block_table,
+            out=actual,
+            **common,
+        )
+    for _ in range(5):
+        graph.replay()
+        torch.cuda.synchronize()
+        assert actual.data_ptr() == output_ptr
+        assert tuple(
+            tensor.data_ptr() for tensor in sparse_mla_decode_compat_workspace()
+        ) == workspace_ptrs
+        assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="native sparse MLA decode requires a MetaX CUDA-compatible device",
+)
+@pytest.mark.parametrize("seed", [163, 167, 173])
+def test_grouped_sparse_decode_mixed_topk_matches_six_serial_production_rows(
+    monkeypatch, seed: int
+) -> None:
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(seed)
+    tokens, heads, head_dim, width = 6, 64, 512, 128
+    num_blocks, block_size = 8, 64
+    q = torch.randn(
+        (tokens, heads, head_dim),
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    swa_cache = torch.randn(
+        (num_blocks, block_size, 1, head_dim),
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    compressed_cache = torch.randn_like(swa_cache)
+    swa_indices = torch.randint(
+        0,
+        num_blocks * block_size,
+        (tokens, 1, width),
+        generator=generator,
+        device=device,
+        dtype=torch.int32,
+    )
+    topk_indices = torch.randint(
+        0,
+        num_blocks * block_size,
+        (tokens, 1, width),
+        generator=generator,
+        device=device,
+        dtype=torch.int32,
+    )
+    topk_lens = torch.tensor(
+        [0, width, 0, width, 0, width], device=device, dtype=torch.int32
+    )
+    topk_indices[::2].fill_(-1)
+    swa_lens = torch.full((tokens,), width, device=device, dtype=torch.int32)
+    block_table = torch.zeros(
+        (tokens, num_blocks), device=device, dtype=torch.int32
+    )
+    common = {
+        "swa_cache": swa_cache,
+        "compressed_cache": compressed_cache,
+        "swa_block_size": block_size,
+        "compressed_block_size": block_size,
+        "sm_scale": head_dim**-0.5,
+        "d_v": head_dim,
+        "compatibility_mode": True,
+    }
+
+    monkeypatch.delenv(
+        "VLLM_METAX_DSV4_SPARSE_MLA_GROUPED_ROWS", raising=False
+    )
+    expected = torch.empty_like(q)
+    for token in range(tokens):
+        sparse_mla_decode(
+            q=q[token : token + 1],
+            swa_indices=swa_indices[token : token + 1],
+            topk_indices=(topk_indices[token : token + 1] if token % 2 else None),
+            swa_lens=swa_lens[token : token + 1],
+            topk_lens=(topk_lens[token : token + 1] if token % 2 else None),
+            swa_block_table=block_table[token : token + 1],
+            compressed_block_table=block_table[token : token + 1],
+            out=expected[token : token + 1],
+            **common,
+        )
+
+    monkeypatch.setenv("VLLM_METAX_DSV4_SPARSE_MLA_GROUPED_ROWS", "1")
+    actual = torch.empty_like(q)
+    actual.fill_(float("nan"))
+    sparse_mla_decode(
+        q=q,
+        swa_indices=swa_indices,
+        topk_indices=topk_indices,
+        swa_lens=swa_lens,
+        topk_lens=topk_lens,
+        swa_block_table=block_table,
+        compressed_block_table=block_table,
+        out=actual,
+        **common,
+    )
+    torch.cuda.synchronize()
+    assert torch.isfinite(actual).all()
+    assert torch.equal(actual, expected)
+    output_ptr = actual.data_ptr()
+    workspace = sparse_mla_decode_compat_workspace()
+    assert workspace is not None
+    workspace_ptrs = tuple(tensor.data_ptr() for tensor in workspace)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        sparse_mla_decode(
+            q=q,
+            swa_indices=swa_indices,
+            topk_indices=topk_indices,
+            topk_lens=topk_lens,
+            swa_lens=swa_lens,
+            swa_block_table=block_table,
+            compressed_block_table=block_table,
+            out=actual,
+            **common,
+        )
+    for _ in range(5):
+        graph.replay()
+        torch.cuda.synchronize()
+        assert actual.data_ptr() == output_ptr
+        replay_workspace = sparse_mla_decode_compat_workspace()
+        assert replay_workspace is not None
+        assert tuple(tensor.data_ptr() for tensor in replay_workspace) == workspace_ptrs
+        assert torch.equal(actual, expected)
 
 
 def test_swa_metadata_short_context_uses_host_max_seq_len() -> None:

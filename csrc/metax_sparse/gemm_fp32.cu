@@ -9,6 +9,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 #include <cublas_v2.h>
+#include <cuda_bf16.h>
 
 #include "../cub_helpers.h"
 
@@ -17,7 +18,7 @@
 
 namespace metax_sparse {
 
-constexpr int kMhcMaxBatchedTokens = 5;
+constexpr int kMhcMaxBatchedTokens = 6;
 
 template <int TPB>
 __launch_bounds__(TPB) __global__ void row_softmax_fp32_kernel(
@@ -766,7 +767,7 @@ void mhc_downstream_rms_out(
       (batched_shape || legacy_shape) &&
           residual.numel() / 16384 <= kMhcMaxBatchedTokens,
       "mhc_downstream_rms_out: expected contiguous decode tensors with "
-      "1 <= N <= 5");
+      "1 <= N <= 6");
   TORCH_CHECK(repeat == 20,
               "mhc_downstream_rms_out: repeat must be 20");
   c10::cuda::CUDAGuard const device_guard(residual.device());
@@ -830,6 +831,329 @@ void mhc_gemv_fp32_out(torch::Tensor const& input, torch::Tensor const& weight,
   auto input_view = input.view({1, 16384});
   auto weight_t = weight.transpose(0, 1);
   at::mm_out(out_view, input_view, weight_t);
+}
+
+void mhc_gemv_fp32_grouped_out(torch::Tensor const& input,
+                               torch::Tensor const& weight,
+                               torch::Tensor& out) {
+  TORCH_CHECK(input.is_cuda() && weight.is_cuda() && out.is_cuda(),
+              "mhc_gemv_fp32_grouped_out: tensors must be CUDA");
+  TORCH_CHECK(input.device() == weight.device() && input.device() == out.device(),
+              "mhc_gemv_fp32_grouped_out: device mismatch");
+  TORCH_CHECK(input.scalar_type() == torch::kFloat32 &&
+                  weight.scalar_type() == torch::kFloat32 &&
+                  out.scalar_type() == torch::kFloat32,
+              "mhc_gemv_fp32_grouped_out: tensors must be float32");
+  TORCH_CHECK(input.is_contiguous() && weight.is_contiguous() &&
+                  out.is_contiguous(),
+              "mhc_gemv_fp32_grouped_out: tensors must be contiguous");
+  int64_t const rows = input.dim() == 2 ? input.size(0) : -1;
+  TORCH_CHECK(rows >= 2 && rows <= 6 && input.size(1) == 16384 &&
+                  weight.dim() == 2 && weight.size(0) == 24 &&
+                  weight.size(1) == 16384 && out.numel() == rows * 24,
+              "mhc_gemv_fp32_grouped_out: expected input [N,16384], "
+              "weight [24,16384], and contiguous out with 2 <= N <= 6");
+  TORCH_CHECK(!input.is_alias_of(weight) && !input.is_alias_of(out) &&
+                  !weight.is_alias_of(out),
+              "mhc_gemv_fp32_grouped_out: tensors must not alias");
+
+  c10::cuda::CUDAGuard const device_guard(input.device());
+  cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+  TORCH_CUDABLAS_CHECK(
+      cublasSetStream(handle, at::cuda::getCurrentCUDAStream()));
+  float const alpha = 1.0f;
+  float const beta = 0.0f;
+  constexpr int k = 16384;
+  constexpr int output_width = 24;
+  TORCH_CUDABLAS_CHECK(cublasSgemvStridedBatched(
+      handle, CUBLAS_OP_T, k, output_width, &alpha,
+      weight.data_ptr<float>(), k, 0, input.data_ptr<float>(), 1, k, &beta,
+      out.data_ptr<float>(), 1, output_width, static_cast<int>(rows)));
+}
+
+void gemv_bf16_serial_rows_out(torch::Tensor const& input,
+                               torch::Tensor const& weight,
+                               torch::Tensor& out) {
+  TORCH_CHECK(input.is_cuda() && weight.is_cuda() && out.is_cuda(),
+              "gemv_bf16_serial_rows_out: tensors must be CUDA");
+  TORCH_CHECK(input.device() == weight.device() && input.device() == out.device(),
+              "gemv_bf16_serial_rows_out: device mismatch");
+  TORCH_CHECK(input.scalar_type() == torch::kBFloat16 &&
+                  weight.scalar_type() == torch::kBFloat16 &&
+                  out.scalar_type() == torch::kBFloat16,
+              "gemv_bf16_serial_rows_out: tensors must be bfloat16");
+  TORCH_CHECK(input.dim() == 2 && weight.dim() == 2 && out.dim() == 2,
+              "gemv_bf16_serial_rows_out: tensors must be 2-D");
+  TORCH_CHECK(input.is_contiguous() && weight.is_contiguous() &&
+                  out.is_contiguous(),
+              "gemv_bf16_serial_rows_out: tensors must be contiguous");
+
+  int64_t const rows = input.size(0);
+  int64_t const k = input.size(1);
+  int64_t const n = weight.size(0);
+  TORCH_CHECK(rows >= 1 && rows <= 6 && weight.size(1) == k &&
+                  out.size(0) == rows && out.size(1) == n,
+              "gemv_bf16_serial_rows_out: expected input [B,K], weight "
+              "[N,K], out [B,N], and 1 <= B <= 6");
+  TORCH_CHECK(!input.is_alias_of(weight) && !input.is_alias_of(out) &&
+                  !weight.is_alias_of(out),
+              "gemv_bf16_serial_rows_out: tensors must not alias");
+
+  c10::cuda::CUDAGuard const device_guard(input.device());
+  cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+  TORCH_CUDABLAS_CHECK(
+      cublasSetStream(handle, at::cuda::getCurrentCUDAStream()));
+
+  float const alpha = 1.0f;
+  float const beta = 0.0f;
+  for (int64_t row = 0; row < rows; ++row) {
+    TORCH_CUDABLAS_CHECK(cublasGemmEx(
+        handle, CUBLAS_OP_T, CUBLAS_OP_N, static_cast<int>(n), 1,
+        static_cast<int>(k), &alpha, weight.data_ptr(),
+        CUDA_R_16BF, static_cast<int>(k),
+        input.data_ptr<c10::BFloat16>() + row * k, CUDA_R_16BF,
+        static_cast<int>(k), &beta, out.data_ptr<c10::BFloat16>() + row * n,
+        CUDA_R_16BF, static_cast<int>(n), CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT));
+  }
+}
+
+typedef __NATIVE_VECTOR__(2, float) GemvFloat2;
+
+struct alignas(16) GemvBf16x8 {
+  __nv_bfloat16 values[8];
+};
+
+__device__ __forceinline__ float gemv_read_lane(float value, int lane) {
+  union {
+    float f;
+    unsigned int u;
+  } bits{value};
+  bits.u = __builtin_mxc_readlane(bits.u, lane);
+  return bits.f;
+}
+
+template <int Delta>
+__device__ __forceinline__ float gemv_mov_shfl_down(float value) {
+  union {
+    float f;
+    int i;
+  } bits{value};
+  bits.i = __builtin_mxc_mov_shfl(bits.i, 0x100 + Delta, 0xf, 0xf, false);
+  return bits.f;
+}
+
+__launch_bounds__(512) __global__ void gemv_bf16_exact_grouped_rows_kernel(
+    __nv_bfloat16 const* input, __nv_bfloat16 const* weight,
+    __nv_bfloat16* out, int rows, int n, int k) {
+  int const row = blockIdx.y;
+  int const lane = threadIdx.x & 63;
+  int const wave = threadIdx.x >> 6;
+  int const output = blockIdx.x * 16 + wave * 2;
+  if (row >= rows || output >= n) {
+    return;
+  }
+
+  GemvFloat2 accum0 = {0.0f, 0.0f};
+  GemvFloat2 accum1 = {0.0f, 0.0f};
+  int const vector_count = k / 8;
+  for (int vector_index = vector_count - 64 + lane; vector_index >= lane;
+       vector_index -= 64) {
+    auto const input_values = *reinterpret_cast<GemvBf16x8 const*>(
+        input + static_cast<int64_t>(row) * k + vector_index * 8);
+    auto const weight0_values = *reinterpret_cast<GemvBf16x8 const*>(
+        weight + static_cast<int64_t>(output) * k + vector_index * 8);
+    auto const weight1_values = *reinterpret_cast<GemvBf16x8 const*>(
+        weight + static_cast<int64_t>(output + 1) * k + vector_index * 8);
+#pragma unroll
+    for (int element = 0; element < 8; element += 2) {
+      GemvFloat2 const input_pair = {
+          __bfloat162float(input_values.values[element]),
+          __bfloat162float(input_values.values[element + 1])};
+      GemvFloat2 const weight0_pair = {
+          __bfloat162float(weight0_values.values[element]),
+          __bfloat162float(weight0_values.values[element + 1])};
+      GemvFloat2 const weight1_pair = {
+          __bfloat162float(weight1_values.values[element]),
+          __bfloat162float(weight1_values.values[element + 1])};
+      accum0 = __builtin_mxc_pk_fma_f32(weight0_pair, input_pair, accum0);
+      accum1 = __builtin_mxc_pk_fma_f32(weight1_pair, input_pair, accum1);
+    }
+  }
+
+  float sum0 = accum0[0] + accum0[1];
+  float sum1 = accum1[0] + accum1[1];
+  sum0 += gemv_mov_shfl_down<8>(sum0);
+  sum0 += gemv_mov_shfl_down<4>(sum0);
+  sum0 += gemv_mov_shfl_down<2>(sum0);
+  sum0 += gemv_mov_shfl_down<1>(sum0);
+  sum1 += gemv_mov_shfl_down<8>(sum1);
+  sum1 += gemv_mov_shfl_down<4>(sum1);
+  sum1 += gemv_mov_shfl_down<2>(sum1);
+  sum1 += gemv_mov_shfl_down<1>(sum1);
+
+  float const other0 =
+      (gemv_read_lane(sum0, 48) + gemv_read_lane(sum0, 32)) +
+      gemv_read_lane(sum0, 16);
+  float const other1 =
+      (gemv_read_lane(sum1, 48) + gemv_read_lane(sum1, 32)) +
+      gemv_read_lane(sum1, 16);
+  if (lane == 0) {
+    int64_t const out_offset = static_cast<int64_t>(row) * n + output;
+    out[out_offset] = __float2bfloat16(sum0 + other0);
+    out[out_offset + 1] = __float2bfloat16(sum1 + other1);
+  }
+}
+
+void gemv_bf16_exact_grouped_rows_out(torch::Tensor const& input,
+                                       torch::Tensor const& weight,
+                                       torch::Tensor& out) {
+  TORCH_CHECK(input.is_cuda() && weight.is_cuda() && out.is_cuda(),
+              "gemv_bf16_exact_grouped_rows_out: tensors must be CUDA");
+  TORCH_CHECK(input.device() == weight.device() && input.device() == out.device(),
+              "gemv_bf16_exact_grouped_rows_out: device mismatch");
+  TORCH_CHECK(input.scalar_type() == torch::kBFloat16 &&
+                  weight.scalar_type() == torch::kBFloat16 &&
+                  out.scalar_type() == torch::kBFloat16,
+              "gemv_bf16_exact_grouped_rows_out: tensors must be bfloat16");
+  TORCH_CHECK(input.dim() == 2 && weight.dim() == 2 && out.dim() == 2 &&
+                  input.is_contiguous() && weight.is_contiguous() &&
+                  out.is_contiguous(),
+              "gemv_bf16_exact_grouped_rows_out: contiguous 2-D tensors required");
+
+  int64_t const rows = input.size(0);
+  int64_t const k = input.size(1);
+  int64_t const n = weight.size(0);
+  bool const wq_b_shape = k == 1024 && n == 8192;
+  bool const o_proj_shape = k == 2048 && n == 4096;
+  TORCH_CHECK(rows >= 1 && rows <= 6 && weight.size(1) == k &&
+                  out.size(0) == rows && out.size(1) == n &&
+                  (wq_b_shape || o_proj_shape),
+              "gemv_bf16_exact_grouped_rows_out: expected input [B,K], weight "
+              "[N,K], out [B,N], 1 <= B <= 6, and one of K=1024,N=8192, "
+              "or K=2048,N=4096");
+  TORCH_CHECK(!input.is_alias_of(weight) && !input.is_alias_of(out) &&
+                  !weight.is_alias_of(out),
+              "gemv_bf16_exact_grouped_rows_out: tensors must not alias");
+
+  c10::cuda::CUDAGuard const device_guard(input.device());
+  if (o_proj_shape) {
+    auto const weight_t = weight.transpose(0, 1);
+    for (int64_t row = 0; row < rows; ++row) {
+      auto input_row = input.narrow(0, row, 1);
+      auto out_row = out.narrow(0, row, 1);
+      at::mm_out(out_row, input_row, weight_t);
+    }
+    return;
+  }
+
+  cudaStream_t const stream = at::cuda::getCurrentCUDAStream();
+  dim3 const grid(static_cast<unsigned>(n / 16),
+                  static_cast<unsigned>(rows));
+  gemv_bf16_exact_grouped_rows_kernel<<<grid, 512, 0, stream>>>(
+      reinterpret_cast<__nv_bfloat16 const*>(input.data_ptr<c10::BFloat16>()),
+      reinterpret_cast<__nv_bfloat16 const*>(weight.data_ptr<c10::BFloat16>()),
+      reinterpret_cast<__nv_bfloat16*>(out.data_ptr<c10::BFloat16>()),
+      static_cast<int>(rows), static_cast<int>(n), static_cast<int>(k));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void gemv_bf16_exact_oproj_grouped_rows_out(torch::Tensor const& input,
+                                            torch::Tensor const& weight,
+                                            torch::Tensor& out) {
+  TORCH_CHECK(input.dim() == 2 && weight.dim() == 2 && out.dim() == 2 &&
+                  input.size(1) == 2048 && weight.size(0) == 4096 &&
+                  weight.size(1) == 2048 && out.size(0) == input.size(0) &&
+                  out.size(1) == 4096,
+              "gemv_bf16_exact_oproj_grouped_rows_out: expected input "
+              "[B,2048], weight [4096,2048], and out [B,4096]");
+  gemv_bf16_exact_grouped_rows_out(input, weight, out);
+}
+
+void gemv_bf16_exact_oproj_row_list_out(c10::List<torch::Tensor> const& inputs,
+                                        torch::Tensor const& weight,
+                                        torch::Tensor& out) {
+  int64_t const rows = inputs.size();
+  TORCH_CHECK(weight.is_cuda() && out.is_cuda(),
+              "gemv_bf16_exact_oproj_row_list_out: tensors must be CUDA");
+  TORCH_CHECK(weight.scalar_type() == torch::kBFloat16 &&
+                  out.scalar_type() == torch::kBFloat16,
+              "gemv_bf16_exact_oproj_row_list_out: tensors must be bfloat16");
+  TORCH_CHECK(rows >= 1 && rows <= 6 && weight.dim() == 2 &&
+                  weight.size(0) == 4096 && weight.size(1) == 2048 &&
+                  weight.is_contiguous() && out.dim() == 2 &&
+                  out.size(0) == rows && out.size(1) == 4096 &&
+                  out.is_contiguous(),
+              "gemv_bf16_exact_oproj_row_list_out: expected 1 <= rows <= 6, "
+              "weight [4096,2048], and out [rows,4096]");
+  TORCH_CHECK(!weight.is_alias_of(out),
+              "gemv_bf16_exact_oproj_row_list_out: tensors must not alias");
+
+  c10::cuda::CUDAGuard const device_guard(weight.device());
+  auto const weight_t = weight.transpose(0, 1);
+  for (int64_t row = 0; row < rows; ++row) {
+    torch::Tensor const input = inputs.get(row);
+    TORCH_CHECK(input.is_cuda() && input.device() == weight.device() &&
+                    out.device() == weight.device(),
+                "gemv_bf16_exact_oproj_row_list_out: device mismatch");
+    TORCH_CHECK(input.scalar_type() == torch::kBFloat16 && input.dim() == 2 &&
+                    input.size(0) == 1 && input.size(1) == 2048 &&
+                    input.is_contiguous(),
+                "gemv_bf16_exact_oproj_row_list_out: expected each input "
+                "row to be contiguous BF16 [1,2048]");
+    TORCH_CHECK(!input.is_alias_of(weight) && !input.is_alias_of(out),
+                "gemv_bf16_exact_oproj_row_list_out: tensors must not alias");
+    auto out_row = out.narrow(0, row, 1);
+    at::mm_out(out_row, input, weight_t);
+  }
+}
+
+void gemv_bf16_fp32_serial_rows_out(torch::Tensor const& input,
+                                    torch::Tensor const& weight,
+                                    torch::Tensor& out) {
+  TORCH_CHECK(input.is_cuda() && weight.is_cuda() && out.is_cuda(),
+              "gemv_bf16_fp32_serial_rows_out: tensors must be CUDA");
+  TORCH_CHECK(input.device() == weight.device() && input.device() == out.device(),
+              "gemv_bf16_fp32_serial_rows_out: device mismatch");
+  TORCH_CHECK(input.scalar_type() == torch::kBFloat16 &&
+                  weight.scalar_type() == torch::kBFloat16 &&
+                  out.scalar_type() == torch::kFloat32,
+              "gemv_bf16_fp32_serial_rows_out: input and weight must be "
+              "bfloat16 and out must be float32");
+  TORCH_CHECK(input.dim() == 2 && weight.dim() == 2 && out.dim() == 2,
+              "gemv_bf16_fp32_serial_rows_out: tensors must be 2-D");
+  TORCH_CHECK(input.is_contiguous() && weight.is_contiguous() &&
+                  out.is_contiguous(),
+              "gemv_bf16_fp32_serial_rows_out: tensors must be contiguous");
+
+  int64_t const rows = input.size(0);
+  int64_t const k = input.size(1);
+  int64_t const n = weight.size(0);
+  TORCH_CHECK(rows >= 1 && rows <= 6 && weight.size(1) == k &&
+                  out.size(0) == rows && out.size(1) == n,
+              "gemv_bf16_fp32_serial_rows_out: expected input [B,K], weight "
+              "[N,K], out [B,N], and 1 <= B <= 6");
+  TORCH_CHECK(!input.is_alias_of(weight) && !input.is_alias_of(out) &&
+                  !weight.is_alias_of(out),
+              "gemv_bf16_fp32_serial_rows_out: tensors must not alias");
+
+  c10::cuda::CUDAGuard const device_guard(input.device());
+  cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+  TORCH_CUDABLAS_CHECK(
+      cublasSetStream(handle, at::cuda::getCurrentCUDAStream()));
+
+  float const alpha = 1.0f;
+  float const beta = 0.0f;
+  for (int64_t row = 0; row < rows; ++row) {
+    TORCH_CUDABLAS_CHECK(cublasGemmEx(
+        handle, CUBLAS_OP_T, CUBLAS_OP_N, static_cast<int>(n), 1,
+        static_cast<int>(k), &alpha, weight.data_ptr(),
+        CUDA_R_16BF, static_cast<int>(k),
+        input.data_ptr<c10::BFloat16>() + row * k, CUDA_R_16BF,
+        static_cast<int>(k), &beta, out.data_ptr<float>() + row * n,
+        CUDA_R_32F, static_cast<int>(n), CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT));
+  }
 }
 
 void gemm_bf16_fp32_out(torch::Tensor const& a, torch::Tensor const& b,
@@ -923,6 +1247,53 @@ void gemm_fp32_out(torch::Tensor const& a, torch::Tensor const& b,
       CUDA_R_32F, static_cast<int>(K), a.data_ptr(), CUDA_R_32F,
       static_cast<int>(K), &beta, out.data_ptr(), CUDA_R_32F,
       static_cast<int>(N), CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+}
+
+void gemm_fp32_strided_batched_out(torch::Tensor const& a,
+                                   torch::Tensor const& b,
+                                   torch::Tensor& out) {
+  TORCH_CHECK(a.is_cuda() && b.is_cuda() && out.is_cuda(),
+              "gemm_fp32_strided_batched_out: tensors must be CUDA");
+  TORCH_CHECK(a.device() == b.device() && a.device() == out.device(),
+              "gemm_fp32_strided_batched_out: device mismatch");
+  TORCH_CHECK(a.scalar_type() == torch::kFloat32 &&
+                  b.scalar_type() == torch::kFloat32 &&
+                  out.scalar_type() == torch::kFloat32,
+              "gemm_fp32_strided_batched_out: tensors must be float32");
+  TORCH_CHECK(a.dim() == 3 && b.dim() == 3 && out.dim() == 3,
+              "gemm_fp32_strided_batched_out: tensors must be 3-D");
+  TORCH_CHECK(a.is_contiguous() && b.is_contiguous() && out.is_contiguous(),
+              "gemm_fp32_strided_batched_out: tensors must be contiguous");
+
+  int64_t const batch = a.size(0);
+  int64_t const M = a.size(1);
+  int64_t const K = a.size(2);
+  int64_t const N = b.size(1);
+  TORCH_CHECK(batch >= 2 && batch <= 6 && b.size(0) == batch &&
+                  b.size(2) == K && out.size(0) == batch &&
+                  out.size(1) == M && out.size(2) == N,
+              "gemm_fp32_strided_batched_out: expected a [B,M,K], "
+              "b [B,N,K], out [B,M,N], and 2 <= B <= 6");
+  TORCH_CHECK(M <= std::numeric_limits<int>::max() &&
+                  N <= std::numeric_limits<int>::max() &&
+                  K <= std::numeric_limits<int>::max(),
+              "gemm_fp32_strided_batched_out: dimensions must fit int32");
+  TORCH_CHECK(!a.is_alias_of(b) && !a.is_alias_of(out) &&
+                  !b.is_alias_of(out),
+              "gemm_fp32_strided_batched_out: tensors must not alias");
+
+  c10::cuda::CUDAGuard const device_guard(a.device());
+  cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+  TORCH_CUDABLAS_CHECK(
+      cublasSetStream(handle, at::cuda::getCurrentCUDAStream()));
+  float const alpha = 1.0f;
+  float const beta = 0.0f;
+  TORCH_CUDABLAS_CHECK(cublasSgemmStridedBatched(
+      handle, CUBLAS_OP_T, CUBLAS_OP_N, static_cast<int>(N),
+      static_cast<int>(M), static_cast<int>(K), &alpha, b.data_ptr<float>(),
+      static_cast<int>(K), N * K, a.data_ptr<float>(), static_cast<int>(K),
+      M * K, &beta, out.data_ptr<float>(), static_cast<int>(N), M * N,
+      static_cast<int>(batch)));
 }
 
 }  // namespace metax_sparse

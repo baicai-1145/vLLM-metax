@@ -272,6 +272,70 @@ def test_mhc_downstream_rms_matches_torch_reference_non_symmetric_sinkhorn():
     assert torch.equal(norm_out, reference_norm)
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires a CUDA-compatible device"
+)
+def test_mhc_downstream_rms_six_rows_matches_serial_calls():
+    import vllm_metax._metax_sparse_C  # noqa: F401
+
+    torch.manual_seed(127)
+    device = torch.device("cuda")
+    residual = torch.randn(6, 4, 4096, device=device, dtype=torch.bfloat16)
+    gemm_out = torch.randn(6, 1, 24, device=device, dtype=torch.float32)
+    sqrsum = residual.float().square().sum(dim=(1, 2), keepdim=True).view(6, 1)
+    scale = torch.randn(3, device=device, dtype=torch.float32)
+    base = torch.randn(24, device=device, dtype=torch.float32)
+    norm_weight = torch.randn(4096, device=device, dtype=torch.bfloat16)
+    params = _trace_kwargs()
+    op = torch.ops._metax_sparse_C
+
+    serial = (
+        torch.empty(6, 4, device=device, dtype=torch.float32),
+        torch.empty(6, 4, 4, device=device, dtype=torch.float32),
+        torch.empty(6, 4096, device=device, dtype=torch.bfloat16),
+        torch.empty(6, 4096, device=device, dtype=torch.bfloat16),
+    )
+    for row in range(6):
+        row_slice = slice(row, row + 1)
+        op.mhc_downstream_rms_out(
+            residual[row_slice],
+            gemm_out[row_slice],
+            sqrsum[row_slice],
+            scale,
+            base,
+            norm_weight,
+            serial[0][row_slice],
+            serial[1][row_slice],
+            serial[2][row_slice],
+            serial[3][row_slice],
+            params["rms_eps"],
+            params["hc_pre_eps"],
+            params["hc_sinkhorn_eps"],
+            params["hc_post_mult_value"],
+            params["sinkhorn_repeat"],
+        )
+
+    batched = tuple(torch.empty_like(output) for output in serial)
+    op.mhc_downstream_rms_out(
+        residual,
+        gemm_out,
+        sqrsum,
+        scale,
+        base,
+        norm_weight,
+        *batched,
+        params["rms_eps"],
+        params["hc_pre_eps"],
+        params["hc_sinkhorn_eps"],
+        params["hc_post_mult_value"],
+        params["sinkhorn_repeat"],
+    )
+    torch.cuda.synchronize()
+
+    for actual, expected in zip(batched, serial, strict=True):
+        assert torch.equal(actual, expected)
+
+
 def test_first_trace_failure_accepts_native_output_subset():
     cli = _load_cli()
     reference = {
@@ -535,15 +599,18 @@ def test_exact_post_pre_rms_rejects_unsupported_hidden_size():
         )
 
 
+@pytest.mark.parametrize("grouped_gemv", [False, True])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_exact_post_pre_rms_batch_matches_stacked_single_tokens():
+def test_exact_post_pre_rms_batch_matches_stacked_single_tokens(
+    monkeypatch, grouped_gemv
+):
     from vllm_metax.models.deepseek_v4.ops.mhc.tilelang import (
         mhc_exact_post_pre_rms,
     )
 
     torch.manual_seed(7)
     device = torch.device("cuda")
-    num_tokens = 2
+    num_tokens = 6
     x = torch.randn(num_tokens, 4096, dtype=torch.bfloat16, device=device)
     residual = torch.randn(
         num_tokens, 4, 4096, dtype=torch.bfloat16, device=device
@@ -555,6 +622,11 @@ def test_exact_post_pre_rms_batch_matches_stacked_single_tokens():
     hc_base = torch.randn(24, dtype=torch.float32, device=device)
     norm_weight = torch.randn(4096, dtype=torch.bfloat16, device=device)
     args = (1e-6, 1e-6, 1e-6, 2.0, 20, norm_weight)
+
+    if grouped_gemv:
+        monkeypatch.setenv("VLLM_METAX_DSV4_MHC_GROUPED_GEMV", "1")
+    else:
+        monkeypatch.delenv("VLLM_METAX_DSV4_MHC_GROUPED_GEMV", raising=False)
 
     expected_per_token = [
         mhc_exact_post_pre_rms(
@@ -589,8 +661,14 @@ def test_exact_post_pre_rms_batch_matches_stacked_single_tokens():
         assert torch.equal(actual_tensor, expected_tensor)
 
 
+@pytest.mark.parametrize(
+    ("grouped_gemv", "hybrid_post_downstream"),
+    [(False, False), (True, False), (False, True), (True, True)],
+)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_exact_initial_pre_rms_batch_matches_stacked_single_tokens():
+def test_exact_initial_pre_rms_batch_matches_stacked_single_tokens(
+    monkeypatch, grouped_gemv, hybrid_post_downstream
+):
     from vllm_metax.models.deepseek_v4.ops.mhc.tilelang import (
         mhc_exact_initial_pre_rms,
     )
@@ -607,6 +685,17 @@ def test_exact_initial_pre_rms_batch_matches_stacked_single_tokens():
     norm_weight = torch.randn(4096, dtype=torch.bfloat16, device=device)
     args = (fn, hc_scale, hc_base, 1e-6, 1e-6, 1e-6, 2.0, 20, norm_weight)
 
+    if grouped_gemv:
+        monkeypatch.setenv("VLLM_METAX_DSV4_MHC_GROUPED_GEMV", "1")
+    else:
+        monkeypatch.delenv("VLLM_METAX_DSV4_MHC_GROUPED_GEMV", raising=False)
+    if hybrid_post_downstream:
+        monkeypatch.setenv("VLLM_METAX_DSV4_MHC_HYBRID_POST_DOWNSTREAM", "1")
+    else:
+        monkeypatch.delenv(
+            "VLLM_METAX_DSV4_MHC_HYBRID_POST_DOWNSTREAM", raising=False
+        )
+
     expected_per_token = [
         mhc_exact_initial_pre_rms(residual[index : index + 1], *args)
         for index in range(num_tokens)
@@ -619,6 +708,144 @@ def test_exact_initial_pre_rms_batch_matches_stacked_single_tokens():
 
     for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
         assert torch.equal(actual_tensor, expected_tensor)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_exact_initial_pre_rms_grouped_gemv_graph_replay(monkeypatch):
+    from vllm_metax.models.deepseek_v4.ops.mhc.tilelang import (
+        _mhc_exact_initial_pre_rms_impl,
+    )
+
+    torch.manual_seed(23)
+    device = torch.device("cuda")
+    residual = torch.randn(6, 4, 4096, dtype=torch.bfloat16, device=device)
+    fn = torch.randn(24, 16384, dtype=torch.float32, device=device)
+    hc_scale = torch.randn(3, dtype=torch.float32, device=device)
+    hc_base = torch.randn(24, dtype=torch.float32, device=device)
+    norm_weight = torch.randn(4096, dtype=torch.bfloat16, device=device)
+    args = (fn, hc_scale, hc_base, 1e-6, 1e-6, 1e-6, 2.0, 20, norm_weight)
+
+    monkeypatch.delenv("VLLM_METAX_DSV4_MHC_GROUPED_GEMV", raising=False)
+    expected = tuple(
+        tensor.clone() for tensor in _mhc_exact_initial_pre_rms_impl(residual, *args)
+    )
+
+    monkeypatch.setenv("VLLM_METAX_DSV4_MHC_GROUPED_GEMV", "1")
+    monkeypatch.setenv("VLLM_METAX_DSV4_MHC_HYBRID_POST_DOWNSTREAM", "1")
+    workspace = {}
+    _mhc_exact_initial_pre_rms_impl(residual, *args, workspace=workspace)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = _mhc_exact_initial_pre_rms_impl(
+            residual, *args, workspace=workspace
+        )
+
+    for _ in range(5):
+        graph.replay()
+        torch.cuda.synchronize()
+        for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
+            assert torch.equal(actual_tensor, expected_tensor)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_exact_post_pre_rms_grouped_rows_graph_replay(monkeypatch):
+    from vllm_metax.models.deepseek_v4.ops.mhc.tilelang import (
+        _mhc_exact_post_pre_rms_impl,
+    )
+
+    torch.manual_seed(27)
+    device = torch.device("cuda")
+    x = torch.randn(6, 4096, dtype=torch.bfloat16, device=device)
+    residual = torch.randn(6, 4, 4096, dtype=torch.bfloat16, device=device)
+    post_mix = torch.randn(6, 4, 1, dtype=torch.float32, device=device)
+    comb_mix = torch.randn(6, 4, 4, dtype=torch.float32, device=device)
+    fn = torch.randn(24, 16384, dtype=torch.float32, device=device)
+    hc_scale = torch.randn(3, dtype=torch.float32, device=device)
+    hc_base = torch.randn(24, dtype=torch.float32, device=device)
+    norm_weight = torch.randn(4096, dtype=torch.bfloat16, device=device)
+    args = (
+        x,
+        residual,
+        post_mix,
+        comb_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        1e-6,
+        1e-6,
+        1e-6,
+        2.0,
+        20,
+        norm_weight,
+    )
+
+    monkeypatch.delenv("VLLM_METAX_DSV4_MHC_GROUPED_GEMV", raising=False)
+    expected = tuple(tensor.clone() for tensor in _mhc_exact_post_pre_rms_impl(*args))
+
+    monkeypatch.setenv("VLLM_METAX_DSV4_MHC_GROUPED_GEMV", "1")
+    monkeypatch.setenv("VLLM_METAX_DSV4_MHC_HYBRID_POST_DOWNSTREAM", "1")
+    workspace = {}
+    _mhc_exact_post_pre_rms_impl(*args, workspace=workspace)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = _mhc_exact_post_pre_rms_impl(*args, workspace=workspace)
+
+    for _ in range(5):
+        graph.replay()
+        torch.cuda.synchronize()
+        for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
+            assert torch.equal(actual_tensor, expected_tensor)
+
+
+@pytest.mark.parametrize("num_tokens", [2, 5, 6])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mhc_grouped_gemv_matches_stacked_single_rows(num_tokens):
+    import vllm_metax._metax_sparse_C  # noqa: F401
+
+    torch.manual_seed(29)
+    device = torch.device("cuda")
+    inputs = torch.randn(num_tokens, 16384, dtype=torch.float32, device=device)
+    weight = torch.randn(24, 16384, dtype=torch.float32, device=device)
+    expected = torch.empty(num_tokens, 1, 24, dtype=torch.float32, device=device)
+    actual = torch.empty_like(expected)
+    ops = torch.ops._metax_sparse_C
+
+    for token_index in range(num_tokens):
+        token_slice = slice(token_index, token_index + 1)
+        ops.mhc_gemv_fp32_out(
+            inputs[token_slice], weight, expected[token_slice]
+        )
+    ops.mhc_gemv_fp32_grouped_out(inputs, weight, actual)
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mhc_grouped_gemv_graph_replay_is_row_exact():
+    import vllm_metax._metax_sparse_C  # noqa: F401
+
+    torch.manual_seed(31)
+    device = torch.device("cuda")
+    inputs = torch.randn(6, 16384, dtype=torch.float32, device=device)
+    weight = torch.randn(24, 16384, dtype=torch.float32, device=device)
+    expected = torch.empty(6, 1, 24, dtype=torch.float32, device=device)
+    actual = torch.empty_like(expected)
+    ops = torch.ops._metax_sparse_C
+
+    for token_index in range(6):
+        token_slice = slice(token_index, token_index + 1)
+        ops.mhc_gemv_fp32_out(
+            inputs[token_slice], weight, expected[token_slice]
+        )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ops.mhc_gemv_fp32_grouped_out(inputs, weight, actual)
+
+    for _ in range(5):
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(actual, expected)
 
 
 def test_exact_pre_rms_dispatches_small_batched_graph_without_runtime_metadata(

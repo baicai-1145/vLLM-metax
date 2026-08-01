@@ -54,12 +54,16 @@ def _dsv4_safe_capture_sizes(vllm_config: "VllmConfig") -> list[int]:
     speculative_config = getattr(vllm_config, "speculative_config", None)
     if speculative_config is None:
         return [1]
-    if getattr(speculative_config, "method", None) != "mtp":
-        return [1]
-
+    speculative_method = getattr(speculative_config, "method", None)
     num_speculative_tokens = getattr(
         speculative_config, "num_speculative_tokens", None
     )
+    if speculative_method == "dspark" and num_speculative_tokens == 5:
+        # The target verifies five draft tokens plus one bonus token together.
+        return [1, 6]
+    if speculative_method != "mtp":
+        return [1]
+
     if (
         not isinstance(num_speculative_tokens, int)
         or isinstance(num_speculative_tokens, bool)

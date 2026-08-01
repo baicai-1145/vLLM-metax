@@ -4,7 +4,6 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar
 
-import numpy as np
 import torch
 
 from vllm import _custom_ops as ops
@@ -50,6 +49,9 @@ from vllm_metax.v1.attention.ops.flashmla import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.workspace import current_workspace_manager
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
+from vllm_metax.v1.attention.backends.mla.metadata_utils import (
+    build_token_to_req_indices_out,
+)
 
 if TYPE_CHECKING:
     from vllm_metax.models.deepseek_v2 import Indexer
@@ -667,17 +669,13 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
     ) -> FlashMLASparseMetadata:
         cm = common_attn_metadata
         num_tokens = cm.num_actual_tokens
-        starts = np.asarray(cm.query_start_loc_cpu, dtype=np.int32)
-        seg_lengths = np.diff(starts)
-        req_id_per_token = np.repeat(
-            np.arange(seg_lengths.shape[0], dtype=np.int32), seg_lengths
+        req_id_per_token = build_token_to_req_indices_out(
+            cm.query_start_loc,
+            cm.num_reqs,
+            num_tokens,
+            self.req_id_per_token_buffer,
+            max_query_len=cm.max_query_len,
         )
-        # Zero-fill for cudagraphs
-        self.req_id_per_token_buffer.fill_(0)
-        self.req_id_per_token_buffer[: req_id_per_token.shape[0]].copy_(
-            torch.from_numpy(req_id_per_token), non_blocking=True
-        )
-        req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
 
         slot_mapping = cm.slot_mapping
         if self.compress_ratio > 1:

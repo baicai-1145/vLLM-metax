@@ -153,6 +153,31 @@ def _build_speculative_config(num_speculative_tokens: int) -> dict | None:
     }
 
 
+def _build_profiler_config(profile_dir: str | None) -> dict | None:
+    if not profile_dir:
+        return None
+    return {
+        "profiler": "torch",
+        "torch_profiler_dir": profile_dir,
+        "torch_profiler_with_stack": True,
+        "torch_profiler_record_shapes": (
+            os.environ.get("PROFILE_RECORD_SHAPES", "0") == "1"
+        ),
+        "torch_profiler_use_gzip": True,
+        "torch_profiler_dump_cuda_time_total": True,
+        "delay_iterations": int(os.environ.get("PROFILE_DELAY_ITERATIONS", "0")),
+        "max_iterations": int(os.environ.get("PROFILE_MAX_ITERATIONS", "0")),
+        "active_iterations": int(os.environ.get("PROFILE_ACTIVE_ITERATIONS", "5")),
+        "ignore_frontend": os.environ.get("PROFILE_IGNORE_FRONTEND", "0") == "1",
+    }
+
+
+def _print_bench_marker(phase: str, boundary: str) -> None:
+    marker = f"{phase}_BENCH_{boundary}"
+    print(marker, flush=True)
+    print(f"{marker}_UNIX_NS {time.time_ns()}", flush=True)
+
+
 def main() -> None:
     model = os.environ["MODEL"]
     tensor_parallel_size = int(os.environ.get("TP", "1"))
@@ -188,19 +213,7 @@ def main() -> None:
             "cudagraph_capture_sizes": capture_sizes,
         }
     speculative_config = _build_speculative_config(num_speculative_tokens)
-    profiler_config = None
-    if profile_dir:
-        profiler_config = {
-            "profiler": "torch",
-            "torch_profiler_dir": profile_dir,
-            "torch_profiler_with_stack": True,
-            "torch_profiler_use_gzip": True,
-            "torch_profiler_dump_cuda_time_total": True,
-            "delay_iterations": int(os.environ.get("PROFILE_DELAY_ITERATIONS", "0")),
-            "max_iterations": int(os.environ.get("PROFILE_MAX_ITERATIONS", "0")),
-            "active_iterations": int(os.environ.get("PROFILE_ACTIVE_ITERATIONS", "5")),
-            "ignore_frontend": os.environ.get("PROFILE_IGNORE_FRONTEND", "0") == "1",
-        }
+    profiler_config = _build_profiler_config(profile_dir)
 
     llm = LLM(
         model=model,
@@ -272,9 +285,9 @@ def main() -> None:
     run_finish_reasons = []
     out = None
     if input_tokens:
-        print("PREFILL_BENCH_START", flush=True)
+        _print_bench_marker("PREFILL", "START")
     else:
-        print("DECODE_BENCH_START", flush=True)
+        _print_bench_marker("DECODE", "START")
     for run_prompt, run_params in zip(
         run_prompts, run_sampling_params, strict=True
     ):
@@ -285,9 +298,9 @@ def main() -> None:
         run_token_ids.append([int(token_id) for token_id in run_output.token_ids])
         run_finish_reasons.append(run_output.finish_reason)
     if input_tokens:
-        print("PREFILL_BENCH_END", flush=True)
+        _print_bench_marker("PREFILL", "END")
     else:
-        print("DECODE_BENCH_END", flush=True)
+        _print_bench_marker("DECODE", "END")
     assert out is not None
     output = out[0].outputs[0]
     text = output.text

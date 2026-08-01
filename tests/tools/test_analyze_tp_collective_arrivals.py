@@ -27,6 +27,7 @@ def _write_trace(
     extra_collective: bool = False,
     calibration_offset: float | None = None,
     calibration_marker: str | None = None,
+    base_time_ns: int | None = None,
 ) -> Path:
     events = [
         {
@@ -98,6 +99,8 @@ def _write_trace(
             "clock_offset_us": calibration_offset,
             "calibration_marker": calibration_marker,
         }
+    if base_time_ns is not None:
+        payload["baseTimeNanoseconds"] = base_time_ns
     path.write_text(json.dumps(payload), encoding="utf-8")
     return path
 
@@ -209,6 +212,36 @@ def test_absolute_calibration_residual_over_two_us_is_rejected(tmp_path: Path) -
             1000 + rank * 1000,
             calibration_offset=float(rank * 3),
             calibration_marker="shared",
+        )
+        for rank in range(4)
+    ]
+
+    result = analyze_traces(paths)
+
+    assert result["summary"]["absolute_alignment"] == "rejected-residual-over-2us"
+
+
+def test_shared_base_time_enables_absolute_alignment(tmp_path: Path) -> None:
+    paths = [
+        _write_trace(tmp_path, rank, 1000, base_time_ns=1_000_000_000)
+        for rank in range(4)
+    ]
+
+    result = analyze_traces(paths)
+
+    collective = result["collectives"][0]
+    assert result["summary"]["absolute_alignment"] == "available"
+    assert result["summary"]["calibration_residual_us"] == 0
+    assert collective["absolute_start_us"] == [1001020, 1001020, 1001020, 1001020]
+
+
+def test_base_time_spread_over_two_us_is_rejected(tmp_path: Path) -> None:
+    paths = [
+        _write_trace(
+            tmp_path,
+            rank,
+            1000,
+            base_time_ns=1_000_000_000 + rank * 3_000,
         )
         for rank in range(4)
     ]

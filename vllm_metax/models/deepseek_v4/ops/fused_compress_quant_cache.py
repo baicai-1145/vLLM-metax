@@ -28,6 +28,10 @@ def compress_norm_rope_store_triton(
     token_stride: int,
     scale_dim: int,
     initial_overlap_boundary: int | None = None,
+    kv: torch.Tensor | None = None,
+    score: torch.Tensor | None = None,
+    ape: torch.Tensor | None = None,
+    fuse_save_partial_states: bool = False,
 ) -> None:
     """Shared triton launcher for the fused compress+norm+RoPE+insert path.
 
@@ -63,11 +67,26 @@ def compress_norm_rope_store_triton(
         # intentionally retained for the INT8 path below.
         constexpr_kwargs["KV_TOKEN_STRIDE"] = kv_cache.stride(1)
 
+    if fuse_save_partial_states:
+        if kv is None or score is None or ape is None:
+            raise ValueError(
+                "fused compressor state save requires kv, score, and ape"
+            )
+    else:
+        kv = score = ape = state_cache
+
     kernel[(num_actual,)](
         # state cache
         state_cache,
         state_cache.stride(0),
         state_cache.stride(1),
+        # current partial state
+        kv,
+        kv.stride(0),
+        score,
+        score.stride(0),
+        ape,
+        ape.stride(0),
         # metadata
         token_to_req_indices,
         positions,
@@ -86,6 +105,7 @@ def compress_norm_rope_store_triton(
         k_cache_metadata.slot_mapping,
         kv_cache.shape[1],  # paged KV cache block size (tokens per block)
         # constexprs
+        FUSE_SAVE_PARTIAL_STATES=fuse_save_partial_states,
         **constexpr_kwargs,
         num_warps=num_warps,
         **pdl_kwargs,
@@ -100,6 +120,13 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn_int8(
     state_cache_ptr,
     state_cache_stride0,
     state_cache_stride1,
+    # ── current partial state ──
+    kv_ptr,
+    kv_stride,
+    score_ptr,
+    score_stride,
+    ape_ptr,
+    ape_stride,
     # ── metadata ──
     token_to_req_indices_ptr,
     positions_ptr,
@@ -130,6 +157,7 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn_int8(
     SCALE_DIM: tl.constexpr,  # 4 for indexer (1 float32)
     KV_BLOCK_STRIDE: tl.constexpr,
     INITIAL_OVERLAP_BOUNDARY: tl.constexpr,
+    FUSE_SAVE_PARTIAL_STATES: tl.constexpr,
 ):
     """Fused compress → RMSNorm → RoPE → INT8 quant → store."""
     token_idx = tl.program_id(0)
@@ -139,6 +167,30 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn_int8(
         return
 
     position = tl.load(positions_ptr + token_idx)
+    block = tl.arange(0, TRITON_BLOCK_SIZE)
+    mask = block < HEAD_SIZE
+    if FUSE_SAVE_PARTIAL_STATES:
+        state_lane = tl.arange(0, STATE_WIDTH)
+        state_block = slot_id // block_size
+        state_offset = slot_id % block_size
+        state_base = (
+            state_cache_ptr
+            + state_block * state_cache_stride0
+            + state_offset * state_cache_stride1
+        )
+        current_kv = tl.load(
+            kv_ptr + token_idx * kv_stride + state_lane
+        )
+        ape_row = position % COMPRESS_RATIO
+        current_ape = tl.load(ape_ptr + ape_row * ape_stride + state_lane)
+        current_score = tl.load(
+            score_ptr + token_idx * score_stride + state_lane
+        )
+        tl.store(state_base + state_lane, current_kv)
+        tl.store(
+            state_base + STATE_WIDTH + state_lane,
+            current_score + current_ape,
+        )
     if (position + 1) % COMPRESS_RATIO != 0:
         return
 
@@ -159,8 +211,6 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn_int8(
     block_offsets = pos % block_size
     head_offset = (tokens >= COMPRESS_RATIO).to(tl.int32) * HEAD_SIZE
 
-    block = tl.arange(0, TRITON_BLOCK_SIZE)
-    mask = block < HEAD_SIZE
     block_numbers_i64 = block_numbers.to(tl.int64)
 
     row_base = (
@@ -272,6 +322,13 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn_bf16(
     state_cache_ptr,
     state_cache_stride0,
     state_cache_stride1,
+    # ── current partial state ──
+    kv_ptr,
+    kv_stride,
+    score_ptr,
+    score_stride,
+    ape_ptr,
+    ape_stride,
     # ── metadata ──
     token_to_req_indices_ptr,
     positions_ptr,
@@ -303,6 +360,7 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn_bf16(
     SCALE_DIM: tl.constexpr,  # Bytes per token for scales
     KV_BLOCK_STRIDE: tl.constexpr,
     INITIAL_OVERLAP_BOUNDARY: tl.constexpr,
+    FUSE_SAVE_PARTIAL_STATES: tl.constexpr,
 ):
     """Fused compress → RMSNorm → RoPE → bf16 store.
 
@@ -318,6 +376,30 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn_bf16(
         return
 
     position = tl.load(positions_ptr + token_idx)
+    block = tl.arange(0, TRITON_BLOCK_SIZE)
+    mask = block < HEAD_SIZE
+    if FUSE_SAVE_PARTIAL_STATES:
+        state_lane = tl.arange(0, STATE_WIDTH)
+        state_block = slot_id // block_size
+        state_offset = slot_id % block_size
+        state_base = (
+            state_cache_ptr
+            + state_block * state_cache_stride0
+            + state_offset * state_cache_stride1
+        )
+        current_kv = tl.load(
+            kv_ptr + token_idx * kv_stride + state_lane
+        )
+        ape_row = position % COMPRESS_RATIO
+        current_ape = tl.load(ape_ptr + ape_row * ape_stride + state_lane)
+        current_score = tl.load(
+            score_ptr + token_idx * score_stride + state_lane
+        )
+        tl.store(state_base + state_lane, current_kv)
+        tl.store(
+            state_base + STATE_WIDTH + state_lane,
+            current_score + current_ape,
+        )
     if (position + 1) % COMPRESS_RATIO != 0:
         return
 
@@ -338,8 +420,6 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn_bf16(
     block_offsets = pos % block_size
     head_offset = (tokens >= COMPRESS_RATIO).to(tl.int32) * HEAD_SIZE
 
-    block = tl.arange(0, TRITON_BLOCK_SIZE)
-    mask = block < HEAD_SIZE
     block_numbers_i64 = block_numbers.to(tl.int64)
 
     # Precomputed row base shared by score and kv loads

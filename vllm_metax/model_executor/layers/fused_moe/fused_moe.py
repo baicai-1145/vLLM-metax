@@ -53,6 +53,101 @@ _mctlass_modname = (
     else "vllm_metax.model_executor.layers.quantization._cutlass_ops"
 )
 mctlass_ops: Any = importlib.import_module(_mctlass_modname)
+_DSPARK_MOE_STAGE_CAPTURE: Callable[[str, torch.Tensor], None] | None = None
+
+
+def set_dspark_moe_stage_capture(
+    callback: Callable[[str, torch.Tensor], None] | None,
+) -> None:
+    global _DSPARK_MOE_STAGE_CAPTURE
+    _DSPARK_MOE_STAGE_CAPTURE = callback
+
+
+def _capture_dspark_moe_stage(name: str, value: torch.Tensor) -> None:
+    if _DSPARK_MOE_STAGE_CAPTURE is not None:
+        _DSPARK_MOE_STAGE_CAPTURE(name, value)
+
+
+@triton.jit
+def _row_exact_moe_align_kernel(
+    topk_ids,
+    sorted_token_ids,
+    expert_ids,
+    num_tokens_post_pad,
+    NUM_ROUTES: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+):
+    route = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE_M)
+    sentinel = NUM_ROUTES
+    sorted_value = tl.where(offsets == 0, route, sentinel)
+    tl.store(sorted_token_ids + route * BLOCK_SIZE_M + offsets, sorted_value)
+    tl.store(expert_ids + route, tl.load(topk_ids + route))
+    if route == 0:
+        tl.store(num_tokens_post_pad, NUM_ROUTES * BLOCK_SIZE_M)
+
+
+def _row_exact_moe_align(
+    topk_ids: torch.Tensor,
+    block_size_m: int,
+    expert_map: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_routes = topk_ids.numel()
+    sorted_token_ids = torch.empty(
+        num_routes * block_size_m, dtype=torch.int32, device=topk_ids.device
+    )
+    expert_ids = torch.empty(num_routes, dtype=torch.int32, device=topk_ids.device)
+    num_tokens_post_pad = torch.empty(1, dtype=torch.int32, device=topk_ids.device)
+    _row_exact_moe_align_kernel[(num_routes,)](
+        topk_ids,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        NUM_ROUTES=num_routes,
+        BLOCK_SIZE_M=block_size_m,
+    )
+    if expert_map is not None:
+        expert_ids = expert_map[expert_ids]
+    return sorted_token_ids, expert_ids, num_tokens_post_pad
+
+
+def _use_row_exact_moe_align(num_tokens: int, top_k_num: int) -> bool:
+    return (
+        os.getenv("VLLM_METAX_DSV4_MOE_ROW_EXACT_ALIGN") == "1"
+        and 1 < num_tokens <= 6
+        and top_k_num == 6
+    )
+
+
+def _row_exact_moe_config_tokens(
+    num_tokens: int, top_k_num: int, use_int4_w4a16: bool
+) -> int:
+    if use_int4_w4a16 and _use_row_exact_moe_align(num_tokens, top_k_num):
+        value = os.getenv("VLLM_METAX_DSV4_MOE_ROW_EXACT_CONFIG_TOKENS", "1")
+        try:
+            config_tokens = int(value)
+        except ValueError as exc:
+            raise ValueError(
+                "VLLM_METAX_DSV4_MOE_ROW_EXACT_CONFIG_TOKENS must be one of "
+                "1, 2, 4, or 8"
+            ) from exc
+        if config_tokens not in (1, 2, 4, 8):
+            raise ValueError(
+                "VLLM_METAX_DSV4_MOE_ROW_EXACT_CONFIG_TOKENS must be one of "
+                "1, 2, 4, or 8"
+            )
+        return config_tokens
+    return num_tokens
+
+
+def _apply_moe_sum(
+    input: torch.Tensor, output: torch.Tensor, *, row_exact: bool
+) -> None:
+    if row_exact:
+        for index in range(input.shape[0]):
+            ops.moe_sum(input[index : index + 1], output[index : index + 1])
+        return
+    ops.moe_sum(input, output)
 
 
 @triton.jit
@@ -2083,14 +2178,6 @@ def fused_experts_impl(
         block_shape=block_shape,
     )
 
-    config = get_config_func(M)
-
-    # We can reuse the memory between these because by the time we need
-    # cache3, we're done with cache1
-    # ┌------------------------  Metax Modification -------------------------┐
-    stage1_config, stage2_config = initialize_staged_config(config)
-    # └------------------------- Metax Modification -------------------------┘
-
     cache13 = torch.empty(
         M * top_k_num * max(N, K),
         device=hidden_states.device,
@@ -2131,17 +2218,21 @@ def fused_experts_impl(
         if tokens_in_chunk == 0:
             break
 
+        config_tokens = _row_exact_moe_config_tokens(
+            tokens_in_chunk, top_k_num, use_int4_w4a16
+        )
+        config = get_config_func(config_tokens)
+        # ┌------------------------  Metax Modification -------------------------┐
+        stage1_config, stage2_config = initialize_staged_config(config)
+        # └------------------------- Metax Modification -------------------------┘
+
         if tokens_in_chunk < CHUNK_SIZE and chunk > 0:
-            # Adjust the intermediate cache size and config for the last
-            # chunk. Note that in most cases we only have one chunk
-            # so the cache size and config are already set correctly and
-            # do not need to be adjusted.
+            # Adjust the intermediate cache size for the last chunk.
             intermediate_cache1 = intermediate_cache1[:tokens_in_chunk]
             intermediate_cache2 = intermediate_cache2[
                 : tokens_in_chunk * topk_ids.size(1)
             ]
             intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
-            config = get_config_func(tokens_in_chunk)
 
         curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
         curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
@@ -2172,8 +2263,26 @@ def fused_experts_impl(
                 and mx_envs.MACA_VLLM_ENABLE_MCTLASS_FUSED_MOE
             )
         )
+        row_exact_alignment = use_int4_w4a16 and _use_row_exact_moe_align(
+            tokens_in_chunk, top_k_num
+        )
 
-        if not naive_block_assignment:
+        if row_exact_alignment:
+            logger.info_once(
+                "DeepSeek V4 W4A16 MoE uses row-exact grouped native dispatch: "
+                "rows=%d topk=%d config_tokens=%d",
+                tokens_in_chunk,
+                top_k_num,
+                config_tokens,
+            )
+            sorted_token_ids, expert_ids, num_tokens_post_padded = (
+                _row_exact_moe_align(
+                    curr_topk_ids,
+                    stage1_config["BLOCK_SIZE_M"],
+                    expert_map,
+                )
+            )
+        elif not naive_block_assignment:
             # ┌------------------------  Metax Modification -------------------------┐
             if use_int8_w8a8 and mx_envs.MACA_VLLM_ENABLE_MCTLASS_FUSED_MOE:
                 kernel_m = mctlass_ops.cutlass_moe_mm_w8a8_get_kernel_m(
@@ -2262,10 +2371,12 @@ def fused_experts_impl(
             block_shape=block_shape,
             B_bias=w1_bias,
         )
+        _capture_dspark_moe_stage("stage1", intermediate_cache1)
 
         apply_moe_activation(
             activation_enum, intermediate_cache2, intermediate_cache1.view(-1, N)
         )
+        _capture_dspark_moe_stage("activation", intermediate_cache2)
 
         use_mctlass_moe_mm_on_stage2 = (
             mx_envs.MACA_VLLM_ENABLE_MCTLASS_FUSED_MOE
@@ -2305,7 +2416,15 @@ def fused_experts_impl(
             )
 
             if stage2_config["BLOCK_SIZE_M"] != stage1_config["BLOCK_SIZE_M"]:
-                if not naive_block_assignment:
+                if row_exact_alignment:
+                    sorted_token_ids, expert_ids, num_tokens_post_padded = (
+                        _row_exact_moe_align(
+                            curr_topk_ids,
+                            stage2_config["BLOCK_SIZE_M"],
+                            expert_map,
+                        )
+                    )
+                elif not naive_block_assignment:
                     sorted_token_ids, expert_ids, num_tokens_post_padded = (
                         moe_align_block_size(
                             curr_topk_ids,
@@ -2352,9 +2471,14 @@ def fused_experts_impl(
                 block_shape=block_shape,
                 B_bias=w2_bias,
             )
-        ops.moe_sum(
+        _capture_dspark_moe_stage("stage2", intermediate_cache3)
+        _apply_moe_sum(
             intermediate_cache3.view(*intermediate_cache3.size()),
             out_hidden_states[begin_chunk_idx:end_chunk_idx],
+            row_exact=row_exact_alignment,
+        )
+        _capture_dspark_moe_stage(
+            "output", out_hidden_states[begin_chunk_idx:end_chunk_idx]
         )
 
     return out_hidden_states

@@ -60,6 +60,7 @@ def _layer():
     layer.layer_idx = 3
     layer.indexer = None
     layer.compressor = lambda *args: None
+    layer.is_target_model = False
     layer._q_insert_cudagraphs = {}
     layer._q_insert_cudagraph_pool = None
     layer.aux_stream_list = None

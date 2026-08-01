@@ -27,10 +27,31 @@ void mhc_downstream_rms_out(
 void mhc_sigmoid_probe_out(torch::Tensor const& input, torch::Tensor& out);
 void mhc_gemv_fp32_out(torch::Tensor const& input, torch::Tensor const& weight,
                        torch::Tensor& out);
+void mhc_gemv_fp32_grouped_out(torch::Tensor const& input,
+                               torch::Tensor const& weight,
+                               torch::Tensor& out);
+void gemv_bf16_serial_rows_out(torch::Tensor const& input,
+                               torch::Tensor const& weight,
+                               torch::Tensor& out);
+void gemv_bf16_exact_grouped_rows_out(torch::Tensor const& input,
+                                      torch::Tensor const& weight,
+                                      torch::Tensor& out);
+void gemv_bf16_exact_oproj_grouped_rows_out(torch::Tensor const& input,
+                                            torch::Tensor const& weight,
+                                            torch::Tensor& out);
+void gemv_bf16_exact_oproj_row_list_out(
+    c10::List<torch::Tensor> const& inputs, torch::Tensor const& weight,
+    torch::Tensor& out);
+void gemv_bf16_fp32_serial_rows_out(torch::Tensor const& input,
+                                    torch::Tensor const& weight,
+                                    torch::Tensor& out);
 void gemm_bf16_fp32_out(torch::Tensor const& a, torch::Tensor const& b,
                         torch::Tensor& out);
 void gemm_fp32_out(torch::Tensor const& a, torch::Tensor const& b,
                    torch::Tensor& out);
+void gemm_fp32_strided_batched_out(torch::Tensor const& a,
+                                   torch::Tensor const& b,
+                                   torch::Tensor& out);
 
 }  // namespace metax_sparse
 
@@ -59,15 +80,34 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
   m.def("mhc_gemv_fp32_out(Tensor input, Tensor weight, Tensor! out) -> ()");
   m.impl("mhc_gemv_fp32_out", torch::kCUDA,
          &metax_sparse::mhc_gemv_fp32_out);
-
+  m.def("mhc_gemv_fp32_grouped_out(Tensor input, Tensor weight, Tensor! out) -> ()");
+  m.impl("mhc_gemv_fp32_grouped_out", torch::kCUDA,
+         &metax_sparse::mhc_gemv_fp32_grouped_out);
+  m.def("gemv_bf16_serial_rows_out(Tensor input, Tensor weight, Tensor! out) -> ()");
+  m.impl("gemv_bf16_serial_rows_out", torch::kCUDA,
+         &metax_sparse::gemv_bf16_serial_rows_out);
+  m.def("gemv_bf16_exact_grouped_rows_out(Tensor input, Tensor weight, Tensor! out) -> ()");
+  m.impl("gemv_bf16_exact_grouped_rows_out", torch::kCUDA,
+         &metax_sparse::gemv_bf16_exact_grouped_rows_out);
+  m.def("gemv_bf16_exact_oproj_grouped_rows_out(Tensor input, Tensor weight, Tensor! out) -> ()");
+  m.impl("gemv_bf16_exact_oproj_grouped_rows_out", torch::kCUDA,
+         &metax_sparse::gemv_bf16_exact_oproj_grouped_rows_out);
+  m.def("gemv_bf16_exact_oproj_row_list_out(Tensor[] inputs, Tensor weight, Tensor! out) -> ()");
+  m.impl("gemv_bf16_exact_oproj_row_list_out", torch::kCUDA,
+         &metax_sparse::gemv_bf16_exact_oproj_row_list_out);
+  m.def("gemv_bf16_fp32_serial_rows_out(Tensor input, Tensor weight, Tensor! out) -> ()");
+  m.impl("gemv_bf16_fp32_serial_rows_out", torch::kCUDA,
+         &metax_sparse::gemv_bf16_fp32_serial_rows_out);
   // In-place BF16 GEMM with FP32 accumulation/output: out = a @ b.T.
   m.def("gemm_bf16_fp32_out(Tensor a, Tensor b, Tensor! out) -> ()");
   m.impl("gemm_bf16_fp32_out", torch::kCUDA,
          &metax_sparse::gemm_bf16_fp32_out);
-
   // In-place float32 GEMM: out = a @ b.T.
   m.def("gemm_fp32_out(Tensor a, Tensor b, Tensor! out) -> ()");
   m.impl("gemm_fp32_out", torch::kCUDA, &metax_sparse::gemm_fp32_out);
+  m.def("gemm_fp32_strided_batched_out(Tensor a, Tensor b, Tensor! out) -> ()");
+  m.impl("gemm_fp32_strided_batched_out", torch::kCUDA,
+         &metax_sparse::gemm_fp32_strided_batched_out);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
