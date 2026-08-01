@@ -209,7 +209,7 @@ def main() -> None:
         if num_speculative_tokens:
             capture_sizes.append(num_speculative_tokens + 1)
         compilation_config = {
-            "cudagraph_mode": os.environ.get("CUDAGRAPH_MODE", "PIECEWISE"),
+            "cudagraph_mode": os.environ.get("CUDAGRAPH_MODE", "FULL"),
             "cudagraph_capture_sizes": capture_sizes,
         }
     speculative_config = _build_speculative_config(num_speculative_tokens)

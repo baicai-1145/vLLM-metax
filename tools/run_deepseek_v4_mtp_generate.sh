@@ -8,6 +8,6 @@ export MODEL=${MODEL:-/root/models/DeepSeek-V4-Flash-W4A16-BF16Attn-MTP}
 export TP=${TP:-4}
 export GPU_MEM=${GPU_MEM:-0.9}
 export ENFORCE_EAGER=${ENFORCE_EAGER:-0}
-export CUDAGRAPH_MODE=${CUDAGRAPH_MODE:-PIECEWISE}
+export CUDAGRAPH_MODE=${CUDAGRAPH_MODE:-FULL}
 export VLLM_USE_BREAKABLE_CUDAGRAPH=${VLLM_USE_BREAKABLE_CUDAGRAPH:-1}
 python /root/vLLM-metax/tools/tmp_deepseek_v4_mtp_generate.py

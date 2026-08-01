@@ -1068,7 +1068,7 @@ def _mhc_mixes_from_raw_torch(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    from .torch import mhc_pre_split_mixes_ref, sinkhorn_normalize_ref
+    from .torch import mhc_pre_split_mixes_ref, sinkhorn_normalize
 
     num_tokens = residual_cur.shape[0]
     hc_mult = residual_cur.shape[1]
@@ -1084,7 +1084,7 @@ def _mhc_mixes_from_raw_torch(
         hc_post_mult_value,
         hc_pre_eps,
     )
-    comb_mix = sinkhorn_normalize_ref(
+    comb_mix = sinkhorn_normalize(
         comb_mix,
         repeat=sinkhorn_repeat,
         eps=hc_sinkhorn_eps,

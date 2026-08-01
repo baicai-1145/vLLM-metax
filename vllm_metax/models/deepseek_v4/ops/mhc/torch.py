@@ -26,6 +26,28 @@ def sinkhorn_normalize_ref(
     return x
 
 
+def sinkhorn_normalize(
+    x: torch.Tensor, repeat: int = 10, eps: float = 1e-6
+) -> torch.Tensor:
+    """Dispatch wrapper: use the fused triton kernel when the layout/dtype is
+    supported, else fall back to the pure-PyTorch reference.
+
+    The fused kernel replaces ~39 tiny 2-4us kernels per call (softmax + 39
+    row/col normalizes for hc_sinkhorn_iters=20) with ~6 compiled triton
+    launches. It requires a CUDA float32 tensor whose last two dims are
+    (MHC_MULT, MHC_MULT)==(4, 4) contiguous with a dense leading layout.
+    """
+    if x.is_cuda and x.dtype == torch.float32:
+        try:
+            from .fused_sinkhorn import fused_sinkhorn as _fused_sinkhorn
+
+            return _fused_sinkhorn(x, repeat, eps)
+        except ValueError:
+            # Unsupported layout/shape -> fall back to the reference path.
+            pass
+    return sinkhorn_normalize_ref(x, repeat, eps)
+
+
 def mhc_head_compute_mix_ref(
     input_mix: torch.Tensor,
     mhc_scale: torch.Tensor,
@@ -68,6 +90,44 @@ def mhc_pre_apply_mix_ref(x: torch.Tensor, mix: torch.Tensor) -> torch.Tensor:
     return (x * mix).sum(-2).bfloat16()
 
 
+def mhc_pre_norm_post(
+    x_mixes: torch.Tensor,
+    x_residual_flat: torch.Tensor,
+    mhc_norm_eps: float,
+) -> torch.Tensor:
+    """Dispatch wrapper: fuse the sqrsum + rsqrt-denom + mixes-scaling block
+    that follows the einsum in `mhc_pre_norm_fn_ref` into one triton kernel.
+
+    Args:
+        x_mixes: [B, 1, N] fp32 einsum output.
+        x_residual_flat: [B, rms_group_size] fp32 flattened residual.
+        mhc_norm_eps: rms epsilon.
+    Returns:
+        [B, N] fp32 = (x_mixes * rsqrt(sqrsum / R + eps)).sum(-2), matching
+        the reference block exactly.
+
+    Falls back to the reference ops when the fused kernel cannot handle the
+    layout (non-contiguous, non-CUDA, wrong dtype, or unsupported sizes).
+    """
+    if (
+        x_mixes.is_cuda
+        and x_residual_flat.is_cuda
+        and x_mixes.dtype == torch.float32
+        and x_residual_flat.dtype == torch.float32
+    ):
+        try:
+            from .fused_mhc_pre_norm import fused_mhc_pre_norm_post as _fused
+
+            return _fused(x_mixes, x_residual_flat, mhc_norm_eps)
+        except ValueError:
+            # Unsupported layout/shape -> fall back to the reference path.
+            pass
+    rms_group_size = x_residual_flat.shape[-1]
+    sqrsum = x_residual_flat.square().sum(-1, keepdim=True)
+    denom = (sqrsum / rms_group_size + mhc_norm_eps).rsqrt()
+    return (x_mixes * denom.unsqueeze(-1)).sum(-2)
+
+
 def mhc_pre_norm_fn_ref(
     residual: torch.Tensor,
     mhc_fn: torch.Tensor,
@@ -86,10 +146,10 @@ def mhc_pre_norm_fn_ref(
         residual.view(-1, 1, rms_group_size),
         mhc_fn.view(mhc_mult, 1, rms_group_size),
     )
-    sqrsum = residual.view(-1, 1, rms_group_size).square().sum(-1)
-    mixes = (
-        mixes * (sqrsum.unsqueeze(-1) / rms_group_size + mhc_norm_eps).rsqrt()
-    ).sum(-2)
+    # Fused: sqrsum + rsqrt-denom + mixes-scaling in one triton kernel
+    # (fallback to the reference ops below when unsupported).
+    residual_flat = residual.view(-1, rms_group_size)
+    mixes = mhc_pre_norm_post(mixes, residual_flat, mhc_norm_eps)
     return mixes.view(*residual.shape[:2], -1)
 
 
@@ -127,7 +187,7 @@ def big_fuse_reference(
         mhc_pre_eps,
     )
 
-    comb_mix = sinkhorn_normalize_ref(
+    comb_mix = sinkhorn_normalize(
         comb_mix, repeat=sinkhorn_repeat, eps=mhc_sinkhorn_eps
     )
 
