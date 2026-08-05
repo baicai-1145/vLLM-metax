@@ -93,9 +93,39 @@ DSpark k=5 batched verify (M=6) 的 target_accept phase, GPU kernel 时间:
 
 来源: `.logs/deepseek_v4_dspark_cycle_reconstruction_20260729/native_serial_attn_gemm_rows_profile_5active_v123/phase_kernel_summary.json`
 
-## 最终诊断 (2026-08-01, 经过五轮实验收敛)
+## 最终诊断 (2026-08-01, 经过六轮实验收敛)
 
-**真正的瓶颈是 attention 的 ~616 个 kernel 在 PIECEWISE graph 之外被 host 串行 launch。** 诊断链条 (每一步都有实验验证):
+**FULL graph 下已接近 device-bound, 真正的杠杆是减少 device kernel time, 但大部分低-occupancy kernel 的 grid 小是 workload (单请求 M=1) 决定的, 非实现差。** 只有 FlashInfer 式整段 attention 融合 (让 grid = num_heads × seq × split_k) 能从根本上提升 SM。
+
+### device-time 精确构成 (post-fusion step, 第六轮分析, 2026-08-01)
+
+post-fusion steady-state step (~30ms) 的 occupancy × category 交叉表 (这是最精确的 device time 拆解):
+
+| category | occupancy | count | ms | 可优化性 |
+|----------|-----------|-------|-----|--------|
+| aten_elem | **0%** | 2358 | **6.79** | block×grid=256/512/1024 元素, 单 block 合理 (M=1 固有) |
+| moe | 25-49% | 82 | 4.40 | 已较优 (fused_moe) |
+| other | 1-24% | 371 | 3.92 | 含 sgemvt/gemm routing |
+| aten_elem | 1-24% | 749 | 3.00 | 部分 Pattern 1 (split+sigmoid) 可融合 |
+| attn_gemv | 1-24% | 224 | 2.50 | M=1 固有小 grid |
+| **sgemvt** | **0%** | 83 | **2.10** | grid=12 (12 head), M=1 固有 |
+| attn_gemv | >=50% | 83 | 1.48 | 已优化 |
+| **sinkhorn** | **0%** | 492 | **1.43** | grid=1 (16元素), 数学上必然小 |
+| qnorm_rope | 0% | 121 | 0.56 | 小 |
+
+**关键结论 (推翻 "融合小 kernel 减数量" 方向)**:
+1. **FULL graph 下 TPS 30.18 ≈ device-bound 33.3 (1000/30ms) 的 91%** — host gap 仅 ~3ms, FULL 已接近 device-bound。故 FULL 下 device kernel time 是 TPS 的真杠杆 (与 PIECEWISE 相反)。
+2. **但 0%-occupancy kernel 的 grid 小是 workload 决定的**: sinkhorn 处理 4×4=16 元素 (grid 必然 1), sgemvt 12 head (grid 必然 12), aten_elem 处理 256-1024 元素 (单 block 256 线程合理)。这些不是 "实现差", 是单请求 M=1 decode 的固有特性。
+3. **"NV 单请求 99% SM" 的真正原因 = FlashInfer 整段 attention 融合**: 一个 kernel 吃 q/kv/score/o, grid = num_heads × seq_len × split_k, 单请求也很大。MetaX 把 attention 拆成 sgemvt(12) + softmax + 多个小 kernel。
+4. **fused_sinkhorn 的教训**: 它减了 kernel 数 (134→6) 但 grid 仍 [1,1,1], 故 device -47% 但 TPS 只 +3.5%。证明 "减 kernel 数" 在单 block 小张量场景无效。
+
+### 优化方向重排 (基于第六轮 device-time 构成)
+
+1. **★★★★ FlashInfer 式 attention 整段融合** — 唯一能从根本提升 SM 的方向。需 tilelang V4 sparse+SWA 成熟 (当前只有 sm90 示例)。grid=num_heads×seq×split_k 能让单请求也占满 SM。工作量巨大, 但是对标 NV 的正道。
+2. **★★ FULL graph 生产化** — 已验证 +8.4%, 待多 batch/长 context 稳定性确认。
+3. **★ Pattern 1 融合 (split+sigmoid 3.93ms)** — 预期 FULL 下 +1-3% (小张量, 收益主要来自减 graph node)。低 ROI 但可作为练手。
+4. **✗ 不再投入: 减 kernel 数量的小融合** — 三次证伪 (sinkhorn/mhc_pre_norm/exact path)。
+ 诊断链条 (每一步都有实验验证):
 
 1. occupancy 分析: 76% device 时间在 occupancy ≤24% 的 kernel。但 high-occupancy kernel (≥50%, 主要是 attention GEMV) 只占 device 时间 5.9% (1.55ms)。
 2. **MHC exact path 实验**: 把 MHC 的 kernel 砍掉 60% (5298→2116), 但 occupancy 结构不变 (0% bucket 46.7%→47.6%), TPS 不动 (+0.33%)。**证明: 减少低 occupancy kernel 对 TPS 无影响 — 它们在 graph 内被吸收, 是背景噪声。**
